@@ -1,0 +1,35 @@
+# Direct RTSP (no NVR) — leave [nvr] out.
+[[cameras]]
+id = "example_cam"
+name = "Example Camera"
+url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
+
+# --- OR discover / stream via Hikvision NVR ---
+# [nvr]
+# host = "198.51.100.20"
+# http_port = 49000
+# rtsp_port = 49002   # remapped RTSP; default device port is 554
+# username = "admin"
+# password = "changeme"
+# stream = "sub"   # main | sub | third  (default: sub)
+# protocols = "tcp"  # udp | tcp | udp+tcp — pin for all NVR streams
+#
+# Listed cameras keep stable ids for views.toml. Match by host + lens in url
+# (/Streaming/Channels/101 → lens 1, …/201 → lens 2), or set channel = N.
+# Grid panes use the NVR; url is for fullscreen direct + PTZ credentials.
+#
+# [[cameras]]
+# id = "barracks"
+# name = "Front"
+# url = "rtsp://admin:camera-password@192.0.2.10:554/Streaming/Channels/201"
+#
+# [[cameras]]
+# id = "front_ptz"
+# name = "Front PTZ"
+# url = "rtsp://admin:camera-password@192.0.2.10:554/Streaming/Channels/102"
+
+[viewer]
+app_name = "Citadel CCTV"
+default_layout = "3x3"
+default_fit = "contain"  # contain | cover | fill
+pause_when_unfocused = true

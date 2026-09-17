@@ -1,0 +1,52 @@
+---
+description: Windows release build and portable packaging with GStreamer DLLs
+alwaysApply: true
+---
+
+# Windows build / package
+
+When the user asks to **build**, **rebuild**, **package**, or fix **missing DLL** errors on Windows, use the project scripts — do not invent ad-hoc `cargo` + manual DLL copy steps.
+
+## Default: Quick
+
+Unless the user explicitly wants a **clean**, **shipping**, **ZIP**, or **full** package:
+
+```powershell
+.\scripts\build-release.ps1 -Quick
+```
+
+That runs `cargo build --release` (no LTO) and refreshes only `dist\rustcams\rustcams.exe`. It keeps the existing GStreamer plugin/DLL tree and skips the ZIP.
+
+## Full / clean / ZIP
+
+```powershell
+.\scripts\build-release.ps1          # cargo --profile dist (fat LTO) + full package + ZIP
+.\scripts\build-release.ps1 -Clean   # cargo clean, then dist + full package
+.\scripts\build-release.ps1 -SkipZip # full package, no ZIP
+```
+
+Use a full (non-Quick) package when `dist\rustcams\` is missing/incomplete, after GStreamer or plugin-allowlist changes, or when producing `dist\rustcams-windows-x64.zip`.
+
+## Cargo profiles (do not “optimize” release with fat LTO)
+
+| Profile | Purpose |
+|---------|---------|
+| `release` | Fast day-to-day optimized builds — **no LTO** |
+| `dist` | Shipping only — fat LTO + `codegen-units = 1` |
+
+Putting `lto = true` / `codegen-units = 1` back on `[profile.release]` makes every dependency rebuild through linker-plugin LTO and is a major regression.
+
+## What the scripts do
+
+- Load MSVC + GStreamer env automatically
+- `-Quick`: `--release` + exe-only package update
+- Full: `--profile dist` + wipe/recopy GStreamer DLLs via `package-windows.ps1` + ZIP (unless `-SkipZip`)
+
+## Run the app
+
+Launch **`dist\rustcams\rustcams.exe`** from that folder so bundled DLLs load. Do not run bare `target\release\rustcams.exe` or `target\dist\rustcams.exe` unless GStreamer is already on `PATH`.
+
+## Related scripts
+
+- `scripts/package-windows.ps1` — `-SkipBuild`, `-Quick`, `-CargoProfile release|dist`
+- `scripts/package-windows-cross.sh` — Linux cross-build (MinGW), not the default on this Windows machine

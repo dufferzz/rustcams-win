@@ -1,0 +1,6 @@
+# Cross-compile rustcams for Windows (MinGW) from this Linux host.
+# GStreamer lives under .cross/gst/mingw_root (unpacked from official MinGW MSIs).
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-gcc-ar"

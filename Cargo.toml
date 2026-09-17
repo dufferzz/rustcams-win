@@ -1,0 +1,47 @@
+[package]
+name = "rustcams"
+version = "0.1.0"
+edition = "2021"
+description = "Performant multi-camera RTSP CCTV viewer"
+license = "MIT"
+
+[package.metadata.winresource]
+ProductName = "Citadel CCTV"
+FileDescription = "Citadel CCTV — multi-camera RTSP viewer"
+
+[dependencies]
+anyhow = "1"
+digest_auth = "0.3"
+eframe = { version = "0.31", default-features = true, features = ["default_fonts", "glow"] }
+egui = "0.31"
+gilrs = "0.11"
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+image = { version = "0.25", default-features = false, features = ["png"] }
+md5 = "0.7"
+parking_lot = "0.12"
+percent-encoding = "2"
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+sysinfo = "0.35"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "3"
+url = "2"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+# Fast day-to-day release builds (used by build-release.ps1 -Quick).
+opt-level = 3
+lto = false
+strip = true
+
+# Shipping / ZIP builds: fat LTO (build-release.ps1 without -Quick).
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
