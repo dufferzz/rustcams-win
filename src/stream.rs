@@ -769,8 +769,8 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
         });
     }
 
-    // Explicit depay/parse/decode (no decodebin) — isolates GOP hitch vs bin
-    // autoconfig. Override with RUSTCAMS_DECODE=sw for software avdec_*.
+    // Explicit depay/parse/decode (no decodebin). Default SW via
+    // prefer_software_decode(); set RUSTCAMS_DECODE=hw for D3D11/MF/NV.
     let pipeline_weak = pipeline.downgrade();
     let queue_weak = queue.downgrade();
     let max_width_link = max_width;

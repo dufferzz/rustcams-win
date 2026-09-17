@@ -11,6 +11,8 @@ Performant multi-camera RTSP CCTV viewer written in Rust.
 - Background pause when unfocused
 - Optional **Hikvision NVR** discovery: list cameras via ISAPI, stream through the NVR
 
+Streaming pipeline (RTSP → decode → egui): [docs/streaming.md](docs/streaming.md).
+
 ## Requirements
 
 ### Linux (Arch/Manjaro)
@@ -107,11 +109,11 @@ gstreamer\lib\gstreamer-1.0\   # allowlisted plugins (RTSP/decode/D3D11/…)
 licenses\gstreamer\
 ```
 
-`package-windows.ps1` copies **only** the plugins rustcams needs (RTSP, decodebin, videorate/convert/scale, D3D11, libav + Media Foundation fallbacks, JPEG) and the runtime DLL dependency closure of the exe + those plugins — not the full GStreamer install. On Windows, runtime `*.dll` must sit next to `rustcams.exe` because the loader resolves imports before `main` can adjust `PATH`. At startup, rustcams sets `GST_PLUGIN_PATH` to `gstreamer\lib\gstreamer-1.0`. MSVC builds may still need the [Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) on target PCs.
+`package-windows.ps1` copies **only** the plugins rustcams needs (RTSP, RTP depay, H.264/H.265 parse, libav + D3D11/Media Foundation decoders, convert/scale, JPEG) and the runtime DLL dependency closure of the exe + those plugins — not the full GStreamer install. On Windows, runtime `*.dll` must sit next to `rustcams.exe` because the loader resolves imports before `main` can adjust `PATH`. At startup, rustcams sets `GST_PLUGIN_PATH` to `gstreamer\lib\gstreamer-1.0`. MSVC builds may still need the [Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) on target PCs.
 
 GStreamer / codecs have LGPL/GPL obligations when redistributing — keep the copied license files with the package.
 
-**Intel / Windows hardware decode:** with the MSVC Complete runtime (includes `gstd3d11.dll`), rustcams prefers Direct3D11/DXVA decoders (`d3d11h264dec` / `d3d11h265dec`) and scales on the GPU before download. In **Debug** (`D` or `RUSTCAMS_DEBUG=1`), per-stream decoder names should show `d3d11h26*dec` rather than `avdec_*`. If you only see software decoders, reinstall the Complete runtime (or ensure `gstd3d11.dll` is in the bundled `gstreamer\lib\gstreamer-1.0` folder).
+**Decode (default = software):** rustcams uses an **explicit** pipeline (`rtph264depay` → `h264parse` → decoder), not `decodebin`. By default it selects **libav** (`avdec_h264` / `avdec_h265`), which measured smoother than DXVA on multi-cam grids (lower emit gaps around keyframes). Set `RUSTCAMS_DECODE=hw` to prefer Direct3D11/DXVA (`d3d11h264dec` / `d3d11h265dec`) with GPU scale/download when `gstd3d11.dll` is present. In **Debug** (`D` or `RUSTCAMS_DEBUG=1`), per-stream `dec=` shows the factory in use; `stutter-stats.log` next to the exe records `gap_ms` every ~2 s.
 
 ## Config
 
@@ -187,8 +189,11 @@ cargo run --release
 
 | Knob | Effect |
 |------|--------|
-| Toolbar **Debug** or `D` | On-screen per-stream fps, size, decoder, stale frames, RGBA copy cost; status-bar UI/tex rates |
+| Toolbar **Debug** or `D` | On-screen per-stream fps, size, decoder, stale frames, RGBA copy cost, emit `gap_ms`; status-bar UI/tex rates |
 | `RUSTCAMS_DEBUG=1` | Starts with Debug on; logs `perf summary` / `perf stream` / `perf ui` every 5s |
+| `RUSTCAMS_DECODE=hw` | Force hardware decode (D3D11/MF/NV); default is software `avdec_*` |
+| `RUSTCAMS_DECODE=sw` | Explicit software decode (same as default) |
+| `stutter-stats.log` | Always written beside the exe (~2 s); use `gap_ms` / `dec=` to compare hitch |
 | `RUST_LOG=rustcams=debug` | Verbose module logs (links, stops, …) |
 | `GST_DEBUG=2` or `GST_DEBUG=rtsp*:3,videodecoder:3` | GStreamer-side RTSP/decode traces |
 
@@ -196,6 +201,7 @@ cargo run --release
 RUSTCAMS_DEBUG=1 RUST_LOG=rustcams=info cargo run --release
 ```
 
+Deep dive: [docs/streaming.md](docs/streaming.md).
 ## Controls
 
 | Action | How |
@@ -223,15 +229,18 @@ Credentials and host come from that camera’s RTSP `url`. Speeds default to mov
 30 / zoom 25. Cameras whose id/name contain `ptz` get a PTZ target from `url`.
 
 **Fullscreen** switches that camera to its **direct main-stream** URL (same `url`
-rewritten to `…01`) at higher decode width (1280). Fullscreen uses a clock-synced
-low-latency pipeline (~200 ms jitterbuffer); grid panes drop late frames and cap
-size/fps by layout. Exit fullscreen returns to the NVR substream when `[nvr]` is set.
+rewritten to `…01`) at higher decode width (1280). Pipelines always use
+`appsink sync=false` with a ~450–500 ms RTSP jitterbuffer (no `videorate`);
+grid panes cap size/fps by layout. Exit fullscreen returns to the NVR substream when `[nvr]` is set.
 
 ## Notes
 
-- Only cameras in the active view are decoded. With **D3D11**, 1×1 and camera-fullscreen stop off-screen streams to save CPU/GPU; otherwise fullscreen keeps the rest running so exit is instant.
+- Only cameras in the active view are decoded. With **D3D11 plugins present**, 1×1 and camera-fullscreen stop off-screen streams to save CPU/GPU; otherwise fullscreen keeps the rest running so exit is instant.
 - Prefer substreams (`stream = "sub"`, `/…02`) for grid viewing.
-- Dense grids (3×3+) always use substreams and lower decode size/fps to cut CPU; **HD** (main stream) is only available on 1×1 / 2×2 and fullscreen.
-- Default RTSP transport is **UDP** (LAN-friendly). On failure, reconnects alternate to **TCP**. Some Hikvision cams return SETUP **500** with TCP interleaved — pin a camera with `protocols = "udp"` in `cameras.toml` if needed.
+- Dense grids (3×3+) always use substreams and a moderate decode width (e.g. 5×5 → 352 px) so OSD timestamps stay readable; **HD** (main stream) is only available on 1×1 / 2×2 and fullscreen.
+- Default RTSP transport is **UDP** (LAN-friendly) unless you set `protocols` in config. On failure, reconnects alternate to **TCP** when protocols are not pinned. Some Hikvision cams return SETUP **500** with TCP interleaved — pin `protocols = "udp"` in `cameras.toml` if needed.
+- Default video decode is **software** (`avdec_*`). Use `RUSTCAMS_DECODE=hw` only if you want DXVA and accept possible GOP hitch; compare with `stutter-stats.log` (`gap_ms`).
 - Opening many streams to one camera IP can hit its concurrent-session limit; use fewer slots or substreams only.
 - In NVR mode, concurrent viewers hit **one** NVR. Prefer substreams and fewer slots; the NVR’s own session limits still apply.
+
+Pipeline details: [docs/streaming.md](docs/streaming.md).

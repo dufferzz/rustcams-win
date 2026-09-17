@@ -122,7 +122,7 @@ function Collect-RuntimeDllClosure {
     return @($needed)
 }
 
-# Plugins required for rustcams RTSP → decodebin → D3D11/CPU RGBA appsink path.
+# Plugins required for rustcams RTSP → depay/parse/decode → RGBA appsink path.
 $PluginAllowList = @(
     'gstcoreelements.dll',      # queue, capsfilter, ...
     'gstapp.dll',               # appsink

@@ -13,6 +13,7 @@ url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
 # password = "changeme"
 # stream = "sub"   # main | sub | third  (default: sub)
 # protocols = "tcp"  # udp | tcp | udp+tcp — pin for all NVR streams
+# Default decode is software (avdec_*). Set env RUSTCAMS_DECODE=hw for DXVA.
 #
 # Listed cameras keep stable ids for views.toml. Match by host + lens in url
 # (/Streaming/Channels/101 → lens 1, …/201 → lens 2), or set channel = N.

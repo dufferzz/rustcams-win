@@ -51,3 +51,13 @@ app_name = "Citadel CCTV"
 ```
 
 Crate/binary/dist folder names stay `rustcams` (packaging identity, not branding).
+
+## Streaming / decode (keep docs in sync)
+
+Default decode is **software** (`avdec_*`) via an **explicit** depay/parse chain — not `decodebin`, and not `videorate`. `RUSTCAMS_DECODE=hw` forces D3D11/MF/NV. Dense-grid tiers are sized for readable OSD (e.g. 5×5 → 352 px).
+
+When changing the pipeline, update:
+
+- [`docs/streaming.md`](docs/streaming.md) — source of truth for RTSP → pixels
+- [`README.md`](README.md) — user-facing decode / debug / Notes
+- `scripts/package-windows.ps1` plugin allowlist comment if elements change

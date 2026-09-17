@@ -16,10 +16,11 @@ ViewerApp::desired_streams()   (layout / HD / fullscreen tiers)
 StreamManager::sync_active()   (start / stop / reconnect pipelines)
       ↓
 Per camera GStreamer pipeline:
-  rtspsrc → decodebin → [optional D3D11 postproc] → queue → videorate
-  → videoconvert → videoscale → capsfilter(RGBA) → appsink
+  rtspsrc → rtph26xdepay → h26xparse → decoder
+    → [optional D3D11 postproc when HW decode]
+    → queue → videoconvert → videoscale → capsfilter(RGBA) → appsink
       ↓
-appsink callback: copy RGBA → latest-frame ring (Arc<VideoFrame>)
+appsink callback: keyframe gate → copy RGBA → latest-frame ring
       ↓
 UI thread (~16 ms): frame_if_newer → ColorImage → TextureHandle
       ↓
@@ -31,7 +32,7 @@ paint grid / fullscreen cell → egui painter.image()
 | Config / URLs | `ViewerApp` + config resolve | `config.rs`, `nvr.rs` |
 | Which streams to run | UI each frame | `app/mod.rs` |
 | Pipeline lifecycle | `StreamManager` | `stream.rs` |
-| Decode pad linking | GStreamer callbacks | `gst_link.rs`, `gst_env.rs` |
+| Explicit decode linking | GStreamer pad-added | `gst_link.rs`, `gst_env.rs` |
 | Texture upload + paint | UI thread | `app/mod.rs`, `app/ui.rs` |
 
 There is **no Tokio/async runtime** for video. Sync Rust on the UI thread drives sync/upload; GStreamer uses its own streaming/decode threads for the pipeline and appsink callback.
@@ -47,6 +48,8 @@ On startup (`main.rs` → `ViewerApp::new` → `StreamManager::new`):
 3. Hardware decoder ranks are adjusted (`prefer_hardware_decoders`) and D3D11 postproc availability is probed (`d3d11_postproc_available`).
 
 See `gst_env.rs`.
+
+**Default decode path is software (`avdec_h264` / `avdec_h265`).** DXVA/`d3d11h264dec` caused ~300–900 ms emit gaps around GOP boundaries on this workload; libav is smoother. Set `RUSTCAMS_DECODE=hw` to force hardware again.
 
 ---
 
@@ -102,12 +105,12 @@ Built in `ViewerApp::desired_streams()` (`app/mod.rs`):
 | `url` | Final RTSP URL (after digit rewrite) |
 | `protocols` | Optional transport override |
 | `max_width` | Cap after scale (height capped to same value) |
-| `max_fps` | `videorate` max-rate |
+| `max_fps` | Tier hint (substream fps); not a `videorate` element |
 
 ### Which cameras get pipelines
 
 - Normally: every slotted camera in the **active view**.
-- **Solo decode** (D3D11 + 1×1 layout or camera fullscreen): only visible camera(s), so off-screen streams stop and free GPU.
+- **Solo decode** (D3D11 available + 1×1 layout or camera fullscreen): only visible camera(s), so off-screen streams stop and free GPU/CPU.
 - Without solo mode, the whole view keeps decoding so leaving fullscreen is instant.
 
 ### Quality tiers (`stream_tier`)
@@ -119,11 +122,16 @@ Built in `ViewerApp::desired_streams()` (`app/mod.rs`):
 | 1×1 HD / Sub | 1280@30 / 640@15 | Main / Sub |
 | Two HD / Sub | 960@20 / 640@15 | Main / Sub |
 | 2×2 HD / Sub | 640@15 | Main / Sub |
-| 3×3 … 6×6 | 288…192 @ 15 | **Sub only** |
+| 3×3 | 480 @ 15 | **Sub only** |
+| 4×4 | 400 @ 15 | **Sub only** |
+| 5×5 | 352 @ 15 | **Sub only** |
+| 6×6 | 288 @ 15 | **Sub only** |
 
-Fullscreen prefers `direct_url` with protocols cleared (UDP default). Grid uses the NVR/grid URL and configured protocols.
+Dense-grid widths are sized so on-screen OSD (date/time) stays readable while keeping substreams.
 
-HD is only offered for layouts One / Two / Grid2; denser grids force substream + small pixel budgets.
+Fullscreen prefers `direct_url` with protocols cleared (UDP default unless `protocols` is set). Grid uses the NVR/grid URL and configured protocols.
+
+HD is only offered for layouts One / Two / Grid2; denser grids force substream + the pixel budgets above.
 
 ---
 
@@ -131,20 +139,23 @@ HD is only offered for layouts One / Two / Grid2; denser grids force substream +
 
 Built in `start_pipeline` (`stream.rs`). One pipeline per active camera.
 
+**No `decodebin` and no `videorate`.** Linking is explicit on `rtspsrc` pad-added (`gst_link::link_explicit_video`).
+
 ```
 [Network RTSP]
       │
    rtspsrc
-      │ pad-added
-   decodebin  ──► HW decoder (d3d11h264dec / …) or SW
+      │ pad-added (H264 / H265 RTP)
+   rtph264depay / rtph265depay
+      → h264parse / h265parse
+      → decoder
+           default: avdec_h264 / avdec_h265
+           RUSTCAMS_DECODE=hw: d3d11h264dec / … (MF / NV fallbacks)
       │
-      ├── D3D11 path (when plugins exist):
-      │     d3d11convert → d3d11scale → caps(RGBA) → d3d11download
-      │
-      └── else: direct link
+      ├── HW + D3D11 plugins: d3d11convert → d3d11scale → caps(RGBA) → d3d11download
+      └── else: direct link from decoder
       ▼
- queue (leaky, max 2 buffers)
-      → videorate (drop-only, max-rate)
+ queue (leaky downstream, max 4 buffers)
       → videoconvert → videoscale → capsfilter (RGBA, ≤ max w/h)
       → appsink
 ```
@@ -153,26 +164,33 @@ Built in `start_pipeline` (`stream.rs`). One pipeline per active camera.
 
 | Property | Value |
 |----------|--------|
-| `latency` | 200 ms |
-| `protocols` | udp or tcp (or multi-protocol override) |
-| `drop-on-latency` | true |
+| `latency` | 450 ms (≤640 px) / 500 ms (wider) — smooths GOP/jitter |
+| `protocols` | udp or tcp (or multi-protocol override from config) |
+| `drop-on-latency` | **false** (dropping on latency clipped around IDRs → hitch) |
 | `do-retransmission` | false |
 | `do-rtsp-keep-alive` | true |
-| `timeout` / `tcp-timeout` | 5 s |
+| `timeout` / `tcp-timeout` | 5 s |
 
 ### Decode / display knobs
 
 - **Scale method:** `nearest-neighbour` if `max_width ≤ 400`, else `bilinear`.
-- **Clock sync on appsink:** only when `max_width > 640` (HD-ish). Smaller panes set `sync=false` to prefer the latest frame over clock alignment.
-- **appsink:** `max-buffers=1`, `drop=true`, `max-lateness=100ms`, `qos=false`.
-- **videorate:** must be `drop-only` + `max-rate`. Classic rate + framerate caps asserts on live RTSP buffers that lack duration.
-- **Audio:** audio pads from `decodebin` are ignored (`gst_link::is_audio_caps`).
+- **Clock sync on appsink:** always `sync=false`. Clock sync held frames then dropped late ones in bursts (~GOP hitch).
+- **appsink:** `max-buffers=1`, `drop=true`, `max-lateness=-1`, `qos=false`.
+- **Keyframe gate:** after connect/reconnect, delta/corrupt buffers are dropped until the first keyframe (queue probe + appsink). Upstream `ForceKeyUnit` is sent to request an IDR ASAP.
+- **Audio:** non-video RTP pads are ignored (`gst_link::is_audio_caps`).
 
-### D3D11 post-process (`gst_link.rs`)
+### Decoder selection (`gst_link.rs` / env)
 
-When `d3d11convert`, `d3d11scale`, and `d3d11download` exist, decodebin video is linked through GPU convert/scale to RGBA in `D3D11Memory`, then downloaded as a small CPU frame into the leaky queue. Downstream CPU convert/scale become cheap passthroughs. On link failure, the code falls back to `decodebin → queue` (full CPU path).
+| `RUSTCAMS_DECODE` | Behavior |
+|-------------------|----------|
+| unset / `sw` / `software` / `avdec` | Software (`avdec_*`) — **default** |
+| `hw` / `hardware` / `d3d11` | Prefer `d3d11h264dec` / `d3d11h265dec`, then MF/NV, else SW |
 
-Hardware decoder factories are ranked up (`d3d11h*`, `mfh*`, `nvh*`, `vah*`); `avdec_h264/265` are demoted. The selected decoder name is logged and exposed in the debug overlay.
+When HW decode is used and `d3d11convert` / `d3d11scale` / `d3d11download` exist, frames go through GPU convert/scale to RGBA in `D3D11Memory`, then download into the leaky queue. On link failure, decoder links straight to the queue (CPU convert/scale).
+
+`prefer_hardware_decoders` still ranks HW factories above SW for any path that uses ranks; the explicit graph ignores rank when `RUSTCAMS_DECODE` forces SW.
+
+The selected decoder name is stored on the slot and shown in the debug overlay / stutter log (`dec=`).
 
 ---
 
@@ -180,11 +198,13 @@ Hardware decoder factories are ranked up (`d3d11h*`, `mfh*`, `nvh*`, `vah*`); `a
 
 On GStreamer’s streaming thread, the appsink `new_sample` callback:
 
-1. Pulls the sample and maps plane 0 as readable RGBA.
-2. Copies into a contiguous `Vec<u8>` (`copy_rgba_plane`, respects stride).
-3. Allocates a global monotonic `seq` and wraps `VideoFrame { width, height, rgba, seq }` in an `Arc`.
-4. Stores it in `slot.frame: Arc<Mutex<Option<Arc<VideoFrame>>>>`, replacing any unread frame (**stale**).
-5. Only then stores `latest_seq` with `Release` ordering — so the UI never sees a new sequence number paired with old pixels.
+1. Pulls the sample; applies keyframe / corrupt filters.
+2. Maps plane 0 as readable RGBA.
+3. Copies into a contiguous `Vec<u8>` (`copy_rgba_plane`, respects stride).
+4. Allocates a global monotonic `seq` and wraps `VideoFrame { width, height, rgba, seq }` in an `Arc`.
+5. Stores it in `slot.frame: Arc<Mutex<Option<Arc<VideoFrame>>>>`, replacing any unread frame (**stale**).
+6. Only then stores `latest_seq` with `Release` ordering — so the UI never sees a new sequence number paired with old pixels.
+7. Updates emit-gap counters (`emit_gap_max_ms`) for stutter diagnosis.
 
 ```rust
 // Conceptual shape
@@ -223,11 +243,21 @@ Handoff is lock + atomics only: appsink writes the latest frame; UI clones the `
 3. Transmute RGBA → `Color32` (opaque) → `ColorImage`.
 4. `TextureHandle::set` or `ctx.load_texture`.
 5. Dense grids (3×3–6×6) use `TextureOptions::NEAREST`; others use `LINEAR`.
-6. `paint_cell_contents` / `draw_grid` draw with `painter.image()` and fit mode Contain / Cover / Fill.
+6. Upload every tile that has a newer frame (uploads are cheap relative to decode).
+7. `paint_cell_contents` / `draw_grid` draw with `painter.image()` and fit mode Contain / Cover / Fill.
 
-Repaint cadence: ~16 ms when active, ~250 ms when paused.
+Repaint cadence: ~16 ms when active, ~250 ms when paused.
 
-Cell placeholders: Connecting… / Error / Offline / Paused (`app/ui.rs`).
+Cell placeholders: Connecting… / Reconnecting… / Error / Offline / Paused (`app/ui.rs`).
+
+### Stutter / perf logging
+
+While Debug is on (toolbar / `D` / `RUSTCAMS_DEBUG=1`), the overlay shows per-stream rates. Independently, the app appends a snapshot every ~2 s to **`stutter-stats.log`** next to the executable (e.g. `dist/rustcams/stutter-stats.log`):
+
+- UI / texture FPS and upload cost
+- Per cam: `out` / `in` fps, stale, drops, **`gap_ms`** (worst emit spacing), `copy_us`, `dec=`
+
+`gap_ms` is the main hitch metric: with SW decode, steady panes are typically ~100–180 ms at 15 fps; HW decode often showed 300–900 ms around keyframes.
 
 ---
 
@@ -248,7 +278,7 @@ start_pipeline fails
     → schedule_reconnect
 ```
 
-**Backoff** (`schedule_reconnect`): failures 1 → 2 s, 2 → 5 s, 3–5 → 10 s, else 20 s.
+**Backoff** (`schedule_reconnect`): failures 1 → 2 s, 2 → 5 s, 3–5 → 10 s, else 20 s.
 
 **Transport flip:** only if protocols are **not** pinned to a single mode **and** `failures >= 2`. Multi-protocol config like `udp+tcp` is set directly on `rtspsrc`; reconnect still starts on UDP then can flip.
 
@@ -316,9 +346,12 @@ ViewerApp (UI thread)
 
 ### Environment
 
-- `RUSTCAMS_DEBUG` — perf overlay + periodic logs
-- `RUST_LOG`, `GST_DEBUG`
-- Bundled GStreamer via exe-relative tree on Windows packages
+| Variable | Effect |
+|----------|--------|
+| `RUSTCAMS_DECODE` | `hw` = force D3D11/MF/NV; default / `sw` = libav |
+| `RUSTCAMS_DEBUG` | Perf overlay on at start; periodic `perf *` logs |
+| `RUST_LOG`, `GST_DEBUG` | Module / GStreamer traces |
+| Bundled GStreamer | Exe-relative tree on Windows packages |
 
 ---
 
@@ -331,12 +364,14 @@ ViewerApp (UI thread)
 | Pause when unfocused | Stops all pipelines and clears textures when enabled |
 | Audio | Explicitly ignored |
 | HTTP video | Not supported |
-| Stale frames | Ring overwritten before UI read — counted in debug overlay |
+| Stale frames | Ring overwritten before UI read — counted in debug / stutter log |
 | Many streams to one NVR/IP | Session limits can fail; keep grids modest or use substreams |
 | Fullscreen vs grid URL | Fullscreen may jump to direct main; exit restores NVR/grid URL |
-| Dense grids | Forced substream + tiny max_width; HD disabled |
-| D3D11 solo decode | Stops off-screen pipelines in 1×1 / fullscreen |
-| Clock sync | Only for wider (HD-ish) panes |
+| Dense grids | Forced substream + max_width above; HD disabled |
+| D3D11 solo decode | Stops off-screen pipelines in 1×1 / fullscreen when D3D11 postproc exists |
+| Green flash on connect | Keyframe gate + ForceKeyUnit |
+| Clock sync | Always off on appsink (avoids GOP hitch) |
+| HW vs SW stutter | Prefer SW default; use `gap_ms` in `stutter-stats.log` to compare |
 
 ---
 
@@ -345,10 +380,10 @@ ViewerApp (UI thread)
 | Path | Role |
 |------|------|
 | `src/stream.rs` | `StreamManager`, `SlotState`, `VideoFrame`, pipeline, appsink, reconnect |
-| `src/gst_link.rs` | Decodebin linking, D3D11 postproc, audio skip |
+| `src/gst_link.rs` | Explicit depay/parse/decode, D3D11 postproc, audio skip |
 | `src/gst_env.rs` | Bundled plugins, HW decoder ranks |
-| `src/app/mod.rs` | Sync, tiers, texture upload, update loop |
-| `src/app/ui.rs` | Grid paint, placeholders, debug overlay |
+| `src/app/mod.rs` | Sync, tiers, texture upload, update loop, stutter log path |
+| `src/app/ui.rs` | Grid paint, placeholders, debug overlay, stutter-stats writer |
 | `src/config.rs` | TOML → `CameraConfig` |
 | `src/nvr.rs` | ISAPI discovery, RTSP URL build/rewrite |
 | `src/views.rs`, `src/layout.rs` | Multi-view grid model |
