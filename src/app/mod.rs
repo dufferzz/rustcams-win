@@ -44,12 +44,24 @@ struct UiPerf {
     upload_bytes: u64,
     upload_ns: u64,
     cloned_frames: u64,
+    upload_skips: u64,
+    /// Worst UI tick gap (ms) in the sample window.
+    frame_dt_max_ms: u64,
+    /// Worst single texture upload (µs) in the sample window.
+    upload_us_max: u64,
+    /// Worst update_textures call (µs).
+    tex_pass_us_max: u64,
+    last_frame: Instant,
     last: Instant,
     ui_fps: f32,
     upload_fps: f32,
     upload_mbps: f32,
     avg_upload_us: f32,
     clone_fps: f32,
+    skip_fps: f32,
+    reported_frame_dt_max_ms: u64,
+    reported_upload_us_max: u64,
+    reported_tex_pass_us_max: u64,
 }
 
 impl UiPerf {
@@ -60,16 +72,29 @@ impl UiPerf {
             upload_bytes: 0,
             upload_ns: 0,
             cloned_frames: 0,
+            upload_skips: 0,
+            frame_dt_max_ms: 0,
+            upload_us_max: 0,
+            tex_pass_us_max: 0,
+            last_frame: Instant::now(),
             last: Instant::now(),
             ui_fps: 0.0,
             upload_fps: 0.0,
             upload_mbps: 0.0,
             avg_upload_us: 0.0,
             clone_fps: 0.0,
+            skip_fps: 0.0,
+            reported_frame_dt_max_ms: 0,
+            reported_upload_us_max: 0,
+            reported_tex_pass_us_max: 0,
         }
     }
 
     fn tick_frame(&mut self) {
+        let now = Instant::now();
+        let dt_ms = now.saturating_duration_since(self.last_frame).as_millis() as u64;
+        self.frame_dt_max_ms = self.frame_dt_max_ms.max(dt_ms);
+        self.last_frame = now;
         self.frames += 1;
     }
 
@@ -77,9 +102,15 @@ impl UiPerf {
         self.uploads += 1;
         self.upload_bytes = self.upload_bytes.saturating_add(bytes);
         self.upload_ns = self.upload_ns.saturating_add(ns);
+        let us = ns / 1000;
+        self.upload_us_max = self.upload_us_max.max(us);
         if cloned {
             self.cloned_frames += 1;
         }
+    }
+
+    fn note_tex_pass(&mut self, ns: u64) {
+        self.tex_pass_us_max = self.tex_pass_us_max.max(ns / 1000);
     }
 
     fn sample_rates(&mut self) {
@@ -93,11 +124,19 @@ impl UiPerf {
             0.0
         };
         self.clone_fps = self.cloned_frames as f32 / dt;
+        self.skip_fps = self.upload_skips as f32 / dt;
+        self.reported_frame_dt_max_ms = self.frame_dt_max_ms;
+        self.reported_upload_us_max = self.upload_us_max;
+        self.reported_tex_pass_us_max = self.tex_pass_us_max;
         self.frames = 0;
         self.uploads = 0;
         self.upload_bytes = 0;
         self.upload_ns = 0;
         self.cloned_frames = 0;
+        self.upload_skips = 0;
+        self.frame_dt_max_ms = 0;
+        self.upload_us_max = 0;
+        self.tex_pass_us_max = 0;
         self.last = Instant::now();
     }
 }
@@ -141,6 +180,8 @@ pub struct ViewerApp {
     last_debug_sample: Instant,
     last_debug_log: Instant,
     ui_perf: UiPerf,
+    /// Append-only hitch diagnostics next to cameras.toml (every ~2s).
+    stutter_log_path: PathBuf,
     /// In-app log / console window (OS console is hidden on Windows release builds).
     show_log: bool,
     log_buffer: LogBuffer,
@@ -167,6 +208,14 @@ impl ViewerApp {
         }
 
         info!(cameras = camera_ids.len(), "resolved camera list");
+        let stutter_log_path = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("stutter-stats.log");
+        info!(
+            path = %stutter_log_path.display(),
+            "stutter diagnostics on — writing every 2s; perf overlay + log panel open"
+        );
 
         let views_path = config_path
             .parent()
@@ -224,11 +273,13 @@ impl ViewerApp {
             last_ptz: PtzVector::STOP,
             last_cross: false,
             last_triangle: false,
+            // Perf overlay: RUSTCAMS_DEBUG=1 or press D. stutter-stats.log always writes.
             debug_overlay: std::env::var_os("RUSTCAMS_DEBUG").is_some(),
             debug_rows: Vec::new(),
             last_debug_sample: Instant::now() - std::time::Duration::from_secs(2),
             last_debug_log: Instant::now(),
             ui_perf: UiPerf::new(),
+            stutter_log_path,
             show_log: false,
             log_buffer,
             log_auto_scroll: true,
@@ -358,11 +409,11 @@ impl ViewerApp {
             Layout::Two => (640, 15, StreamType::Sub),
             Layout::Grid2 if hd => (640, 15, StreamType::Main),
             Layout::Grid2 => (640, 15, StreamType::Sub),
-            // Dense grids: keep pixel size low; match typical cam substream fps (15).
-            Layout::Grid3 => (288, 15, StreamType::Sub),
-            Layout::Grid4 => (256, 15, StreamType::Sub),
-            Layout::Grid5 => (224, 15, StreamType::Sub),
-            Layout::Grid6 => (192, 15, StreamType::Sub),
+            // Dense grids: sharp enough for OSD timestamps; SW decode handles this.
+            Layout::Grid3 => (480, 15, StreamType::Sub),
+            Layout::Grid4 => (400, 15, StreamType::Sub),
+            Layout::Grid5 => (352, 15, StreamType::Sub),
+            Layout::Grid6 => (288, 15, StreamType::Sub),
         }
     }
 
@@ -432,7 +483,23 @@ impl ViewerApp {
     }
 
     fn update_textures(&mut self, ctx: &egui::Context) {
+        let pass_t0 = Instant::now();
         let ids = self.displayed_camera_ids();
+        if ids.is_empty() {
+            return;
+        }
+        // Uploads are cheap (~3–30µs in stutter-stats); update every tile that has
+        // a newer frame. Capping to 1–2/frame made dense grids look like 2fps.
+        let dense = matches!(
+            self.active_layout(),
+            Layout::Grid3 | Layout::Grid4 | Layout::Grid5 | Layout::Grid6
+        );
+        let tex_opts = if dense {
+            TextureOptions::NEAREST
+        } else {
+            TextureOptions::LINEAR
+        };
+
         for id in ids {
             let seen = self.textures.get(&id).map(|t| t.seq).unwrap_or(0);
             let Some(frame) = self.streams.frame_if_newer(&id, seen) else {
@@ -454,6 +521,7 @@ impl ViewerApp {
                     )
                 }
                 Err(shared) => {
+                    // Race with appsink: clone once rather than skip a present.
                     let bytes = shared.rgba.len() as u64;
                     (
                         color_image_from_rgba(
@@ -465,16 +533,6 @@ impl ViewerApp {
                         true,
                     )
                 }
-            };
-            // Nearest is cheaper on iGPU and fine for small grid tiles.
-            let dense = matches!(
-                self.active_layout(),
-                Layout::Grid3 | Layout::Grid4 | Layout::Grid5 | Layout::Grid6
-            );
-            let tex_opts = if dense {
-                TextureOptions::NEAREST
-            } else {
-                TextureOptions::LINEAR
             };
             if let Some(entry) = self.textures.get_mut(&id) {
                 entry.handle.set(image, tex_opts);
@@ -492,6 +550,8 @@ impl ViewerApp {
             self.ui_perf
                 .note_upload(bytes, t0.elapsed().as_nanos() as u64, cloned);
         }
+        self.ui_perf
+            .note_tex_pass(pass_t0.elapsed().as_nanos() as u64);
     }
 
     fn apply_drop(&mut self, slot_idx: usize, payload: DragPayload) {

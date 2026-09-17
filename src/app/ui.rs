@@ -570,30 +570,102 @@ impl ViewerApp {
         });
     }
     pub(super) fn refresh_debug(&mut self) {
-        if !self.debug_overlay {
-            return;
-        }
-        if self.last_debug_sample.elapsed() < std::time::Duration::from_millis(1000) {
+        // Always sample/write hitch stats (overlay only controls the on-screen panel).
+        if self.last_debug_sample.elapsed() < std::time::Duration::from_millis(2000) {
             return;
         }
         self.ui_perf.sample_rates();
         self.debug_rows = self.streams.debug_snapshot();
         self.last_debug_sample = Instant::now();
 
-        if self.last_debug_log.elapsed() >= std::time::Duration::from_secs(5) {
-            info!(
-                ui_fps = format!("{:.1}", self.ui_perf.ui_fps),
-                tex_fps = format!("{:.1}", self.ui_perf.upload_fps),
-                tex_mib_s = format!("{:.1}", self.ui_perf.upload_mbps),
-                tex_upload_us = format!("{:.0}", self.ui_perf.avg_upload_us),
-                tex_clone_fps = format!("{:.1}", self.ui_perf.clone_fps),
-                layout = self.active_layout().as_str(),
-                hd = self.hd,
-                camera_fs = self.fullscreen_slot.is_some(),
-                "perf ui"
+        let gap_max = self
+            .debug_rows
+            .iter()
+            .map(|r| r.emit_gap_max_ms)
+            .max()
+            .unwrap_or(0);
+        let sum_fps: f32 = self.debug_rows.iter().map(|r| r.fps).sum();
+        let sum_stale: f32 = self.debug_rows.iter().map(|r| r.stale_fps).sum();
+        let sum_drop_rate: f32 = self.debug_rows.iter().map(|r| r.drop_rate_fps).sum();
+        let sum_drop_delta: f32 = self.debug_rows.iter().map(|r| r.drop_delta_fps).sum();
+        let sum_in: f32 = self.debug_rows.iter().map(|r| r.samples_in_fps).sum();
+
+        info!(
+            ui_fps = format!("{:.1}", self.ui_perf.ui_fps),
+            ui_dt_max_ms = self.ui_perf.reported_frame_dt_max_ms,
+            tex_fps = format!("{:.1}", self.ui_perf.upload_fps),
+            tex_skip_fps = format!("{:.1}", self.ui_perf.skip_fps),
+            tex_upload_us = format!("{:.0}", self.ui_perf.avg_upload_us),
+            tex_upload_us_max = self.ui_perf.reported_upload_us_max,
+            tex_pass_us_max = self.ui_perf.reported_tex_pass_us_max,
+            decode_fps = format!("{sum_fps:.1}"),
+            in_fps = format!("{sum_in:.1}"),
+            stale_fps = format!("{sum_stale:.1}"),
+            drop_rate_fps = format!("{sum_drop_rate:.1}"),
+            drop_delta_fps = format!("{sum_drop_delta:.1}"),
+            emit_gap_max_ms = gap_max,
+            layout = self.active_layout().as_str(),
+            hd = self.hd,
+            view = %self.views.active_view().name,
+            "stutter sample"
+        );
+        log_stream_debug_rows(&self.debug_rows);
+        self.append_stutter_stats_file();
+        self.last_debug_log = Instant::now();
+    }
+
+    fn append_stutter_stats_file(&self) {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.stutter_log_path)
+        else {
+            return;
+        };
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(
+            f,
+            "=== unix={secs} view={} layout={} hd={} ui_fps={:.1} ui_dt_max_ms={} tex_fps={:.1} tex_skip={:.1} upload_us_avg={:.0} upload_us_max={} tex_pass_us_max={} ===",
+            self.views.active_view().name,
+            self.active_layout().as_str(),
+            self.hd,
+            self.ui_perf.ui_fps,
+            self.ui_perf.reported_frame_dt_max_ms,
+            self.ui_perf.upload_fps,
+            self.ui_perf.skip_fps,
+            self.ui_perf.avg_upload_us,
+            self.ui_perf.reported_upload_us_max,
+            self.ui_perf.reported_tex_pass_us_max,
+        );
+        for row in &self.debug_rows {
+            let _ = writeln!(
+                f,
+                "  {id} run={run} {w}x{h} tier={tw}@{tf} out={out:.1} in={inn:.1} stale={st:.1} drop_rate={dr:.1} drop_delta={dd:.1} drop_key={dk:.1} gap_ms={gap} copy_us={cu:.0} dec={dec}",
+                id = row.id,
+                run = row.running,
+                w = row.width,
+                h = row.height,
+                tw = row.max_width,
+                tf = row.max_fps,
+                out = row.fps,
+                inn = row.samples_in_fps,
+                st = row.stale_fps,
+                dr = row.drop_rate_fps,
+                dd = row.drop_delta_fps,
+                dk = row.drop_key_fps,
+                gap = row.emit_gap_max_ms,
+                cu = row.avg_copy_us,
+                dec = if row.decoder.is_empty() {
+                    "?"
+                } else {
+                    row.decoder.as_str()
+                },
             );
-            log_stream_debug_rows(&self.debug_rows);
-            self.last_debug_log = Instant::now();
         }
     }
 
@@ -608,20 +680,23 @@ impl ViewerApp {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "UI {:.1} fps │ tex uploads {:.1}/s ({:.1} MiB/s, avg {:.0} µs) │ Arc clone {:.1}/s │ D toggles",
+                        "UI {:.1} fps (dt_max {}ms) │ tex {:.1}/s skip {:.1}/s (avg {:.0}µs max {}µs pass_max {}µs) │ D toggles",
                         self.ui_perf.ui_fps,
+                        self.ui_perf.reported_frame_dt_max_ms,
                         self.ui_perf.upload_fps,
-                        self.ui_perf.upload_mbps,
+                        self.ui_perf.skip_fps,
                         self.ui_perf.avg_upload_us,
-                        self.ui_perf.clone_fps,
+                        self.ui_perf.reported_upload_us_max,
+                        self.ui_perf.reported_tex_pass_us_max,
                     ))
                     .monospace()
                     .size(12.0),
                 );
                 ui.label(
-                    egui::RichText::new(
-                        "stale = appsink replaced a frame the UI never consumed (decode ahead of display)",
-                    )
+                    egui::RichText::new(format!(
+                        "logging → {} (every 2s). drop_rate=wall-clock cap, drop_delta=IDR-prefer, gap_ms=worst emit spacing",
+                        self.stutter_log_path.display()
+                    ))
                     .size(11.0)
                     .color(Color32::from_rgb(160, 160, 160)),
                 );
@@ -630,12 +705,23 @@ impl ViewerApp {
                 let sum_fps: f32 = self.debug_rows.iter().map(|r| r.fps).sum();
                 let sum_stale: f32 = self.debug_rows.iter().map(|r| r.stale_fps).sum();
                 let sum_mbps: f32 = self.debug_rows.iter().map(|r| r.rgba_mbps).sum();
+                let sum_drop_rate: f32 = self.debug_rows.iter().map(|r| r.drop_rate_fps).sum();
+                let sum_drop_delta: f32 = self.debug_rows.iter().map(|r| r.drop_delta_fps).sum();
+                let gap_max = self
+                    .debug_rows
+                    .iter()
+                    .map(|r| r.emit_gap_max_ms)
+                    .max()
+                    .unwrap_or(0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "streams {} │ decode {:.1} fps │ stale {:.1}/s │ RGBA copy {:.1} MiB/s",
+                        "streams {} │ out {:.1} fps │ stale {:.1}/s │ drop_rate {:.1} drop_delta {:.1} │ gap_max {}ms │ RGBA {:.1} MiB/s",
                         self.debug_rows.len(),
                         sum_fps,
                         sum_stale,
+                        sum_drop_rate,
+                        sum_drop_delta,
+                        gap_max,
                         sum_mbps,
                     ))
                     .monospace()
@@ -645,42 +731,33 @@ impl ViewerApp {
 
                 egui::Grid::new("perf_grid")
                     .striped(true)
-                    .min_col_width(56.0)
+                    .min_col_width(48.0)
                     .show(ui, |ui| {
                         ui.label("camera");
-                        ui.label("run");
-                        ui.label("tier");
-                        ui.label("size");
-                        ui.label("fps");
+                        ui.label("out");
+                        ui.label("in");
                         ui.label("stale");
-                        ui.label("MiB/s");
+                        ui.label("d_rate");
+                        ui.label("d_delta");
+                        ui.label("gap");
                         ui.label("copyµs");
                         ui.label("dec");
-                        ui.label("err");
                         ui.end_row();
 
                         for row in &self.debug_rows {
                             ui.label(&row.id);
-                            ui.label(if row.running { "Y" } else { "N" });
-                            ui.label(format!("{}@{}", row.max_width, row.max_fps));
-                            ui.label(format!("{}x{}", row.width, row.height));
                             ui.label(format!("{:.1}", row.fps));
+                            ui.label(format!("{:.1}", row.samples_in_fps));
                             ui.label(format!("{:.1}", row.stale_fps));
-                            ui.label(format!("{:.2}", row.rgba_mbps));
+                            ui.label(format!("{:.1}", row.drop_rate_fps));
+                            ui.label(format!("{:.1}", row.drop_delta_fps));
+                            ui.label(format!("{}", row.emit_gap_max_ms));
                             ui.label(format!("{:.0}", row.avg_copy_us));
                             ui.label(if row.decoder.is_empty() {
                                 "?"
                             } else {
                                 row.decoder.as_str()
                             });
-                            ui.colored_label(
-                                if row.error.is_some() {
-                                    Color32::from_rgb(255, 120, 100)
-                                } else {
-                                    Color32::from_rgb(180, 180, 180)
-                                },
-                                row.error.as_deref().unwrap_or("-"),
-                            );
                             ui.end_row();
                         }
                     });
@@ -765,12 +842,42 @@ impl ViewerApp {
             };
             let draw = fitted_rect(cell, aspect, self.fit);
             let painter = ui.painter().with_clip_rect(cell);
+            let live = self.streams.has_live_frame(&cam.id);
+            let reconnecting = self.streams.is_reconnecting(&cam.id);
+            let err = self.streams.error(&cam.id);
+            let waiting = self.streams.is_running(&cam.id) && !live;
+            let tint = if live && err.is_none() {
+                Color32::WHITE
+            } else {
+                // Hold last good frame dimmed while reconnecting / waiting for keyframe.
+                Color32::from_rgb(160, 160, 160)
+            };
             painter.image(
                 tex.handle.id(),
                 draw,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
+                tint,
             );
+            let overlay = if self.paused {
+                Some("Paused")
+            } else if reconnecting {
+                Some("Reconnecting…")
+            } else if waiting {
+                Some("Connecting…")
+            } else if err.is_some() {
+                Some("Error")
+            } else {
+                None
+            };
+            if let Some(msg) = overlay {
+                ui.painter().text(
+                    cell.center(),
+                    egui::Align2::CENTER_CENTER,
+                    msg,
+                    egui::FontId::proportional(14.0),
+                    Color32::from_rgb(220, 220, 220),
+                );
+            }
         } else {
             let msg = if self.paused {
                 "Paused".to_string()
@@ -778,6 +885,8 @@ impl ViewerApp {
                 format!("Error\n{err}")
             } else if self.streams.is_running(&cam.id) {
                 "Connecting…".to_string()
+            } else if self.streams.is_reconnecting(&cam.id) {
+                "Reconnecting…".to_string()
             } else {
                 "Offline".to_string()
             };

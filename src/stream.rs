@@ -5,7 +5,7 @@ use gstreamer_app::{AppSink, AppSinkCallbacks};
 use gstreamer_video::VideoFrameExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -33,16 +33,43 @@ pub struct StreamRequest {
 }
 
 /// Live counters written on the appsink thread; cheap atomics for optimising.
-#[derive(Default)]
 struct SlotCounters {
     frames_out: AtomicU64,
     /// Frame replaced in the ring before the UI consumed it.
     frames_stale: AtomicU64,
     bytes_copied: AtomicU64,
     copy_ns: AtomicU64,
+    /// appsink new_sample invocations (before drop filters).
+    samples_in: AtomicU64,
+    drop_rate: AtomicU64,
+    drop_delta: AtomicU64,
+    drop_key: AtomicU64,
+    drop_corrupt: AtomicU64,
+    /// Max gap between successful emits in this run (ms), reset by snapshot.
+    emit_gap_max_ms: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
-    decoder: Mutex<String>,
+    decoder: Arc<Mutex<String>>,
+}
+
+impl Default for SlotCounters {
+    fn default() -> Self {
+        Self {
+            frames_out: AtomicU64::new(0),
+            frames_stale: AtomicU64::new(0),
+            bytes_copied: AtomicU64::new(0),
+            copy_ns: AtomicU64::new(0),
+            samples_in: AtomicU64::new(0),
+            drop_rate: AtomicU64::new(0),
+            drop_delta: AtomicU64::new(0),
+            drop_key: AtomicU64::new(0),
+            drop_corrupt: AtomicU64::new(0),
+            emit_gap_max_ms: AtomicU64::new(0),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            decoder: Arc::new(Mutex::new(String::new())),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +86,13 @@ pub struct StreamDebugRow {
     /// RGBA payload throughput from appsink copies.
     pub rgba_mbps: f32,
     pub avg_copy_us: f32,
+    pub samples_in_fps: f32,
+    pub drop_rate_fps: f32,
+    pub drop_delta_fps: f32,
+    pub drop_key_fps: f32,
+    pub drop_corrupt_fps: f32,
+    /// Worst emit-to-emit gap in the last sample window (ms).
+    pub emit_gap_max_ms: u64,
     pub decoder: String,
     pub failures: u32,
     pub error: Option<String>,
@@ -70,6 +104,11 @@ struct SlotRateWindow {
     stale: u64,
     bytes: u64,
     copy_ns: u64,
+    samples_in: u64,
+    drop_rate: u64,
+    drop_delta: u64,
+    drop_key: u64,
+    drop_corrupt: u64,
     at: Instant,
 }
 
@@ -116,6 +155,10 @@ struct SlotState {
     transport: TransportMode,
     frame: Arc<Mutex<Option<Arc<VideoFrame>>>>,
     latest_seq: Arc<AtomicU64>,
+    /// False until appsink sees a non-DELTA (key) frame — avoids green mid-GOP flash.
+    seen_keyframe: Arc<AtomicBool>,
+    /// Wall-clock nanos of last appsink emit (rate limit without videorate/PTS).
+    last_emit_ns: Arc<AtomicU64>,
     error: Arc<Mutex<Option<String>>>,
     counters: Arc<SlotCounters>,
     rate_window: SlotRateWindow,
@@ -207,6 +250,8 @@ impl StreamManager {
                     transport: initial_transport,
                     frame: Arc::new(Mutex::new(None)),
                     latest_seq: Arc::new(AtomicU64::new(0)),
+                    seen_keyframe: Arc::new(AtomicBool::new(false)),
+                    last_emit_ns: Arc::new(AtomicU64::new(0)),
                     error: Arc::new(Mutex::new(None)),
                     counters: Arc::new(SlotCounters::default()),
                     rate_window: SlotRateWindow::fresh(),
@@ -304,19 +349,21 @@ impl StreamManager {
         self.slots.clear();
     }
 
-    /// Returns a frame only when `seq` is newer than `seen_seq` (Arc clone, not pixel copy).
+    /// Takes the latest frame when `seq` is newer than `seen_seq` so the UI can
+    /// `try_unwrap` without an RGBA clone. Clears the ring slot until appsink
+    /// writes the next frame.
     pub fn frame_if_newer(&self, camera_id: &str, seen_seq: u64) -> Option<Arc<VideoFrame>> {
         let slot = self.slots.get(camera_id)?;
         let seq = slot.latest_seq.load(Ordering::Acquire);
         if seq == 0 || seq == seen_seq {
             return None;
         }
-        let guard = slot.frame.lock();
+        let mut guard = slot.frame.lock();
         let frame = guard.as_ref()?;
         if frame.seq == seen_seq {
             return None;
         }
-        Some(Arc::clone(frame))
+        guard.take()
     }
 
     pub fn error(&self, camera_id: &str) -> Option<String> {
@@ -330,6 +377,22 @@ impl StreamManager {
             .unwrap_or(false)
     }
 
+    /// True once a keyframe has been delivered for the current pipeline run.
+    pub fn has_live_frame(&self, camera_id: &str) -> bool {
+        self.slots
+            .get(camera_id)
+            .map(|s| s.latest_seq.load(Ordering::Acquire) > 0)
+            .unwrap_or(false)
+    }
+
+    /// Pipeline is down but a reconnect is scheduled (error/eos backoff).
+    pub fn is_reconnecting(&self, camera_id: &str) -> bool {
+        self.slots
+            .get(camera_id)
+            .map(|s| s.pipeline.is_none() && s.reconnect_at.is_some())
+            .unwrap_or(false)
+    }
+
     /// Per-stream rates since the previous call (call ~1×/s from the UI).
     pub fn debug_snapshot(&mut self) -> Vec<StreamDebugRow> {
         let now = Instant::now();
@@ -339,6 +402,15 @@ impl StreamManager {
             let stale = slot.counters.frames_stale.load(Ordering::Relaxed);
             let bytes = slot.counters.bytes_copied.load(Ordering::Relaxed);
             let copy_ns = slot.counters.copy_ns.load(Ordering::Relaxed);
+            let samples_in = slot.counters.samples_in.load(Ordering::Relaxed);
+            let drop_rate = slot.counters.drop_rate.load(Ordering::Relaxed);
+            let drop_delta = slot.counters.drop_delta.load(Ordering::Relaxed);
+            let drop_key = slot.counters.drop_key.load(Ordering::Relaxed);
+            let drop_corrupt = slot.counters.drop_corrupt.load(Ordering::Relaxed);
+            let emit_gap_max_ms = slot
+                .counters
+                .emit_gap_max_ms
+                .swap(0, Ordering::Relaxed);
             let dt = now
                 .saturating_duration_since(slot.rate_window.at)
                 .as_secs_f32()
@@ -347,12 +419,23 @@ impl StreamManager {
             let d_stale = stale.saturating_sub(slot.rate_window.stale) as f32;
             let d_bytes = bytes.saturating_sub(slot.rate_window.bytes) as f32;
             let d_copy_ns = copy_ns.saturating_sub(slot.rate_window.copy_ns);
+            let d_samples = samples_in.saturating_sub(slot.rate_window.samples_in) as f32;
+            let d_drop_rate = drop_rate.saturating_sub(slot.rate_window.drop_rate) as f32;
+            let d_drop_delta = drop_delta.saturating_sub(slot.rate_window.drop_delta) as f32;
+            let d_drop_key = drop_key.saturating_sub(slot.rate_window.drop_key) as f32;
+            let d_drop_corrupt =
+                drop_corrupt.saturating_sub(slot.rate_window.drop_corrupt) as f32;
             let d_frame_i = d_frames.max(1.0);
             slot.rate_window = SlotRateWindow {
                 frames,
                 stale,
                 bytes,
                 copy_ns,
+                samples_in,
+                drop_rate,
+                drop_delta,
+                drop_key,
+                drop_corrupt,
                 at: now,
             };
 
@@ -368,6 +451,12 @@ impl StreamManager {
                 stale_fps: d_stale / dt,
                 rgba_mbps: (d_bytes / dt) / (1024.0 * 1024.0),
                 avg_copy_us: (d_copy_ns as f32 / d_frame_i) / 1000.0,
+                samples_in_fps: d_samples / dt,
+                drop_rate_fps: d_drop_rate / dt,
+                drop_delta_fps: d_drop_delta / dt,
+                drop_key_fps: d_drop_key / dt,
+                drop_corrupt_fps: d_drop_corrupt / dt,
+                emit_gap_max_ms,
                 decoder: slot.counters.decoder.lock().clone(),
                 failures: slot.failures,
                 error: slot.error.lock().clone(),
@@ -398,6 +487,11 @@ impl SlotRateWindow {
             stale: 0,
             bytes: 0,
             copy_ns: 0,
+            samples_in: 0,
+            drop_rate: 0,
+            drop_delta: 0,
+            drop_key: 0,
+            drop_corrupt: 0,
             at: Instant::now(),
         }
     }
@@ -409,11 +503,17 @@ pub fn log_stream_debug_rows(rows: &[StreamDebugRow]) {
     let fps: f32 = rows.iter().map(|r| r.fps).sum();
     let mbps: f32 = rows.iter().map(|r| r.rgba_mbps).sum();
     let stale: f32 = rows.iter().map(|r| r.stale_fps).sum();
+    let drop_rate: f32 = rows.iter().map(|r| r.drop_rate_fps).sum();
+    let drop_delta: f32 = rows.iter().map(|r| r.drop_delta_fps).sum();
+    let gap_max = rows.iter().map(|r| r.emit_gap_max_ms).max().unwrap_or(0);
     info!(
         streams = n,
         running,
         decode_fps = format!("{fps:.1}"),
         stale_fps = format!("{stale:.1}"),
+        drop_rate_fps = format!("{drop_rate:.1}"),
+        drop_delta_fps = format!("{drop_delta:.1}"),
+        emit_gap_max_ms = gap_max,
         rgba_mib_s = format!("{mbps:.1}"),
         "perf summary"
     );
@@ -426,6 +526,11 @@ pub fn log_stream_debug_rows(rows: &[StreamDebugRow]) {
             size = format!("{}x{}", row.width, row.height),
             fps = format!("{:.1}", row.fps),
             stale = format!("{:.1}", row.stale_fps),
+            in_fps = format!("{:.1}", row.samples_in_fps),
+            drop_rate = format!("{:.1}", row.drop_rate_fps),
+            drop_delta = format!("{:.1}", row.drop_delta_fps),
+            drop_key = format!("{:.1}", row.drop_key_fps),
+            gap_ms = row.emit_gap_max_ms,
             rgba_mib_s = format!("{:.2}", row.rgba_mbps),
             copy_us = format!("{:.0}", row.avg_copy_us),
             decoder = %row.decoder,
@@ -467,6 +572,8 @@ fn stop_slot_inner(slot: &mut SlotState) {
     }
     *slot.frame.lock() = None;
     slot.latest_seq.store(0, Ordering::Release);
+    slot.seen_keyframe.store(false, Ordering::Release);
+    slot.last_emit_ns.store(0, Ordering::Release);
 }
 
 fn schedule_reconnect(slot: &mut SlotState) {
@@ -480,21 +587,67 @@ fn schedule_reconnect(slot: &mut SlotState) {
     slot.reconnect_at = Some(Instant::now() + Duration::from_secs(secs));
 }
 
+fn try_explicit_link(
+    pad: &gst::Pad,
+    pipeline_weak: &gst::glib::object::WeakRef<gst::Pipeline>,
+    queue_weak: &gst::glib::object::WeakRef<gst::Element>,
+    max_width: i32,
+    max_height: i32,
+    decoder_name_out: &Arc<Mutex<String>>,
+    camera_id: &str,
+    link_once: &Arc<AtomicBool>,
+) {
+    if link_once.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(pipeline) = pipeline_weak.upgrade() else {
+        link_once.store(false, Ordering::Release);
+        return;
+    };
+    let Some(queue) = queue_weak.upgrade() else {
+        link_once.store(false, Ordering::Release);
+        return;
+    };
+    if let Err(err) = crate::gst_link::link_explicit_video(
+        &pipeline,
+        pad,
+        &queue,
+        max_width,
+        max_height,
+        decoder_name_out,
+    ) {
+        warn!(
+            camera = %camera_id,
+            error = %format!("{err:#}"),
+            "explicit video link failed"
+        );
+        link_once.store(false, Ordering::Release);
+    }
+}
+
 fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
     *slot.error.lock() = None;
     slot.reconnect_at = None;
+    slot.seen_keyframe.store(false, Ordering::Release);
+    slot.latest_seq.store(0, Ordering::Release);
+    slot.last_emit_ns.store(0, Ordering::Release);
+    *slot.frame.lock() = None;
 
     let pipeline = gst::Pipeline::new();
 
     // Low-latency RTSP; dense grids use smaller max_width / max_fps.
-    const RTSP_LATENCY_MS: u32 = 200;
-    const MAX_LATENESS_NS: i64 = 100_000_000;
     let max_width = slot.max_width.max(1);
     let max_fps = slot.max_fps.max(1);
     // Bound both axes so portrait/substreams don't stay huge after width-only scale
     // (e.g. 320×576 was still ~2× the pixel cost of 320×180).
     let max_height = max_width;
-    let clock_sync = true;
+    // Live CCTV: never clock-sync the sink. Sync holds for running-time then
+    // drops late frames in bursts — feels like a hitch every ~GOP (often 1s).
+    let clock_sync = false;
+    let max_lateness: i64 = -1;
+    // Smooth ~1s GOP / I-frame spikes: give the jitterbuffer ~half a second and
+    // do not drop-on-latency (that was clipping around keyframes → gap_ms 300–900).
+    let rtsp_latency_ms: u32 = if max_width > 640 { 500 } else { 450 };
     // GstVideoScaleMethod nick is "nearest-neighbour", not "nearest".
     let scale_method = if max_width <= 400 {
         "nearest-neighbour"
@@ -505,9 +658,9 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
     let src = gst::ElementFactory::make("rtspsrc")
         .name("src")
         .property("location", &slot.url)
-        .property("latency", RTSP_LATENCY_MS)
+        .property("latency", rtsp_latency_ms)
         .property_from_str("protocols", slot.transport.as_gst())
-        .property("drop-on-latency", true)
+        .property("drop-on-latency", false)
         .property("do-retransmission", false)
         .property("do-rtsp-keep-alive", true)
         .property("timeout", 5_000_000u64)
@@ -518,7 +671,8 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
     info!(
         camera = %slot.camera_id,
         transport = slot.transport.as_gst(),
-        latency_ms = RTSP_LATENCY_MS,
+        latency_ms = rtsp_latency_ms,
+        drop_on_latency = false,
         max_width,
         max_fps,
         sync = clock_sync,
@@ -534,32 +688,19 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
         }
     }
 
-    let decode = gst::ElementFactory::make("decodebin")
-        .name("decode")
-        .build()
-        .context("create decodebin")?;
-
-    // Tiny leaky queue after decode/download: prefer latest frame over backlog
-    // on low-power hosts (deep queues caused 100% stale + high RGBA copy).
+    // Short leaky queue after decode/download: absorb I-frame decode bursts
+    // without a deep backlog (deep queues used to drive 100% stale).
     let queue = gst::ElementFactory::make("queue")
         .name("q")
-        .property("max-size-buffers", 2u32)
+        .property("max-size-buffers", 4u32)
         .property("max-size-bytes", 0u32)
         .property("max-size-time", 0u64)
         .property_from_str("leaky", "downstream")
         .build()
         .context("create queue")?;
 
-    // drop-only + max-rate: live RTSP buffers often lack DURATION; classic
-    // videorate + framerate caps asserts and aborts the process.
-    let rate = gst::ElementFactory::make("videorate")
-        .name("rate")
-        .property("skip-to-first", true)
-        .property("drop-only", true)
-        .property("max-rate", max_fps)
-        .build()
-        .context("create videorate")?;
-
+    // No videorate: live PTS/DISCONT around IDR made it clump frames (gap_ms
+    // 300–900 while out≈15). FPS is already limited by substream/tier + appsink drop.
     let convert = gst::ElementFactory::make("videoconvert")
         .name("convert")
         .property_from_str("n-threads", "0")
@@ -594,81 +735,88 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
         .property("drop", true)
         .property("sync", clock_sync)
         .property("qos", false)
-        .property("max-lateness", MAX_LATENESS_NS)
+        .property("max-lateness", max_lateness)
         .property("emit-signals", false)
         .build()
         .context("create appsink")?;
 
-    pipeline.add_many([
-        &src, &decode, &queue, &rate, &convert, &scale, &caps, &sink,
-    ])?;
-    gst::Element::link_many([&queue, &rate, &convert, &scale, &caps, &sink])
+    pipeline.add_many([&src, &queue, &convert, &scale, &caps, &sink])?;
+    gst::Element::link_many([&queue, &convert, &scale, &caps, &sink])
         .context("link queue → appsink")?;
 
-    let decode_weak = decode.downgrade();
-    src.connect_pad_added(move |_src, pad| {
-        let Some(decode) = decode_weak.upgrade() else {
-            return;
-        };
-        let Some(sink_pad) = decode.static_pad("sink") else {
-            return;
-        };
-        if sink_pad.is_linked() {
-            return;
-        }
-        if let Err(err) = pad.link(&sink_pad) {
-            warn!("rtspsrc → decodebin link failed: {err}");
-        }
-    });
+    // Drop mid-GOP / corrupt buffers as early as possible (before convert), so
+    // appsink never uploads green flash frames after connect/reconnect.
+    let seen_kf_probe = Arc::clone(&slot.seen_keyframe);
+    if let Some(queue_sink) = queue.static_pad("sink") {
+        queue_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            let Some(buffer) = info.buffer() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let flags = buffer.flags();
+            if seen_kf_probe.load(Ordering::Acquire) {
+                if flags.contains(gst::BufferFlags::CORRUPTED) {
+                    return gst::PadProbeReturn::Drop;
+                }
+                return gst::PadProbeReturn::Ok;
+            }
+            if flags.contains(gst::BufferFlags::DELTA_UNIT)
+                || flags.contains(gst::BufferFlags::CORRUPTED)
+            {
+                return gst::PadProbeReturn::Drop;
+            }
+            seen_kf_probe.store(true, Ordering::Release);
+            gst::PadProbeReturn::Ok
+        });
+    }
 
+    // Explicit depay/parse/decode (no decodebin) — isolates GOP hitch vs bin
+    // autoconfig. Override with RUSTCAMS_DECODE=sw for software avdec_*.
     let pipeline_weak = pipeline.downgrade();
     let queue_weak = queue.downgrade();
     let max_width_link = max_width;
     let max_height_link = max_height;
-    decode.connect_pad_added(move |_dbin, src_pad| {
-        if let Some(caps) = src_pad.current_caps() {
+    let decoder_name_out = Arc::clone(&slot.counters.decoder);
+    let cam_for_link = slot.camera_id.clone();
+    let link_once = Arc::new(AtomicBool::new(false));
+    src.connect_pad_added(move |_src, pad| {
+        if let Some(caps) = pad.current_caps() {
             if crate::gst_link::is_audio_caps(&caps) {
                 return;
             }
         }
 
-        let caps = src_pad
+        let caps = pad
             .current_caps()
-            .unwrap_or_else(|| src_pad.query_caps(None));
-        let need_caps_notify = caps.is_any() || src_pad.current_caps().is_none();
-        if need_caps_notify {
+            .unwrap_or_else(|| pad.query_caps(None));
+        if caps.is_any() || pad.current_caps().is_none() {
             let pipeline_weak = pipeline_weak.clone();
             let queue_weak = queue_weak.clone();
-            src_pad.connect_notify(Some("caps"), move |pad, _| {
-                let Some(pipeline) = pipeline_weak.upgrade() else {
-                    return;
-                };
-                let Some(queue) = queue_weak.upgrade() else {
-                    return;
-                };
-                crate::gst_link::link_decodebin_video_pad(
-                    &pipeline,
+            let decoder_name_out = Arc::clone(&decoder_name_out);
+            let cam_for_link = cam_for_link.clone();
+            let link_once = Arc::clone(&link_once);
+            pad.connect_notify(Some("caps"), move |pad, _| {
+                try_explicit_link(
                     pad,
-                    &queue,
+                    &pipeline_weak,
+                    &queue_weak,
                     max_width_link,
                     max_height_link,
+                    &decoder_name_out,
+                    &cam_for_link,
+                    &link_once,
                 );
             });
             return;
         }
-
-        let Some(pipeline) = pipeline_weak.upgrade() else {
-            return;
-        };
-        let Some(queue) = queue_weak.upgrade() else {
-            return;
-        };
-        crate::gst_link::link_decodebin_video_pad(
-            &pipeline,
-            src_pad,
-            &queue,
+        try_explicit_link(
+            pad,
+            &pipeline_weak,
+            &queue_weak,
             max_width_link,
             max_height_link,
+            &decoder_name_out,
+            &cam_for_link,
+            &link_once,
         );
     });
 
@@ -678,13 +826,32 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
 
     let frame_store = Arc::clone(&slot.frame);
     let latest_seq = Arc::clone(&slot.latest_seq);
+    let seen_keyframe = Arc::clone(&slot.seen_keyframe);
+    let last_emit_ns = Arc::clone(&slot.last_emit_ns);
     let counters = Arc::clone(&slot.counters);
     let seq = Arc::clone(seq);
     appsink.set_callbacks(
         AppSinkCallbacks::builder()
             .new_sample(move |appsink| {
                 let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Error)?;
+                counters.samples_in.fetch_add(1, Ordering::Relaxed);
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                // Wait for a keyframe after connect/reconnect. Mid-GOP joins often
+                // yield green/corrupt decoded frames until the next IDR.
+                let flags = buffer.flags();
+                if !seen_keyframe.load(Ordering::Acquire) {
+                    if flags.contains(gst::BufferFlags::DELTA_UNIT)
+                        || flags.contains(gst::BufferFlags::CORRUPTED)
+                    {
+                        counters.drop_key.fetch_add(1, Ordering::Relaxed);
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                    seen_keyframe.store(true, Ordering::Release);
+                } else if flags.contains(gst::BufferFlags::CORRUPTED) {
+                    counters.drop_corrupt.fetch_add(1, Ordering::Relaxed);
+                    return Ok(gst::FlowSuccess::Ok);
+                }
+
                 let caps = sample.caps().ok_or(gst::FlowError::Error)?;
                 let info = gstreamer_video::VideoInfo::from_caps(caps)
                     .map_err(|_| gst::FlowError::Error)?;
@@ -722,6 +889,23 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
                 // Otherwise the UI can observe a new sequence with the old frame and
                 // unnecessarily defer presentation until its next repaint.
                 latest_seq.store(seq_n, Ordering::Release);
+                let now_ns = mono_ns();
+                let last = last_emit_ns.swap(now_ns, Ordering::Relaxed);
+                if last != 0 {
+                    let gap_ms = now_ns.saturating_sub(last) / 1_000_000;
+                    let mut prev = counters.emit_gap_max_ms.load(Ordering::Relaxed);
+                    while gap_ms > prev {
+                        match counters.emit_gap_max_ms.compare_exchange_weak(
+                            prev,
+                            gap_ms,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(p) => prev = p,
+                        }
+                    }
+                }
                 counters.frames_out.fetch_add(1, Ordering::Relaxed);
                 counters.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
                 counters.copy_ns.fetch_add(copy_ns, Ordering::Relaxed);
@@ -732,24 +916,17 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
             .build(),
     );
 
-    let counters_dec = Arc::clone(&slot.counters);
-    let cam_for_dec = slot.camera_id.clone();
-    pipeline.connect_deep_element_added(move |_bin, _sub_bin, element| {
-        let Some(factory) = element.factory() else {
-            return;
-        };
-        let name = factory.name().to_string();
-        let lname = name.to_ascii_lowercase();
-        if lname.contains("decodebin") || !lname.contains("dec") {
-            return;
-        }
-        *counters_dec.decoder.lock() = name.clone();
-        info!(camera = %cam_for_dec, decoder = %name, "decode element selected");
-    });
-
     pipeline
         .set_state(gst::State::Playing)
         .context("set pipeline Playing")?;
+
+    // Request an IDR ASAP after mid-stream join (PLI/FIR via rtspsrc when possible).
+    if let Some(sink_pad) = appsink.static_pad("sink") {
+        let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        let _ = sink_pad.send_event(ev);
+    }
 
     slot.pipeline = Some(pipeline);
     info!(
@@ -761,6 +938,13 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
         "pipeline started"
     );
     Ok(())
+}
+
+/// Monotonic nanoseconds since first call (wall-clock rate limit; not PTS).
+fn mono_ns() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 fn copy_rgba_plane(src: &[u8], stride: usize, row_bytes: usize, height: usize) -> Option<Vec<u8>> {
