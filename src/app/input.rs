@@ -1,5 +1,4 @@
 use super::ViewerApp;
-use crate::layout::Layout;
 use crate::ptz::{PtzVector, PTZ_MOVE_SPEED, PTZ_ZOOM_SPEED};
 use eframe::egui;
 use gilrs::{Axis, Button};
@@ -10,7 +9,9 @@ const PTZ_STICK_DEADZONE: f32 = 0.2;
 impl ViewerApp {
     pub(super) fn handle_keys(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.fullscreen_slot.is_some() {
+            if self.show_settings {
+                self.show_settings = false;
+            } else if self.fullscreen_slot.is_some() {
                 self.exit_fullscreen();
             } else if self.window_fullscreen {
                 self.set_window_fullscreen(ctx, false);
@@ -18,6 +19,7 @@ impl ViewerApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.fit = self.fit.cycle();
+            self.save_ui_prefs();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::D)) {
             self.debug_overlay = !self.debug_overlay;
@@ -25,27 +27,6 @@ impl ViewerApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::L)) {
             self.show_log = !self.show_log;
-        }
-
-        let layout_key = ctx.input(|i| {
-            if i.key_pressed(egui::Key::Num1) {
-                Some(Layout::One)
-            } else if i.key_pressed(egui::Key::Num2) {
-                Some(Layout::Two)
-            } else if i.key_pressed(egui::Key::Num3) {
-                Some(Layout::Grid3)
-            } else if i.key_pressed(egui::Key::Num4) {
-                Some(Layout::Grid4)
-            } else if i.key_pressed(egui::Key::Num5) {
-                Some(Layout::Grid5)
-            } else if i.key_pressed(egui::Key::Num6) {
-                Some(Layout::Grid6)
-            } else {
-                None
-            }
-        });
-        if let Some(layout) = layout_key {
-            self.set_layout(layout);
         }
     }
     /// Poll keyboard + DualShock axes into a continuous PTZ command.

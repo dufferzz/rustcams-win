@@ -217,6 +217,11 @@ function Sync-PackageConfigs([string]$PackageDir) {
     foreach ($name in @("cameras.toml", "views.toml")) {
         $dest = Join-Path $PackageDir $name
         $fromRoot = Join-Path $repoRoot $name
+        # Keep the packaged view layout (camera slots) — do not clobber with repo views.toml.
+        if ($name -eq "views.toml" -and (Test-Path $dest)) {
+            Write-Host "  = $name (keeping packaged layout)"
+            continue
+        }
         if (Test-Path $fromRoot) {
             Copy-Item $fromRoot $dest -Force
             Write-Host "  + $name (from repo root)"
@@ -309,11 +314,14 @@ foreach ($h in @("gst-plugin-scanner.exe", "gst-inspect-1.0.exe")) {
 
 Sync-PackageConfigs $out
 
-# Restore cameras.toml / views.toml from prior dist when repo root has none.
+# Restore cameras.toml from prior dist when repo root has none.
+# Always restore views.toml from the previous package so camera layouts survive a wipe.
 foreach ($name in @("cameras.toml", "views.toml")) {
     $dest = Join-Path $out $name
     $fromPrev = Join-Path $preserveDir $name
-    if (-not (Test-Path $dest) -and (Test-Path $fromPrev)) {
+    if (-not (Test-Path $fromPrev)) { continue }
+    $preferPrev = ($name -eq "views.toml") -or (-not (Test-Path $dest))
+    if ($preferPrev) {
         Copy-Item $fromPrev $dest -Force
         Write-Host "  + $name (preserved from previous package)"
     }

@@ -28,6 +28,13 @@ url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
 # id = "front_ptz"
 # name = "Front PTZ"
 # url = "rtsp://admin:camera-password@192.0.2.10:554/Streaming/Channels/102"
+#
+# PTZ is on when id/name contains "ptz", or set ptz = true (e.g. Yard).
+# [[cameras]]
+# id = "moat_corner"
+# name = "Yard"
+# url = "rtsp://admin:camera-password@203.0.113.50:554/Streaming/Channels/102"
+# ptz = true
 
 [viewer]
 app_name = "Citadel CCTV"

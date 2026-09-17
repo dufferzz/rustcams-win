@@ -2,8 +2,7 @@ mod input;
 mod settings;
 mod ui;
 
-use crate::config::{AppConfig, CameraConfig, ResolvedConfig, StreamType};
-use settings::SettingsState;
+use crate::config::{CameraConfig, ResolvedConfig, StreamType};
 use crate::layout::{FitMode, Layout};
 use crate::log_buffer::LogBuffer;
 use crate::nvr::rewrite_stream_digit;
@@ -142,10 +141,8 @@ impl UiPerf {
 }
 
 pub struct ViewerApp {
-    config_path: PathBuf,
     /// Shown when config is missing / empty / failed to load.
     config_warning: Option<String>,
-    settings: SettingsState,
     cameras: Vec<CameraConfig>,
     camera_index: HashMap<String, usize>,
     streams: StreamManager,
@@ -163,7 +160,7 @@ pub struct ViewerApp {
     textures: HashMap<String, TexCache>,
     stats: SystemStats,
     sidebar_filter: String,
-    /// Camera selected for the PTZ / Presets panel (click in library).
+    /// Camera selected for PTZ / Presets (click a grid cell or the library).
     sidebar_ptz_cam: Option<String>,
     sidebar_controls: SidebarControls,
     rename_buffer: String,
@@ -184,6 +181,13 @@ pub struct ViewerApp {
     stutter_log_path: PathBuf,
     /// In-app log / console window (OS console is hidden on Windows release builds).
     show_log: bool,
+    show_settings: bool,
+    /// Selection / outline color (default on-view blue).
+    accent: Color32,
+    outline_width: f32,
+    camera_list_open: bool,
+    sidebar_open: bool,
+    ui_prefs_path: PathBuf,
     log_buffer: LogBuffer,
     log_auto_scroll: bool,
     log_view_generation: u64,
@@ -221,10 +225,21 @@ impl ViewerApp {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("views.toml");
-        let views = ViewStore::load_or_default(&views_path, &camera_ids, layout);
+        let mut views = ViewStore::load_or_default(&views_path, &camera_ids, layout);
 
-        let draft = AppConfig::read(&config_path).unwrap_or_default();
-        let settings = SettingsState::from_config(draft);
+        let ui_prefs_path = settings::UiPrefs::path_next_to(&config_path);
+        let ui_prefs = settings::UiPrefs::load(&ui_prefs_path);
+        if let Some(name) = ui_prefs.last_view.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            if let Some(i) = views.views.iter().position(|v| v.name == name) {
+                views.active = i;
+            }
+        }
+        let fit = ui_prefs
+            .fit
+            .as_deref()
+            .map(FitMode::from_str)
+            .unwrap_or(fit);
 
         let ptz = PtzWorker::spawn();
 
@@ -239,10 +254,8 @@ impl ViewerApp {
             }
         };
 
-        Ok(Self {
-            config_path,
+        let app = Self {
             config_warning,
-            settings,
             cameras: cfg.cameras,
             camera_index,
             streams,
@@ -281,61 +294,19 @@ impl ViewerApp {
             ui_perf: UiPerf::new(),
             stutter_log_path,
             show_log: false,
+            show_settings: false,
+            accent: ui_prefs.accent_color(),
+            outline_width: ui_prefs.outline_width(),
+            camera_list_open: ui_prefs.camera_list_open,
+            sidebar_open: ui_prefs.sidebar_open,
+            ui_prefs_path,
             log_buffer,
             log_auto_scroll: true,
             log_view_generation: 0,
             log_view_lines: Vec::new(),
-        })
-    }
-
-    /// Replace runtime cameras after Settings Save & Apply.
-    pub(super) fn apply_resolved(&mut self, cfg: ResolvedConfig) {
-        self.exit_fullscreen();
-        self.streams.stop_all();
-        self.textures.clear();
-
-        let mut camera_index = HashMap::new();
-        for (i, cam) in cfg.cameras.iter().enumerate() {
-            camera_index.insert(cam.id.clone(), i);
-        }
-        let known: std::collections::HashSet<String> =
-            cfg.cameras.iter().map(|c| c.id.clone()).collect();
-
-        for view in &mut self.views.views {
-            for slot in &mut view.slots {
-                if let Some(id) = slot.as_ref() {
-                    if !known.contains(id) {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-        self.views.mark_dirty();
-
-        self.cameras = cfg.cameras;
-        self.camera_index = camera_index;
-        if let Some(id) = self.sidebar_ptz_cam.as_ref() {
-            let still_ptz = self
-                .camera_by_id(id)
-                .and_then(|c| c.ptz.as_ref())
-                .is_some();
-            if !still_ptz {
-                self.sidebar_ptz_cam = None;
-            }
-        }
-        let name = cfg.viewer.app_name.trim();
-        self.app_name = if name.is_empty() {
-            crate::config::default_app_name()
-        } else {
-            name.to_string()
         };
-        self.pause_when_unfocused = cfg.viewer.pause_when_unfocused;
-        self.fit = FitMode::from_str(&cfg.viewer.default_fit);
-        info!(cameras = self.cameras.len(), "applied new camera config");
-    }
-
-    pub(super) fn apply_app_title(&self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.app_name.clone()));
+        app.save_ui_prefs();
+        Ok(app)
     }
 
     fn camera_by_id(&self, id: &str) -> Option<&CameraConfig> {
@@ -346,6 +317,18 @@ impl ViewerApp {
 
     fn active_layout(&self) -> Layout {
         self.views.active_view().layout
+    }
+
+    fn persist_view_file(&mut self) {
+        if let Err(err) = self.views.save_if_dirty() {
+            warn!("failed to save views: {err:#}");
+        }
+    }
+
+    fn persist_views(&mut self) {
+        self.views.mark_dirty();
+        self.persist_view_file();
+        self.save_ui_prefs();
     }
 
     /// All cameras slotted in the active view.
@@ -582,14 +565,14 @@ impl ViewerApp {
                 }
             }
         }
-        let _ = self.views.save_if_dirty();
+        self.persist_view_file();
     }
 
     fn clear_slot(&mut self, slot_idx: usize) {
         if let Some(slot) = self.views.active_view_mut().slots.get_mut(slot_idx) {
             *slot = None;
             self.views.mark_dirty();
-            let _ = self.views.save_if_dirty();
+            self.persist_view_file();
         }
         if self.fullscreen_slot == Some(slot_idx) {
             self.exit_fullscreen();
@@ -600,7 +583,7 @@ impl ViewerApp {
         self.views.active_view_mut().resize_for_layout(layout);
         self.exit_fullscreen();
         self.views.mark_dirty();
-        let _ = self.views.save_if_dirty();
+        self.persist_view_file();
     }
 
     fn ptz_stop(&mut self) {
@@ -608,7 +591,7 @@ impl ViewerApp {
         self.last_ptz = PtzVector::STOP;
     }
 
-    /// Prefer fullscreen PTZ camera; otherwise the library selection.
+    /// Prefer the fullscreen camera when it has PTZ; otherwise the selection.
     fn active_ptz_target(&self) -> Option<crate::config::PtzTarget> {
         if let Some(slot) = self.fullscreen_slot {
             if let Some(cam_id) = self.views.active_view().slots.get(slot).and_then(|s| s.as_ref())
@@ -624,19 +607,58 @@ impl ViewerApp {
         self.camera_by_id(cam_id)?.ptz.clone()
     }
 
-    fn select_ptz_camera(&mut self, cam_id: &str) {
+    fn select_camera(&mut self, cam_id: &str) {
         let Some(cam) = self.camera_by_id(cam_id) else {
             return;
         };
-        let Some(target) = cam.ptz.clone() else {
+        let changed = self.sidebar_ptz_cam.as_deref() != Some(cam_id);
+        if !changed {
+            return;
+        }
+        let target = cam.ptz.clone();
+        self.ptz_stop();
+        self.sidebar_ptz_cam = Some(cam_id.to_string());
+        if let Some(target) = target {
+            self.ptz.prewarm(target.clone());
+            self.ptz.fetch_presets(target.clone());
+            self.ptz.fetch_park_action(target.clone());
+            self.ptz.fetch_tracking(target);
+        }
+    }
+
+    /// If a grid cell is selected, put `cam_id` in that cell (swap if it is already on the view).
+    fn place_library_camera(&mut self, cam_id: &str) {
+        if self.camera_by_id(cam_id).is_none() {
+            return;
+        }
+        let selected = self.sidebar_ptz_cam.clone();
+        let Some(selected) = selected else {
+            self.select_camera(cam_id);
             return;
         };
-        let changed = self.sidebar_ptz_cam.as_deref() != Some(cam_id);
-        self.sidebar_ptz_cam = Some(cam_id.to_string());
-        if changed {
-            self.ptz.prewarm(target.clone());
-            self.ptz.fetch_presets(target);
+        if selected.as_str() == cam_id {
+            return;
         }
+        let found = {
+            let slots = &self.views.active_view().slots;
+            slots
+                .iter()
+                .position(|s| s.as_deref() == Some(selected.as_str()))
+                .map(|sel_idx| {
+                    let already = slots.iter().position(|s| s.as_deref() == Some(cam_id));
+                    (sel_idx, already)
+                })
+        };
+        let Some((sel_idx, already)) = found else {
+            self.select_camera(cam_id);
+            return;
+        };
+        if let Some(other_idx) = already {
+            self.apply_drop(sel_idx, DragPayload::FromSlot(other_idx));
+        } else {
+            self.apply_drop(sel_idx, DragPayload::FromLibrary(cam_id.to_string()));
+        }
+        self.select_camera(cam_id);
     }
 
     fn enter_fullscreen(&mut self, slot: usize) {
@@ -655,7 +677,7 @@ impl ViewerApp {
             .and_then(|s| s.as_ref())
             .cloned()
         {
-            self.select_ptz_camera(&cam_id);
+            self.select_camera(&cam_id);
         } else if let Some(target) = self.active_ptz_target() {
             self.ptz.prewarm(target);
         }
@@ -706,6 +728,7 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui_perf.tick_frame();
         self.sync_window_fullscreen(ctx);
+        self.apply_accent_visuals(ctx);
         self.handle_keys(ctx);
         self.handle_ptz_input(ctx);
 
@@ -730,29 +753,62 @@ impl eframe::App for ViewerApp {
                 self.toolbar(ui);
             });
 
-            egui::TopBottomPanel::bottom("statusbar")
-                .exact_height(26.0)
-                .frame(
-                    egui::Frame::NONE
-                        .fill(Color32::from_rgb(16, 18, 22))
-                        .inner_margin(egui::Margin::symmetric(10, 4)),
-                )
-                .show(ctx, |ui| {
-                    self.status_bar(ui);
-                });
+            if self.debug_overlay {
+                egui::TopBottomPanel::bottom("statusbar")
+                    .exact_height(26.0)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgb(16, 18, 22))
+                            .inner_margin(egui::Margin::symmetric(10, 4)),
+                    )
+                    .show(ctx, |ui| {
+                        self.status_bar(ui);
+                    });
+            }
 
-            egui::SidePanel::left("cameras")
-                .resizable(true)
-                .default_width(220.0)
-                .width_range(160.0..=360.0)
-                .frame(
-                    egui::Frame::NONE
-                        .fill(Color32::from_rgb(14, 16, 20))
-                        .inner_margin(egui::Margin::symmetric(10, 8)),
-                )
-                .show(ctx, |ui| {
-                    self.camera_sidebar(ui);
-                });
+            if self.sidebar_open {
+                egui::SidePanel::left("cameras")
+                    .resizable(true)
+                    .default_width(220.0)
+                    .width_range(160.0..=360.0)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgb(14, 16, 20))
+                            .inner_margin(egui::Margin::symmetric(10, 8)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("◀")
+                                .on_hover_text("Collapse sidebar")
+                                .clicked()
+                            {
+                                self.sidebar_open = false;
+                                self.save_ui_prefs();
+                            }
+                        });
+                        self.camera_sidebar(ui);
+                    });
+            } else {
+                egui::SidePanel::left("cameras_collapsed")
+                    .exact_width(28.0)
+                    .resizable(false)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgb(14, 16, 20))
+                            .inner_margin(egui::Margin::symmetric(4, 6)),
+                    )
+                    .show(ctx, |ui| {
+                        if ui
+                            .small_button("▶")
+                            .on_hover_text("Show sidebar")
+                            .clicked()
+                        {
+                            self.sidebar_open = true;
+                            self.save_ui_prefs();
+                        }
+                    });
+            }
         }
 
         egui::CentralPanel::default()
@@ -776,24 +832,15 @@ impl eframe::App for ViewerApp {
                 }
 
                 if self.cameras.is_empty() {
-                    let msg = self
-                        .config_warning
-                        .clone()
-                        .unwrap_or_else(|| {
-                            "No cameras configured — open Settings to add streams.".into()
-                        });
+                    let msg = self.config_warning.clone().unwrap_or_else(|| {
+                        "No cameras configured — edit cameras.toml to add streams.".into()
+                    });
                     ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new(msg)
-                                    .size(18.0)
-                                    .color(Color32::from_rgb(255, 190, 70)),
-                            );
-                            ui.add_space(12.0);
-                            if ui.button("⚙ Open Settings").clicked() {
-                                self.open_settings();
-                            }
-                        });
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .size(18.0)
+                                .color(Color32::from_rgb(255, 190, 70)),
+                        );
                     });
                     return;
                 }
@@ -809,7 +856,7 @@ impl eframe::App for ViewerApp {
                     if let Some(id) = cam_id {
                         if let Some(cam) = self.camera_by_id(&id).cloned() {
                             let response = ui.interact(full, Id::new("fs"), Sense::click());
-                            self.paint_cell_contents(ui, &cam, full, response.hovered());
+                            self.paint_cell_contents(ui, &cam, full, response.hovered(), false);
                             if response.double_clicked() {
                                 self.exit_fullscreen();
                             }
@@ -823,9 +870,9 @@ impl eframe::App for ViewerApp {
                 self.draw_grid(ui, full);
             });
 
-        self.settings_window(ctx);
         self.draw_debug_panel(ctx);
         self.draw_log_panel(ctx);
+        self.settings_window(ctx);
 
         if let Err(err) = self.views.save_if_dirty() {
             warn!("failed to save views: {err:#}");

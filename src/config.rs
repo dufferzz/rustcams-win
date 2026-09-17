@@ -102,6 +102,9 @@ pub struct CameraEntry {
     /// Optional RTSP transport: "udp", "tcp", or "udp+tcp"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocols: Option<String>,
+    /// Enable ISAPI PTZ. If omitted, ids/names containing `"ptz"` are treated as PTZ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptz: Option<bool>,
 }
 
 /// HTTP Digest target for Hikvision ISAPI PTZ (host includes port).
@@ -379,11 +382,16 @@ fn resolve_ptz_target(
     nvr: Option<&NvrConfig>,
     nvr_channel: Option<u32>,
 ) -> Option<PtzTarget> {
-    let wants_ptz = entry.id.to_ascii_lowercase().contains("ptz")
-        || entry
-            .name
-            .as_deref()
-            .is_some_and(|n| n.to_ascii_lowercase().contains("ptz"));
+    let wants_ptz = match entry.ptz {
+        Some(flag) => flag,
+        None => {
+            entry.id.to_ascii_lowercase().contains("ptz")
+                || entry
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.to_ascii_lowercase().contains("ptz"))
+        }
+    };
 
     let cam_url = entry.url.trim();
     if !cam_url.is_empty() {
@@ -542,9 +550,7 @@ mod tests {
             id: "front_ptz".into(),
             name: Some("Front PTZ".into()),
             url: "rtsp://admin:secret@192.0.2.10:554/Streaming/Channels/101".into(),
-            channel: None,
-            stream: None,
-            protocols: None,
+            ..Default::default()
         };
         let t = resolve_ptz_target(&entry, None, None).unwrap();
         assert_eq!(
@@ -556,6 +562,30 @@ mod tests {
                 channel: 1,
             }
         );
+    }
+
+    #[test]
+    fn ptz_flag_enables_without_ptz_in_name() {
+        let entry = CameraEntry {
+            id: "water_tower".into(),
+            name: Some("Water Tower".into()),
+            url: "rtsp://admin:secret@192.0.2.10:554/Streaming/Channels/102".into(),
+            ptz: Some(true),
+            ..Default::default()
+        };
+        assert!(resolve_ptz_target(&entry, None, None).is_some());
+    }
+
+    #[test]
+    fn ptz_flag_false_overrides_name_heuristic() {
+        let entry = CameraEntry {
+            id: "front_ptz".into(),
+            name: Some("Front PTZ".into()),
+            url: "rtsp://admin:secret@192.0.2.10:554/Streaming/Channels/102".into(),
+            ptz: Some(false),
+            ..Default::default()
+        };
+        assert!(resolve_ptz_target(&entry, None, None).is_none());
     }
 
     #[test]

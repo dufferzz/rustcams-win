@@ -298,6 +298,7 @@ Errors are shortened for the UI (`short_error` maps common RTSP/auth failures). 
 | `View.slots` | Which camera id sits in which cell (`views.toml`) |
 | Active view only | Only that view’s slotted cameras are requested |
 | Fullscreen | Double-click cell → higher tier (+ direct URL when available); Esc exits |
+| Select / PTZ | Click a cell (or library) → amber border; PTZ pad/keys target that camera |
 | DnD | Library → cell, cell ↔ cell swap (`app/ui.rs`) |
 
 ---
@@ -313,7 +314,7 @@ ViewerApp (UI thread)
   │           pipeline, frame ring, latest_seq, error,
   │           transport, reconnect_at, failures, counters
   ├── textures: HashMap<id, TexCache> // egui GPU textures + last seq
-  └── ptz: PtzWorker                  // separate thread; fullscreen control
+  └── ptz: PtzWorker                  // separate thread; selected-camera control
 ```
 
 - Connection lifecycle / reconnect → `StreamManager`

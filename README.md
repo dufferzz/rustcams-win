@@ -7,7 +7,7 @@ Performant multi-camera RTSP CCTV viewer written in Rust.
 - Drag cells to **reorder / swap** streams
 - Right-click a cell to clear it
 - Fit modes: Contain / Cover / Fill
-- Hover for camera name; status bar with CPU, RAM, app, and **network** rates
+- Hover for camera name; status bar (CPU, RAM, network) while the perf overlay is open
 - Background pause when unfocused
 - Optional **Hikvision NVR** discovery: list cameras via ISAPI, stream through the NVR
 
@@ -122,10 +122,12 @@ cp cameras.example.toml cameras.toml
 # edit — cameras.toml is gitignored
 ```
 
-Or launch without a file: rustcams starts with a warning and **Settings** in the toolbar
-to create/edit `cameras.toml` (Save / Save & Apply).
+Launch without a file: rustcams starts with a warning; add cameras by editing `cameras.toml`.
 
-Views are auto-saved next to the config as `views.toml`.
+Views are auto-saved next to the config as `views.toml` whenever you change
+layout, drag cameras, or click a library camera into a selected cell. The last
+selected view is remembered in `ui.toml` and restored on launch. Portable
+builds load `cameras.toml` / `views.toml` next to `rustcams.exe`.
 
 ### Shape
 
@@ -156,7 +158,8 @@ pause_when_unfocused = false
 ```
 
 Each `[[cameras]]` entry needs `id` and a camera-direct RTSP `url` (credentials
-embedded). There is no shared `[ptz]` section.
+embedded). There is no shared `[ptz]` section. Set `ptz = true` to enable PTZ
+when the id/name does not contain `ptz` (`ptz = false` turns it off).
 
 ### Direct cameras
 
@@ -207,26 +210,30 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | Action | How |
 |--------|-----|
 | Switch / create views | Toolbar dropdown, ➕, ✎ Rename, 🗑 Delete |
-| Layout | Toolbar `1` / `2` / `2×2` / `3×3`… or keys `1`–`6` (`2` = stacked dual / vertical split; `2×2` is toolbar-only) |
-| Fit mode | `F` or toolbar (Contain → Cover → Fill) |
+| Layout | Toolbar `1` / `2` / `2×2` / `3×3`… (`2` = stacked dual / vertical split; `2×2` is toolbar-only) |
+| Fit mode | Settings — Contain / Cover / Fill (`F` still cycles) |
 | HD | Toolbar toggle — main `…01` / `101` vs sub `…02` / `102` (1 / 2 / 2×2 only; denser grids force sub) |
-| Assign camera | Drag from left list onto a cell |
+| Assign camera | Drag from left list onto a cell, or click a list camera to replace the selected cell |
+| Select camera | Click a cell (or the library) — accent border; arms PTZ when the camera has it |
 | Reorder | Drag a cell onto another cell (swap) |
 | Clear cell | Right-click |
-| Fullscreen | Double-click / `Esc` — switches that cam to **direct main** RTSP; arms PTZ |
+| Fullscreen | Double-click / `Esc` — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
 | Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` exits (after camera FS) |
-| Settings | ⚙ toolbar — edit NVR / cameras / viewer; save `cameras.toml` |
-| Debug | 🐛 toolbar / `D` — perf overlay + stream decode metrics |
-| Log | 📋 toolbar / `L` — in-app log console (Windows release builds hide the OS console) |
-| PTZ pan / tilt | Arrow keys (**fullscreen only**) |
-| PTZ zoom | `=` / `+` / PageUp in; `-` / PageDown out |
-| PTZ home | `H` |
+| Settings | ⚙ toolbar — fit, accent, outline width, perf overlay, log console |
+| Debug | Settings or `D` — perf overlay + stream decode metrics; status bar while open |
+| Log | Settings or `L` — in-app log console (Windows release builds hide the OS console) |
+| PTZ pan / tilt | Sidebar pad (including diagonals) or arrow keys (**selected camera**) |
+| PTZ zoom | Sidebar `−` / `+`, or `=` / `+` / PageUp in; `-` / PageDown out |
+| PTZ home | Sidebar `⌂` or `H` |
+| PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol; click to toggle |
+| PTZ tracking | Sidebar **Tracking On/Off** — intrusion detection on the camera; click to toggle |
 | PTZ (DualShock 4) | Left stick pan/tilt; L2/R2 or right-stick Y zoom; L1/R1 focus; Cross = preset 1; Triangle = patrol 1 |
 
 PTZ talks **directly to each camera** (`http://{camera-host}:80/ISAPI/PTZCtrl/…`),
-not through the NVR. Digest auth is warmed when you **enter fullscreen**.
+not through the NVR. Digest auth is warmed when you **select** a PTZ camera.
 Credentials and host come from that camera’s RTSP `url`. Speeds default to move
-30 / zoom 25. Cameras whose id/name contain `ptz` get a PTZ target from `url`.
+30 / zoom 25. Cameras whose id/name contain `ptz`, or that set `ptz = true`,
+get a PTZ target from `url`.
 
 **Fullscreen** switches that camera to its **direct main-stream** URL (same `url`
 rewritten to `…01`) at higher decode width (1280). Pipelines always use

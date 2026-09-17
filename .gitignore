@@ -4,5 +4,6 @@
 /.deps/
 cameras.toml
 views.toml
+ui.toml
 *.log
 .DS_Store

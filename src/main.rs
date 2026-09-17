@@ -49,6 +49,19 @@ fn load_app_icon() -> Option<egui::IconData> {
     })
 }
 
+/// Prefer `cameras.toml` next to the exe (portable dist), else the working directory.
+fn default_cameras_toml() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let next_to_exe = dir.join("cameras.toml");
+            if next_to_exe.is_file() {
+                return next_to_exe;
+            }
+        }
+    }
+    PathBuf::from("cameras.toml")
+}
+
 fn main() -> eframe::Result<()> {
     let log_buffer = LogBuffer::new(2000);
     tracing_subscriber::fmt()
@@ -68,13 +81,13 @@ fn main() -> eframe::Result<()> {
     let config_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("cameras.toml"));
+        .unwrap_or_else(default_cameras_toml);
 
     let (cfg, config_warning) = match AppConfig::load(&config_path) {
         Ok(cfg) => {
             let warning = if cfg.cameras.is_empty() {
                 Some(format!(
-                    "No cameras in {} — open Settings to configure.",
+                    "No cameras in {} — edit cameras.toml to configure.",
                     config_path.display()
                 ))
             } else {
@@ -90,7 +103,7 @@ fn main() -> eframe::Result<()> {
             (
                 ResolvedConfig::default(),
                 Some(format!(
-                    "Config needs setup ({}): {err:#}\nOpen Settings to configure cameras.",
+                    "Config needs setup ({}): {err:#}\nEdit cameras.toml to configure cameras.",
                     config_path.display()
                 )),
             )

@@ -33,6 +33,39 @@ pub struct PtzPreset {
     pub name: String,
 }
 
+/// Idle-return (park) action from `GET …/parkaction`.
+#[derive(Debug, Clone)]
+pub struct ParkAction {
+    pub enabled: bool,
+    pub park_time_sec: Option<u32>,
+    pub action_type: Option<String>,
+    pub action_num: Option<u32>,
+}
+
+/// Async snapshot of the last park-action fetch for a PTZ target.
+#[derive(Debug, Clone)]
+pub enum ParkActionStatus {
+    Idle,
+    Loading,
+    Ready(ParkAction),
+    Error(String),
+}
+
+/// Intrusion detection (`GET …/Smart/FieldDetection/{ch}`) shown as Tracking.
+#[derive(Debug, Clone)]
+pub struct Tracking {
+    pub enabled: bool,
+}
+
+/// Async snapshot of the last intrusion-detection fetch for a PTZ target.
+#[derive(Debug, Clone)]
+pub enum TrackingStatus {
+    Idle,
+    Loading,
+    Ready(Tracking),
+    Error(String),
+}
+
 /// Async snapshot of the last preset-list fetch for a PTZ target.
 #[derive(Debug, Clone)]
 pub enum PresetListStatus {
@@ -60,6 +93,48 @@ enum PresetListStatusInner {
 }
 
 impl Default for PresetListStatusInner {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Default)]
+struct ParkFetchState {
+    key: String,
+    status: ParkStatusInner,
+    gen: u64,
+}
+
+#[derive(Clone)]
+enum ParkStatusInner {
+    Idle,
+    Loading,
+    Ready(ParkAction),
+    Error(String),
+}
+
+impl Default for ParkStatusInner {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Default)]
+struct TrackingFetchState {
+    key: String,
+    status: TrackingStatusInner,
+    gen: u64,
+}
+
+#[derive(Clone)]
+enum TrackingStatusInner {
+    Idle,
+    Loading,
+    Ready(Tracking),
+    Error(String),
+}
+
+impl Default for TrackingStatusInner {
     fn default() -> Self {
         Self::Idle
     }
@@ -106,6 +181,8 @@ struct Shared {
     cv: Condvar,
     sessions: Mutex<HashMap<String, Arc<Mutex<DigestSession>>>>,
     presets: Mutex<PresetFetchState>,
+    park: Mutex<ParkFetchState>,
+    tracking: Mutex<TrackingFetchState>,
     agent: Agent,
 }
 
@@ -128,6 +205,8 @@ impl PtzWorker {
             cv: Condvar::new(),
             sessions: Mutex::new(HashMap::new()),
             presets: Mutex::new(PresetFetchState::default()),
+            park: Mutex::new(ParkFetchState::default()),
+            tracking: Mutex::new(TrackingFetchState::default()),
             agent,
         });
         let worker = Arc::clone(&shared);
@@ -206,6 +285,170 @@ impl PtzWorker {
             PresetListStatusInner::Ready(list) => PresetListStatus::Ready(list.clone()),
             PresetListStatusInner::Error(err) => PresetListStatus::Error(err.clone()),
         }
+    }
+
+    /// Fetch `GET /ISAPI/PTZCtrl/channels/{ch}/parkaction` in the background.
+    pub fn fetch_park_action(&self, target: PtzTarget) {
+        let key = Self::preset_key(&target);
+        let gen = {
+            let mut g = self.shared.park.lock();
+            if g.key == key && matches!(g.status, ParkStatusInner::Loading) {
+                return;
+            }
+            g.key = key.clone();
+            g.status = ParkStatusInner::Loading;
+            g.gen = g.gen.wrapping_add(1);
+            g.gen
+        };
+
+        let shared = Arc::clone(&self.shared);
+        thread::Builder::new()
+            .name("ptz-park".into())
+            .spawn(move || {
+                let result = get_park_action(&shared, &target);
+                let mut g = shared.park.lock();
+                if g.gen != gen || g.key != key {
+                    return;
+                }
+                g.status = match result {
+                    Ok(action) => ParkStatusInner::Ready(action),
+                    Err(err) => ParkStatusInner::Error(err.to_string()),
+                };
+            })
+            .ok();
+    }
+
+    pub fn refresh_park_action(&self, target: PtzTarget) {
+        {
+            let mut g = self.shared.park.lock();
+            g.key.clear();
+            g.status = ParkStatusInner::Idle;
+        }
+        self.fetch_park_action(target);
+    }
+
+    pub fn park_status(&self, target: &PtzTarget) -> ParkActionStatus {
+        let key = Self::preset_key(target);
+        let g = self.shared.park.lock();
+        if g.key != key {
+            return ParkActionStatus::Idle;
+        }
+        match &g.status {
+            ParkStatusInner::Idle => ParkActionStatus::Idle,
+            ParkStatusInner::Loading => ParkActionStatus::Loading,
+            ParkStatusInner::Ready(action) => ParkActionStatus::Ready(action.clone()),
+            ParkStatusInner::Error(err) => ParkActionStatus::Error(err.clone()),
+        }
+    }
+
+    /// GET current park XML, flip `<enabled>`, PUT it back, then re-GET.
+    pub fn set_park_enabled(&self, target: PtzTarget, enabled: bool) {
+        let key = Self::preset_key(&target);
+        let gen = {
+            let mut g = self.shared.park.lock();
+            g.key = key.clone();
+            g.status = ParkStatusInner::Loading;
+            g.gen = g.gen.wrapping_add(1);
+            g.gen
+        };
+
+        let shared = Arc::clone(&self.shared);
+        thread::Builder::new()
+            .name("ptz-park-set".into())
+            .spawn(move || {
+                let result = set_park_enabled(&shared, &target, enabled);
+                let mut g = shared.park.lock();
+                if g.gen != gen || g.key != key {
+                    return;
+                }
+                g.status = match result {
+                    Ok(action) => ParkStatusInner::Ready(action),
+                    Err(err) => ParkStatusInner::Error(err.to_string()),
+                };
+            })
+            .ok();
+    }
+
+    /// Fetch `GET /ISAPI/Smart/FieldDetection/{ch}` in the background.
+    pub fn fetch_tracking(&self, target: PtzTarget) {
+        let key = Self::preset_key(&target);
+        let gen = {
+            let mut g = self.shared.tracking.lock();
+            if g.key == key && matches!(g.status, TrackingStatusInner::Loading) {
+                return;
+            }
+            g.key = key.clone();
+            g.status = TrackingStatusInner::Loading;
+            g.gen = g.gen.wrapping_add(1);
+            g.gen
+        };
+
+        let shared = Arc::clone(&self.shared);
+        thread::Builder::new()
+            .name("ptz-tracking".into())
+            .spawn(move || {
+                let result = get_tracking(&shared, &target);
+                let mut g = shared.tracking.lock();
+                if g.gen != gen || g.key != key {
+                    return;
+                }
+                g.status = match result {
+                    Ok(tracking) => TrackingStatusInner::Ready(tracking),
+                    Err(err) => TrackingStatusInner::Error(err.to_string()),
+                };
+            })
+            .ok();
+    }
+
+    pub fn refresh_tracking(&self, target: PtzTarget) {
+        {
+            let mut g = self.shared.tracking.lock();
+            g.key.clear();
+            g.status = TrackingStatusInner::Idle;
+        }
+        self.fetch_tracking(target);
+    }
+
+    pub fn tracking_status(&self, target: &PtzTarget) -> TrackingStatus {
+        let key = Self::preset_key(target);
+        let g = self.shared.tracking.lock();
+        if g.key != key {
+            return TrackingStatus::Idle;
+        }
+        match &g.status {
+            TrackingStatusInner::Idle => TrackingStatus::Idle,
+            TrackingStatusInner::Loading => TrackingStatus::Loading,
+            TrackingStatusInner::Ready(tracking) => TrackingStatus::Ready(tracking.clone()),
+            TrackingStatusInner::Error(err) => TrackingStatus::Error(err.clone()),
+        }
+    }
+
+    /// GET current FieldDetection XML, flip `<enabled>`, PUT it back, then re-GET.
+    pub fn set_tracking_enabled(&self, target: PtzTarget, enabled: bool) {
+        let key = Self::preset_key(&target);
+        let gen = {
+            let mut g = self.shared.tracking.lock();
+            g.key = key.clone();
+            g.status = TrackingStatusInner::Loading;
+            g.gen = g.gen.wrapping_add(1);
+            g.gen
+        };
+
+        let shared = Arc::clone(&self.shared);
+        thread::Builder::new()
+            .name("ptz-tracking-set".into())
+            .spawn(move || {
+                let result = set_tracking_enabled(&shared, &target, enabled);
+                let mut g = shared.tracking.lock();
+                if g.gen != gen || g.key != key {
+                    return;
+                }
+                g.status = match result {
+                    Ok(tracking) => TrackingStatusInner::Ready(tracking),
+                    Err(err) => TrackingStatusInner::Error(err.to_string()),
+                };
+            })
+            .ok();
     }
 
     fn notify_desired(&self, target: PtzTarget, vec: PtzVector) {
@@ -577,6 +820,287 @@ fn oneshot_put(shared: &Shared, target: &PtzTarget, suffix: &str) -> anyhow::Res
     Ok(())
 }
 
+fn park_path(target: &PtzTarget) -> String {
+    format!("/ISAPI/PTZCtrl/channels/{}/parkaction", target.channel)
+}
+
+fn get_park_action(shared: &Shared, target: &PtzTarget) -> anyhow::Result<ParkAction> {
+    let path = park_path(target);
+    let (_status, body) = digest_request(
+        &shared.agent,
+        &shared.sessions,
+        "GET",
+        target,
+        &path,
+        None,
+        "",
+    )?;
+    parse_park_action(&body)
+}
+
+fn set_park_enabled(
+    shared: &Shared,
+    target: &PtzTarget,
+    enabled: bool,
+) -> anyhow::Result<ParkAction> {
+    let path = park_path(target);
+    let (_status, body) = digest_request(
+        &shared.agent,
+        &shared.sessions,
+        "GET",
+        target,
+        &path,
+        None,
+        "",
+    )?;
+    let xml = rewrite_park_enabled(&body, enabled)?;
+    digest_request(
+        &shared.agent,
+        &shared.sessions,
+        "PUT",
+        target,
+        &path,
+        Some(xml.as_bytes()),
+        "application/xml",
+    )?;
+    get_park_action(shared, target)
+}
+
+fn parse_park_action(xml: &str) -> anyhow::Result<ParkAction> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut enabled = false;
+    let mut saw_enabled = false;
+    let mut park_time_sec = None;
+    let mut action_type = None;
+    let mut action_num = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                path.push(xml_local_name(e.name().as_ref()));
+            }
+            Ok(Event::End(_)) => {
+                path.pop();
+            }
+            Ok(Event::Text(t)) => {
+                if path.is_empty() {
+                    continue;
+                }
+                let text = t.unescape().unwrap_or_default().into_owned();
+                if text.is_empty() {
+                    continue;
+                }
+                let leaf = path[path.len() - 1].as_str();
+                let parent = path
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|i| path.get(i))
+                    .map(|s| s.to_ascii_lowercase());
+                let leaf_l = leaf.to_ascii_lowercase();
+                match (parent.as_deref(), leaf_l.as_str()) {
+                    (Some("parkaction"), "enabled") => {
+                        saw_enabled = true;
+                        enabled = matches!(text.to_ascii_lowercase().as_str(), "true" | "1");
+                    }
+                    (Some("parkaction"), "parktime" | "returntime" | "time") => {
+                        park_time_sec = text.parse().ok();
+                    }
+                    (Some("parkaction") | Some("action"), "actiontype" | "action") => {
+                        action_type = Some(text);
+                    }
+                    (Some("parkaction") | Some("action"), "actionnum" | "actionid") => {
+                        action_num = text.parse().ok();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => anyhow::bail!("park XML parse error at {}: {e}", reader.buffer_position()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !saw_enabled && !xml.to_ascii_lowercase().contains("<parkaction") {
+        anyhow::bail!("not a ParkAction response");
+    }
+    Ok(ParkAction {
+        enabled,
+        park_time_sec,
+        action_type,
+        action_num,
+    })
+}
+
+fn rewrite_park_enabled(xml: &str, enabled: bool) -> anyhow::Result<String> {
+    let value = if enabled { "true" } else { "false" };
+    if let Some(out) = replace_first_tag_text(xml, "enabled", value) {
+        return Ok(out);
+    }
+    anyhow::bail!("ParkAction XML has no <enabled> element")
+}
+
+fn field_detection_paths(target: &PtzTarget) -> [String; 2] {
+    [
+        format!("/ISAPI/Smart/FieldDetection/{}", target.channel),
+        format!("/ISAPI/Smart/channels/{}/fieldDetection", target.channel),
+    ]
+}
+
+fn get_field_detection_xml(
+    shared: &Shared,
+    target: &PtzTarget,
+) -> anyhow::Result<(String, String)> {
+    let mut last_err = None;
+    for path in field_detection_paths(target) {
+        match digest_request(
+            &shared.agent,
+            &shared.sessions,
+            "GET",
+            target,
+            &path,
+            None,
+            "",
+        ) {
+            Ok((_, body)) => {
+                if parse_tracking(&body).is_ok() {
+                    return Ok((path, body));
+                }
+                last_err = Some(anyhow::anyhow!("GET {path}: not a FieldDetection response"));
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("FieldDetection not available")))
+}
+
+fn get_tracking(shared: &Shared, target: &PtzTarget) -> anyhow::Result<Tracking> {
+    let (_path, body) = get_field_detection_xml(shared, target)?;
+    parse_tracking(&body)
+}
+
+fn set_tracking_enabled(
+    shared: &Shared,
+    target: &PtzTarget,
+    enabled: bool,
+) -> anyhow::Result<Tracking> {
+    let (path, body) = get_field_detection_xml(shared, target)?;
+    let xml = rewrite_tracking_enabled(&body, enabled)?;
+    digest_request(
+        &shared.agent,
+        &shared.sessions,
+        "PUT",
+        target,
+        &path,
+        Some(xml.as_bytes()),
+        "application/xml",
+    )?;
+    get_tracking(shared, target)
+}
+
+fn parse_tracking(xml: &str) -> anyhow::Result<Tracking> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut enabled = false;
+    let mut saw_enabled = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                path.push(xml_local_name(e.name().as_ref()));
+            }
+            Ok(Event::End(_)) => {
+                path.pop();
+            }
+            Ok(Event::Text(t)) => {
+                if path.is_empty() {
+                    continue;
+                }
+                let text = t.unescape().unwrap_or_default().into_owned();
+                if text.is_empty() {
+                    continue;
+                }
+                let leaf = path[path.len() - 1].as_str();
+                let parent = path
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|i| path.get(i))
+                    .map(|s| s.to_ascii_lowercase());
+                let leaf_l = leaf.to_ascii_lowercase();
+                if !saw_enabled
+                    && leaf_l == "enabled"
+                    && matches!(
+                        parent.as_deref(),
+                        Some("fielddetection" | "intrusiondetection")
+                    )
+                {
+                    saw_enabled = true;
+                    enabled = matches!(text.to_ascii_lowercase().as_str(), "true" | "1");
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => anyhow::bail!(
+                "FieldDetection XML parse error at {}: {e}",
+                reader.buffer_position()
+            ),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !saw_enabled {
+        anyhow::bail!("not a FieldDetection response");
+    }
+    Ok(Tracking { enabled })
+}
+
+fn rewrite_tracking_enabled(xml: &str, enabled: bool) -> anyhow::Result<String> {
+    let value = if enabled { "true" } else { "false" };
+    if let Some(out) = replace_first_tag_text(xml, "enabled", value) {
+        return Ok(out);
+    }
+    anyhow::bail!("FieldDetection XML has no <enabled> element")
+}
+
+/// Replace the text of the first `<tag>…</tag>` (case-insensitive local name).
+fn replace_first_tag_text(xml: &str, local_name: &str, new_text: &str) -> Option<String> {
+    let lower = xml.to_ascii_lowercase();
+    let open = format!("<{}", local_name.to_ascii_lowercase());
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find(&open) {
+        let abs = search_from + rel;
+        let after_name = abs + open.len();
+        let next = xml.get(after_name..)?.chars().next()?;
+        if !matches!(next, '>' | ' ' | '\t' | '\n' | '\r' | '/') {
+            search_from = after_name;
+            continue;
+        }
+        let gt_rel = xml[after_name..].find('>')?;
+        let open_end = after_name + gt_rel;
+        if xml[abs..=open_end].trim_end().ends_with("/>") {
+            search_from = open_end + 1;
+            continue;
+        }
+        let content_start = open_end + 1;
+        let close = format!("</{}", local_name.to_ascii_lowercase());
+        let close_rel = lower[content_start..].find(&close)?;
+        let content_end = content_start + close_rel;
+        let mut out = String::with_capacity(xml.len() + new_text.len());
+        out.push_str(&xml[..content_start]);
+        out.push_str(new_text);
+        out.push_str(&xml[content_end..]);
+        return Some(out);
+    }
+    None
+}
+
 fn parse_ptz_presets(xml: &str) -> anyhow::Result<Vec<PtzPreset>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -726,5 +1250,76 @@ mod tests {
         assert_eq!(list[0].name, "Gate");
         assert_eq!(list[1].id, 10);
         assert_eq!(list[1].name, "Parking");
+    }
+
+    #[test]
+    fn parses_nested_park_action() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ParkAction version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <enabled>true</enabled>
+  <Parktime>120</Parktime>
+  <Action>
+    <ActionType>preset</ActionType>
+    <ActionNum>2</ActionNum>
+  </Action>
+</ParkAction>"#;
+        let park = parse_park_action(xml).unwrap();
+        assert!(park.enabled);
+        assert_eq!(park.park_time_sec, Some(120));
+        assert_eq!(park.action_type.as_deref(), Some("preset"));
+        assert_eq!(park.action_num, Some(2));
+    }
+
+    #[test]
+    fn parses_disabled_flat_park_action() {
+        let xml = r#"<ParkAction>
+  <enabled>false</enabled>
+  <returnTime>5</returnTime>
+  <actionType>patrol</actionType>
+  <actionNum>1</actionNum>
+</ParkAction>"#;
+        let park = parse_park_action(xml).unwrap();
+        assert!(!park.enabled);
+        assert_eq!(park.park_time_sec, Some(5));
+        assert_eq!(park.action_type.as_deref(), Some("patrol"));
+        assert_eq!(park.action_num, Some(1));
+    }
+
+    #[test]
+    fn rewrites_enabled_preserving_rest() {
+        let xml = "<ParkAction><enabled>true</enabled><Parktime>30</Parktime></ParkAction>";
+        let out = rewrite_park_enabled(xml, false).unwrap();
+        assert!(out.contains("<enabled>false</enabled>"));
+        assert!(out.contains("<Parktime>30</Parktime>"));
+        let park = parse_park_action(&out).unwrap();
+        assert!(!park.enabled);
+        assert_eq!(park.park_time_sec, Some(30));
+    }
+
+    #[test]
+    fn parses_field_detection_ignoring_region_enabled() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<FieldDetection version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <id>1</id>
+  <enabled>false</enabled>
+  <FieldDetectionRegionList>
+    <FieldDetectionRegion>
+      <id>1</id>
+      <enabled>true</enabled>
+    </FieldDetectionRegion>
+  </FieldDetectionRegionList>
+</FieldDetection>"#;
+        let tracking = parse_tracking(xml).unwrap();
+        assert!(!tracking.enabled);
+    }
+
+    #[test]
+    fn rewrites_field_detection_top_enabled_only() {
+        let xml = "<FieldDetection><enabled>true</enabled><FieldDetectionRegion><enabled>true</enabled></FieldDetectionRegion></FieldDetection>";
+        let out = rewrite_tracking_enabled(xml, false).unwrap();
+        assert!(out.starts_with("<FieldDetection><enabled>false</enabled>"));
+        assert!(out.contains("<FieldDetectionRegion><enabled>true</enabled>"));
+        let tracking = parse_tracking(&out).unwrap();
+        assert!(!tracking.enabled);
     }
 }

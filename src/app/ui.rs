@@ -1,7 +1,10 @@
 use super::{DragPayload, SidebarControls, ViewerApp};
 use crate::config::CameraConfig;
 use crate::layout::{FitMode, Layout};
-use crate::ptz::{PresetListStatus, PtzVector, PTZ_MOVE_SPEED, PTZ_ZOOM_SPEED};
+use crate::ptz::{
+    ParkAction, ParkActionStatus, PresetListStatus, PtzVector, TrackingStatus, PTZ_MOVE_SPEED,
+    PTZ_ZOOM_SPEED,
+};
 use crate::stream::log_stream_debug_rows;
 use crate::views::View;
 use eframe::egui;
@@ -34,8 +37,7 @@ impl ViewerApp {
             if active != self.views.active {
                 self.views.active = active;
                 self.exit_fullscreen();
-                self.views.mark_dirty();
-                let _ = self.views.save_if_dirty();
+                self.persist_views();
             }
 
             if ui
@@ -48,8 +50,7 @@ impl ViewerApp {
                 self.views.views.push(View::new(name, layout));
                 self.views.active = self.views.views.len() - 1;
                 self.exit_fullscreen();
-                self.views.mark_dirty();
-                let _ = self.views.save_if_dirty();
+                self.persist_views();
             }
 
             if ui
@@ -73,8 +74,7 @@ impl ViewerApp {
                     self.views.active = self.views.views.len() - 1;
                 }
                 self.exit_fullscreen();
-                self.views.mark_dirty();
-                let _ = self.views.save_if_dirty();
+                self.persist_views();
             }
 
             ui.separator();
@@ -87,13 +87,13 @@ impl ViewerApp {
                         layout.label(),
                     )
                     .on_hover_text(match layout {
-                        Layout::One => "Single camera (1)",
-                        Layout::Two => "Two cameras stacked (vertical split) (2)",
+                        Layout::One => "Single camera",
+                        Layout::Two => "Two cameras stacked (vertical split)",
                         Layout::Grid2 => "2×2 grid",
-                        Layout::Grid3 => "3×3 grid (3)",
-                        Layout::Grid4 => "4×4 grid (4)",
-                        Layout::Grid5 => "5×5 grid (5)",
-                        Layout::Grid6 => "6×6 grid (6)",
+                        Layout::Grid3 => "3×3 grid",
+                        Layout::Grid4 => "4×4 grid",
+                        Layout::Grid5 => "5×5 grid",
+                        Layout::Grid6 => "6×6 grid",
                     })
                     .clicked()
                 {
@@ -122,48 +122,12 @@ impl ViewerApp {
 
             ui.separator();
             if ui
-                .button(format!("Fit: {}", self.fit.label()))
-                .on_hover_text("Cycle fit mode (F): Contain → Cover → Fill")
-                .clicked()
-            {
-                self.fit = self.fit.cycle();
-            }
-
-            ui.separator();
-            if ui
                 .selectable_label(self.window_fullscreen, "⛶")
                 .on_hover_text("OS / monitor fullscreen (Esc to exit)")
                 .clicked()
             {
                 let on = !self.window_fullscreen;
                 self.set_window_fullscreen(ui.ctx(), on);
-            }
-
-            ui.separator();
-            if ui
-                .selectable_label(self.debug_overlay, "🐛")
-                .on_hover_text("Perf overlay + stream metrics (D). Also: RUSTCAMS_DEBUG=1")
-                .clicked()
-            {
-                self.debug_overlay = !self.debug_overlay;
-                info!(debug = self.debug_overlay, "debug overlay toggled");
-            }
-
-            if ui
-                .selectable_label(self.show_log, "📋")
-                .on_hover_text("Log console (L) — replaces the hidden Windows console")
-                .clicked()
-            {
-                self.show_log = !self.show_log;
-            }
-
-            ui.separator();
-            if ui
-                .button("⚙")
-                .on_hover_text("Settings — edit cameras.toml")
-                .clicked()
-            {
-                self.open_settings();
             }
 
             if self.fullscreen_slot.is_some() {
@@ -191,11 +155,18 @@ impl ViewerApp {
                             }
                         })
                         .unwrap_or_else(|| "PTZ: —".into());
-                    ui.colored_label(Color32::from_rgb(255, 190, 70), label);
+                    ui.colored_label(self.accent, label);
                 }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("⚙")
+                    .on_hover_text("Settings — accent color, perf overlay, log")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
+                }
                 if self.paused {
                     ui.colored_label(Color32::from_rgb(255, 180, 80), "⏸ Paused (background)");
                 }
@@ -214,8 +185,7 @@ impl ViewerApp {
                             let name = self.rename_buffer.trim().to_string();
                             if !name.is_empty() {
                                 self.views.active_view_mut().name = name;
-                                self.views.mark_dirty();
-                                let _ = self.views.save_if_dirty();
+                                self.persist_views();
                             }
                             self.show_rename = false;
                         }
@@ -228,83 +198,101 @@ impl ViewerApp {
     }
 
     pub(super) fn camera_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("📷 Cameras");
-        });
-        ui.add(
-            egui::TextEdit::singleline(&mut self.sidebar_filter)
-                .hint_text("Filter…")
-                .desired_width(f32::INFINITY),
-        );
-        ui.add_space(4.0);
-
-        let filter = self.sidebar_filter.to_ascii_lowercase();
-        let active_ids = self.view_camera_ids();
-        let selected_ptz = self.sidebar_ptz_cam.clone();
-        let cameras: Vec<(String, String, bool, bool)> = self
-            .cameras
-            .iter()
-            .filter(|c| {
-                filter.is_empty()
-                    || c.name.to_ascii_lowercase().contains(&filter)
-                    || c.id.to_ascii_lowercase().contains(&filter)
-            })
-            .map(|c| {
-                (
-                    c.id.clone(),
-                    c.name.clone(),
-                    active_ids.contains(&c.id),
-                    c.ptz.is_some(),
-                )
-            })
-            .collect();
-
-        // Top: camera library. Bottom: PTZ / Presets (fixed-ish share).
-        let available = ui.available_height();
-        let controls_h = (available * 0.42).clamp(160.0, 280.0);
-        let list_h = (available - controls_h - 8.0).max(80.0);
-
-        egui::ScrollArea::vertical()
-            .id_salt("camera_library")
-            .max_height(list_h)
-            .auto_shrink([false, false])
+        let mut list_open = self.camera_list_open;
+        let cam_header = egui::CollapsingHeader::new("📷 Cameras")
+            .id_salt("camera_library_header")
+            .open(Some(list_open))
             .show(ui, |ui| {
-                for (id, name, on_view, has_ptz) in cameras {
-                    let item_id = Id::new("lib_cam").with(&id);
-                    let payload = DragPayload::FromLibrary(id.clone());
-                    let is_ptz_sel = selected_ptz.as_deref() == Some(id.as_str());
-                    let response = ui.dnd_drag_source(item_id, payload, |ui| {
-                        let mark = if on_view { "●" } else { "○" };
-                        let label = if has_ptz {
-                            format!("{mark}  {name}  ⌖")
-                        } else {
-                            format!("{mark}  {name}")
-                        };
-                        let color = if is_ptz_sel {
-                            Color32::from_rgb(255, 200, 120)
-                        } else if on_view {
-                            Color32::from_rgb(140, 200, 255)
-                        } else {
-                            Color32::from_rgb(210, 210, 210)
-                        };
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(label).color(color))
-                                .sense(Sense::click_and_drag()),
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sidebar_filter)
+                        .hint_text("Filter…")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+
+                let filter = self.sidebar_filter.to_ascii_lowercase();
+                let active_ids = self.view_camera_ids();
+                let selected_ptz = self.sidebar_ptz_cam.clone();
+                let cameras: Vec<(String, String, bool, bool)> = self
+                    .cameras
+                    .iter()
+                    .filter(|c| {
+                        filter.is_empty()
+                            || c.name.to_ascii_lowercase().contains(&filter)
+                            || c.id.to_ascii_lowercase().contains(&filter)
+                    })
+                    .map(|c| {
+                        (
+                            c.id.clone(),
+                            c.name.clone(),
+                            active_ids.contains(&c.id),
+                            c.ptz.is_some(),
                         )
+                    })
+                    .collect();
+
+                let available = ui.available_height();
+                let list_h = (available * 0.55).clamp(80.0, available.max(80.0));
+
+                egui::ScrollArea::vertical()
+                    .id_salt("camera_library")
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (id, name, on_view, has_ptz) in cameras {
+                            let item_id = Id::new("lib_cam").with(&id);
+                            let payload = DragPayload::FromLibrary(id.clone());
+                            let is_ptz_sel = selected_ptz.as_deref() == Some(id.as_str());
+                            let accent = self.accent;
+                            let response = ui.dnd_drag_source(item_id, payload, |ui| {
+                                let mark = if on_view { "▶" } else { "■" };
+                                let label = if has_ptz {
+                                    format!("{mark}  {name}  ⌖")
+                                } else {
+                                    format!("{mark}  {name}")
+                                };
+                                let color = if is_ptz_sel {
+                                    accent
+                                } else if on_view {
+                                    super::settings::mix_rgb(
+                                        accent,
+                                        Color32::from_rgb(200, 210, 220),
+                                        0.35,
+                                    )
+                                } else {
+                                    Color32::from_rgb(210, 210, 210)
+                                };
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(label).color(color))
+                                        .sense(Sense::click_and_drag()),
+                                )
+                            });
+                            let can_replace = selected_ptz
+                                .as_ref()
+                                .is_some_and(|id| active_ids.contains(id));
+                            let hover = if can_replace {
+                                "Click to replace the selected camera"
+                            } else if has_ptz {
+                                "Drag onto a grid cell · click to select for PTZ"
+                            } else {
+                                "Drag onto a grid cell · click to select"
+                            };
+                            let clicked = response.inner.clicked();
+                            response.inner.on_hover_text(hover);
+                            if clicked {
+                                self.place_library_camera(&id);
+                            }
+                            ui.add_space(2.0);
+                        }
                     });
-                    let hover = if has_ptz {
-                        "Drag onto a grid cell · click to select for PTZ"
-                    } else {
-                        "Drag onto a grid cell"
-                    };
-                    let clicked = response.inner.clicked();
-                    response.inner.on_hover_text(hover);
-                    if has_ptz && clicked {
-                        self.select_ptz_camera(&id);
-                    }
-                    ui.add_space(2.0);
-                }
             });
+        if cam_header.header_response.clicked() {
+            list_open = !list_open;
+        }
+        if list_open != self.camera_list_open {
+            self.camera_list_open = list_open;
+            self.save_ui_prefs();
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -352,9 +340,22 @@ impl ViewerApp {
                         .color(Color32::from_rgb(180, 190, 200)),
                 );
             }
+            (Some(name), None) => {
+                ui.label(
+                    egui::RichText::new(name)
+                        .small()
+                        .color(Color32::from_rgb(180, 190, 200)),
+                );
+                ui.label(
+                    egui::RichText::new("No PTZ on this camera")
+                        .small()
+                        .color(Color32::from_rgb(140, 140, 140)),
+                );
+                return;
+            }
             _ => {
                 ui.label(
-                    egui::RichText::new("Select a PTZ camera above")
+                    egui::RichText::new("Click a camera to control PTZ")
                         .small()
                         .color(Color32::from_rgb(140, 140, 140)),
                 );
@@ -373,61 +374,101 @@ impl ViewerApp {
         let mut pan = 0i32;
         let mut tilt = 0i32;
         let mut zoom = 0i32;
+        let mut home = false;
 
-        let btn = |ui: &mut egui::Ui, label: &str| -> bool {
+        let gap = 4.0;
+        let width = ui.available_width();
+        let cell = ((width - gap * 2.0) / 3.0).floor().clamp(34.0, 48.0);
+        let font = (cell * 0.42).clamp(14.0, 18.0);
+        let pad_w = cell * 3.0 + gap * 2.0;
+
+        let hold = |ui: &mut egui::Ui, label: &str| -> bool {
             ui.add_sized(
-                [36.0, 28.0],
-                egui::Button::new(egui::RichText::new(label).size(14.0)),
+                [cell, cell],
+                egui::Button::new(egui::RichText::new(label).size(font)),
             )
             .is_pointer_button_down_on()
         };
 
-        ui.vertical_centered(|ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(36.0);
-                if btn(ui, "▲") {
-                    tilt = PTZ_MOVE_SPEED;
-                }
-            });
-            ui.horizontal(|ui| {
-                if btn(ui, "◀") {
-                    pan = -PTZ_MOVE_SPEED;
-                }
-                if ui
-                    .add_sized([36.0, 28.0], egui::Button::new("⌂"))
-                    .on_hover_text("Home")
-                    .clicked()
-                {
-                    if let Some(target) = self.active_ptz_target() {
-                        self.ptz_stop();
-                        self.ptz.home(target);
+        ui.horizontal(|ui| {
+            let inset = ((ui.available_width() - pad_w) * 0.5).max(0.0);
+            if inset > 0.0 {
+                ui.add_space(inset);
+            }
+            egui::Grid::new("ptz_pad")
+                .min_col_width(cell)
+                .max_col_width(cell)
+                .spacing([gap, gap])
+                .show(ui, |ui| {
+                    if hold(ui, "↖") {
+                        pan = -PTZ_MOVE_SPEED;
+                        tilt = PTZ_MOVE_SPEED;
                     }
-                }
-                if btn(ui, "▶") {
-                    pan = PTZ_MOVE_SPEED;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(36.0);
-                if btn(ui, "▼") {
-                    tilt = -PTZ_MOVE_SPEED;
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if btn(ui, "−") {
-                    zoom = -PTZ_ZOOM_SPEED;
-                }
-                ui.label(
-                    egui::RichText::new("Zoom")
-                        .small()
-                        .color(Color32::from_rgb(150, 150, 150)),
-                );
-                if btn(ui, "+") {
-                    zoom = PTZ_ZOOM_SPEED;
-                }
-            });
+                    if hold(ui, "↑") {
+                        tilt = PTZ_MOVE_SPEED;
+                    }
+                    if hold(ui, "↗") {
+                        pan = PTZ_MOVE_SPEED;
+                        tilt = PTZ_MOVE_SPEED;
+                    }
+                    ui.end_row();
+
+                    if hold(ui, "←") {
+                        pan = -PTZ_MOVE_SPEED;
+                    }
+                    if ui
+                        .add_sized(
+                            [cell, cell],
+                            egui::Button::new(egui::RichText::new("⌂").size(font)),
+                        )
+                        .on_hover_text("Home")
+                        .clicked()
+                    {
+                        home = true;
+                    }
+                    if hold(ui, "→") {
+                        pan = PTZ_MOVE_SPEED;
+                    }
+                    ui.end_row();
+
+                    if hold(ui, "↙") {
+                        pan = -PTZ_MOVE_SPEED;
+                        tilt = -PTZ_MOVE_SPEED;
+                    }
+                    if hold(ui, "↓") {
+                        tilt = -PTZ_MOVE_SPEED;
+                    }
+                    if hold(ui, "↘") {
+                        pan = PTZ_MOVE_SPEED;
+                        tilt = -PTZ_MOVE_SPEED;
+                    }
+                    ui.end_row();
+
+                    if hold(ui, "−") {
+                        zoom = -PTZ_ZOOM_SPEED;
+                    }
+                    let (zoom_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(cell), Sense::hover());
+                    ui.painter().text(
+                        zoom_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Zoom",
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(150, 150, 150),
+                    );
+                    if hold(ui, "+") {
+                        zoom = PTZ_ZOOM_SPEED;
+                    }
+                    ui.end_row();
+                });
         });
+
+        if home {
+            if let Some(target) = self.active_ptz_target() {
+                self.ptz_stop();
+                self.ptz.home(target);
+            }
+        }
 
         let held = PtzVector {
             pan,
@@ -442,10 +483,165 @@ impl ViewerApp {
         if !held.is_stop() {
             self.apply_ptz_vector(held);
             ui.ctx().data_mut(|d| d.insert_temp(pad_id, true));
+            ui.ctx().request_repaint();
         } else if was_holding {
             self.apply_ptz_vector(PtzVector::STOP);
             ui.ctx().data_mut(|d| d.insert_temp(pad_id, false));
         }
+
+        ui.add_space(8.0);
+        self.sidebar_park_action(ui);
+        self.sidebar_tracking(ui);
+    }
+
+    fn sidebar_park_action(&mut self, ui: &mut egui::Ui) {
+        let Some(target) = self.active_ptz_target() else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("↻")
+                .on_hover_text("Refresh park action from camera")
+                .clicked()
+            {
+                self.ptz.refresh_park_action(target.clone());
+            }
+
+            match self.ptz.park_status(&target) {
+                ParkActionStatus::Idle => {
+                    self.ptz.fetch_park_action(target.clone());
+                    ui.label(
+                        egui::RichText::new("Park…")
+                            .small()
+                            .color(Color32::from_rgb(160, 160, 160)),
+                    );
+                }
+                ParkActionStatus::Loading => {
+                    ui.ctx().request_repaint();
+                    ui.label(
+                        egui::RichText::new("Park…")
+                            .small()
+                            .color(Color32::from_rgb(160, 160, 160)),
+                    );
+                }
+                ParkActionStatus::Error(err) => {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Park ?")
+                                    .color(Color32::from_rgb(255, 160, 120)),
+                            )
+                            .min_size(Vec2::new(ui.available_width(), 0.0)),
+                        )
+                        .on_hover_text(err)
+                        .clicked()
+                    {
+                        self.ptz.refresh_park_action(target.clone());
+                    }
+                }
+                ParkActionStatus::Ready(park) => {
+                    let (label, color) = if park.enabled {
+                        ("Park On", Color32::from_rgb(140, 210, 150))
+                    } else {
+                        ("Park Off", Color32::from_rgb(180, 180, 180))
+                    };
+                    let hint = park_action_hint(&park);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(label).color(color))
+                                .min_size(Vec2::new(ui.available_width(), 0.0)),
+                        )
+                        .on_hover_text(format!(
+                            "{hint}\nClick to {}",
+                            if park.enabled { "disable" } else { "enable" }
+                        ))
+                        .clicked()
+                    {
+                        self.ptz.set_park_enabled(target.clone(), !park.enabled);
+                    }
+                }
+            }
+        });
+
+        if let ParkActionStatus::Ready(park) = self.ptz.park_status(&target) {
+            ui.label(
+                egui::RichText::new(park_action_hint(&park))
+                    .small()
+                    .color(Color32::from_rgb(140, 150, 160)),
+            );
+        }
+    }
+
+    fn sidebar_tracking(&mut self, ui: &mut egui::Ui) {
+        let Some(target) = self.active_ptz_target() else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("↻")
+                .on_hover_text("Refresh intrusion detection from camera")
+                .clicked()
+            {
+                self.ptz.refresh_tracking(target.clone());
+            }
+
+            match self.ptz.tracking_status(&target) {
+                TrackingStatus::Idle => {
+                    self.ptz.fetch_tracking(target.clone());
+                    ui.label(
+                        egui::RichText::new("Tracking…")
+                            .small()
+                            .color(Color32::from_rgb(160, 160, 160)),
+                    );
+                }
+                TrackingStatus::Loading => {
+                    ui.ctx().request_repaint();
+                    ui.label(
+                        egui::RichText::new("Tracking…")
+                            .small()
+                            .color(Color32::from_rgb(160, 160, 160)),
+                    );
+                }
+                TrackingStatus::Error(err) => {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Tracking ?")
+                                    .color(Color32::from_rgb(255, 160, 120)),
+                            )
+                            .min_size(Vec2::new(ui.available_width(), 0.0)),
+                        )
+                        .on_hover_text(err)
+                        .clicked()
+                    {
+                        self.ptz.refresh_tracking(target.clone());
+                    }
+                }
+                TrackingStatus::Ready(tracking) => {
+                    let (label, color) = if tracking.enabled {
+                        ("Tracking On", Color32::from_rgb(140, 210, 150))
+                    } else {
+                        ("Tracking Off", Color32::from_rgb(180, 180, 180))
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(label).color(color))
+                                .min_size(Vec2::new(ui.available_width(), 0.0)),
+                        )
+                        .on_hover_text(format!(
+                            "Intrusion detection\nClick to {}",
+                            if tracking.enabled { "disable" } else { "enable" }
+                        ))
+                        .clicked()
+                    {
+                        self.ptz
+                            .set_tracking_enabled(target.clone(), !tracking.enabled);
+                    }
+                }
+            }
+        });
     }
 
     fn sidebar_presets_list(&mut self, ui: &mut egui::Ui) {
@@ -829,6 +1025,7 @@ impl ViewerApp {
         cam: &CameraConfig,
         cell: Rect,
         hovered: bool,
+        selected: bool,
     ) {
         ui.painter()
             .rect_filled(cell, 0.0, Color32::from_rgb(12, 14, 18));
@@ -899,17 +1096,26 @@ impl ViewerApp {
             );
         }
 
-        if hovered {
+        if hovered || selected {
             let bar_h = 24.0;
             let bar = Rect::from_min_max(egui::pos2(cell.min.x, cell.max.y - bar_h), cell.max);
             ui.painter()
                 .rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+            let label = if selected && cam.ptz.is_some() {
+                format!("{}  ⌖", cam.name)
+            } else {
+                cam.name.clone()
+            };
             ui.painter().text(
                 bar.left_center() + Vec2::new(8.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                &cam.name,
+                label,
                 egui::FontId::proportional(13.0),
-                Color32::WHITE,
+                if selected {
+                    self.accent
+                } else {
+                    Color32::WHITE
+                },
             );
         }
     }
@@ -924,9 +1130,11 @@ impl ViewerApp {
         let cell_h = (full.height() - gap * (rows as f32 + 1.0)) / rows as f32;
 
         let slots = self.views.active_view().slots.clone();
+        let selected_id = self.sidebar_ptz_cam.clone();
         let mut drop_action: Option<(usize, DragPayload)> = None;
         let mut fullscreen: Option<usize> = None;
         let mut clear: Option<usize> = None;
+        let mut select: Option<String> = None;
 
         for (i, slot) in slots.iter().enumerate() {
             let col = i % cols;
@@ -944,8 +1152,9 @@ impl ViewerApp {
             let response = ui.interact(cell, id, sense);
 
             if let Some(cam_id) = slot {
+                let selected = selected_id.as_deref() == Some(cam_id.as_str());
                 if let Some(cam) = self.camera_by_id(cam_id) {
-                    self.paint_cell_contents(ui, cam, cell, response.hovered());
+                    self.paint_cell_contents(ui, cam, cell, response.hovered(), selected);
                 } else {
                     ui.painter()
                         .rect_filled(cell, 0.0, Color32::from_rgb(12, 14, 18));
@@ -955,6 +1164,14 @@ impl ViewerApp {
                         "Missing camera",
                         egui::FontId::proportional(13.0),
                         Color32::from_rgb(180, 100, 100),
+                    );
+                }
+                if selected {
+                    ui.painter().rect_stroke(
+                        cell.shrink(1.0),
+                        0.0,
+                        egui::Stroke::new(self.outline_width, self.accent),
+                        egui::StrokeKind::Inside,
                     );
                 }
                 response.dnd_set_drag_payload(DragPayload::FromSlot(i));
@@ -974,13 +1191,18 @@ impl ViewerApp {
                 ui.painter().rect_stroke(
                     cell.shrink(1.0),
                     0.0,
-                    egui::Stroke::new(2.0_f32, Color32::from_rgb(80, 160, 255)),
+                    egui::Stroke::new(self.outline_width.max(2.0_f32), self.accent),
                     egui::StrokeKind::Inside,
                 );
             }
 
             if let Some(payload) = response.dnd_release_payload::<DragPayload>() {
                 drop_action = Some((i, (*payload).clone()));
+            }
+            if response.clicked() {
+                if let Some(cam_id) = slot {
+                    select = Some(cam_id.clone());
+                }
             }
             if response.double_clicked() && slot.is_some() {
                 fullscreen = Some(i);
@@ -993,12 +1215,27 @@ impl ViewerApp {
         if let Some((idx, payload)) = drop_action {
             self.apply_drop(idx, payload);
         }
+        if let Some(id) = select {
+            self.select_camera(&id);
+        }
         if let Some(idx) = fullscreen {
             self.enter_fullscreen(idx);
         }
         if let Some(idx) = clear {
             self.clear_slot(idx);
         }
+    }
+}
+
+fn park_action_hint(park: &ParkAction) -> String {
+    let action = match (park.action_type.as_deref(), park.action_num) {
+        (Some(kind), Some(n)) if n > 0 => format!("{kind} {n}"),
+        (Some(kind), _) => kind.to_string(),
+        _ => "idle return".into(),
+    };
+    match park.park_time_sec {
+        Some(sec) => format!("{action} · {sec}s"),
+        None => action,
     }
 }
 

@@ -43,12 +43,14 @@ Details: [`.cursor/rules/windows-build.mdc`](.cursor/rules/windows-build.mdc), W
 
 ## App display name
 
-User-facing name defaults to **Citadel CCTV**, editable via Settings or TOML:
+User-facing name defaults to **Citadel CCTV**, editable via TOML:
 
 ```toml
 [viewer]
 app_name = "Citadel CCTV"
 ```
+
+Accent color (selection outline) is set in **Settings** and saved in `ui.toml` next to `cameras.toml`. The last selected view is stored there too and restored on launch.
 
 Crate/binary/dist folder names stay `rustcams` (packaging identity, not branding).
 
