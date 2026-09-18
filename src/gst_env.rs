@@ -4,9 +4,17 @@ use gstreamer as gst;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
-/// If a portable GStreamer tree sits next to the executable, point the
-/// process at it before `gst::init()`. No-op when the tree is missing so
-/// system installs (Linux packages / Windows PATH) keep working.
+fn running_from_appimage() -> bool {
+    std::env::var_os("APPIMAGE")
+        .or_else(|| std::env::var_os("APPDIR"))
+        .is_some_and(|v| !v.is_empty())
+}
+
+/// Portable GStreamer layouts:
+/// - Windows ZIP: `exe_dir/gstreamer/lib/gstreamer-1.0`
+/// - linuxdeploy AppImage: `$APPDIR/usr/lib/gstreamer-1.0` (or `exe_dir/../lib/gstreamer-1.0`)
+///
+/// No-op when neither tree exists so a system GStreamer install still works.
 pub(crate) fn configure_bundled_gstreamer() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -14,20 +22,22 @@ pub(crate) fn configure_bundled_gstreamer() {
     let Some(exe_dir) = exe.parent() else {
         return;
     };
-    let root = exe_dir.join("gstreamer");
-    let plugin_dir = root.join("lib").join("gstreamer-1.0");
-    if !plugin_dir.is_dir() {
+    let Some((root, plugin_dir)) = discover_bundled_gstreamer(exe_dir) else {
         return;
-    }
-    let bin_dir = root.join("bin");
+    };
+    let bin_dir = bundled_bin_dir(&root, exe_dir);
 
     prepend_path_env("PATH", &bin_dir);
-    // Prefer our plugins; leave registry discovery otherwise unchanged.
     set_path_env("GST_PLUGIN_PATH", &plugin_dir);
+    set_path_env("GST_PLUGIN_PATH_1_0", &plugin_dir);
     set_path_env("GST_PLUGIN_SYSTEM_PATH", &plugin_dir);
+    set_path_env("GST_PLUGIN_SYSTEM_PATH_1_0", &plugin_dir);
+    // SAFETY: before gst::init / other threads.
+    unsafe { std::env::set_var("GST_REGISTRY_REUSE_PLUGIN_SCANNER", "no") };
 
-    if let Some(scanner) = find_plugin_scanner(&bin_dir, &root) {
+    if let Some(scanner) = find_plugin_scanner(&bin_dir, &root, &plugin_dir) {
         set_path_env("GST_PLUGIN_SCANNER", &scanner);
+        set_path_env("GST_PLUGIN_SCANNER_1_0", &scanner);
     }
 
     info!(
@@ -37,23 +47,69 @@ pub(crate) fn configure_bundled_gstreamer() {
     );
 }
 
-fn find_plugin_scanner(bin_dir: &Path, root: &Path) -> Option<PathBuf> {
+fn discover_bundled_gstreamer(exe_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut roots = vec![exe_dir.join("gstreamer")];
+    if running_from_appimage() {
+        if let Some(appdir) = std::env::var_os("APPDIR").filter(|v| !v.is_empty()) {
+            roots.push(PathBuf::from(appdir));
+        }
+        roots.push(exe_dir.join(".."));
+    }
+    for root in roots {
+        for rel in ["lib/gstreamer-1.0", "usr/lib/gstreamer-1.0"] {
+            let plugin_dir = root.join(rel);
+            if plugin_dir.is_dir() {
+                return Some((root, plugin_dir));
+            }
+        }
+    }
+    None
+}
+
+fn bundled_bin_dir(root: &Path, exe_dir: &Path) -> PathBuf {
+    for rel in ["usr/bin", "bin"] {
+        let p = root.join(rel);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    exe_dir.to_path_buf()
+}
+
+fn find_plugin_scanner(bin_dir: &Path, root: &Path, plugin_dir: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     let names = ["gst-plugin-scanner.exe"];
     #[cfg(not(windows))]
     let names = ["gst-plugin-scanner", "gst-plugin-scanner-1.0"];
 
-    for name in names {
-        let p = bin_dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
+    let mut dirs = vec![
+        bin_dir.to_path_buf(),
+        root.join("libexec").join("gstreamer-1.0"),
+        root.join("usr").join("libexec").join("gstreamer-1.0"),
+        root.join("lib").join("gstreamer1.0").join("gstreamer-1.0"),
+        root.join("usr")
+            .join("lib")
+            .join("gstreamer1.0")
+            .join("gstreamer-1.0"),
+        plugin_dir.to_path_buf(),
+    ];
+    if let Some(appdir) = std::env::var_os("APPDIR").filter(|v| !v.is_empty()) {
+        let appdir = PathBuf::from(appdir);
+        dirs.push(
+            appdir
+                .join("usr")
+                .join("lib")
+                .join("gstreamer1.0")
+                .join("gstreamer-1.0"),
+        );
     }
-    // Some layouts keep the scanner under libexec.
-    for name in names {
-        let p = root.join("libexec").join("gstreamer-1.0").join(name);
-        if p.is_file() {
-            return Some(p);
+
+    for dir in dirs {
+        for name in names {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
         }
     }
     None

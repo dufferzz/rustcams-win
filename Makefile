@@ -6,7 +6,7 @@
 #   make help
 
 .PHONY: help build release run check clippy clean \
-	windows windows-build windows-package windows-gst
+	windows windows-build windows-package windows-gst appimage
 
 CARGO   ?= cargo
 TARGET_WIN := x86_64-pc-windows-gnu
@@ -25,6 +25,7 @@ help:
 	@echo "  check             cargo check"
 	@echo "  clippy            cargo clippy -- -D warnings"
 	@echo "  clean             cargo clean + remove dist/"
+	@echo "  appimage          Linux AppImage → dist/Citadel_CCTV-linux-x86_64.AppImage"
 	@echo "  windows           Cross-build + package dist/rustcams/"
 	@echo "  windows-build     Cross-compile only (x86_64-pc-windows-gnu)"
 	@echo "  windows-package   Package existing Windows exe + GStreamer"
@@ -35,6 +36,9 @@ build release:
 
 run:
 	$(CARGO) run --release
+
+appimage:
+	./scripts/package-linux-appimage.sh
 
 check:
 	$(CARGO) check

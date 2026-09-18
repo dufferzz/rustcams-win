@@ -23,6 +23,15 @@ sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-l
 sudo pacman -S gst-plugin-nvcodec
 ```
 
+Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible):
+
+```bash
+./scripts/package-linux-appimage.sh
+# → dist/Citadel_CCTV-linux-x86_64.AppImage
+```
+
+`chmod +x` the file and run it. Put `cameras.toml` next to the AppImage, pass the path as the first argument, or use `~/.config/citadel-cctv/cameras.toml`. A Manjaro-built image may not run on older glibc (Debian/Ubuntu); the `v*` GitHub Actions workflow builds on `ubuntu-22.04`.
+
 ### Windows
 
 #### Develop / build on Windows (MSVC)
@@ -127,7 +136,9 @@ Launch without a file: rustcams starts with a warning; add cameras by editing `c
 Views are auto-saved next to the config as `views.toml` whenever you change
 layout, drag cameras, or click a library camera into a selected cell. The last
 selected view is remembered in `ui.toml` and restored on launch. Portable
-builds load `cameras.toml` / `views.toml` next to `rustcams.exe`.
+Windows builds load `cameras.toml` / `views.toml` next to `rustcams.exe`.
+AppImages use `cameras.toml` next to the `.AppImage` file if present, otherwise
+`~/.config/citadel-cctv/` (so views can be saved; the image itself is read-only).
 
 ### Shape
 

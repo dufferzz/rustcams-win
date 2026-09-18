@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use url::Url;
 
@@ -149,6 +149,50 @@ pub struct ViewerConfig {
 
 pub fn default_app_name() -> String {
     "Citadel CCTV".into()
+}
+
+/// XDG / AppImage config directory name (`~/.config/citadel-cctv`).
+pub const LINUX_CONFIG_DIR: &str = "citadel-cctv";
+
+fn appimage_dir() -> Option<PathBuf> {
+    let p = std::env::var_os("APPIMAGE").filter(|v| !v.is_empty())?;
+    PathBuf::from(p).parent().map(Path::to_path_buf)
+}
+
+fn xdg_config_cameras_toml() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    base.join(LINUX_CONFIG_DIR).join("cameras.toml")
+}
+
+/// Prefer a writable `cameras.toml`:
+/// 1. Next to the AppImage file, else `~/.config/citadel-cctv/` (AppImage)
+/// 2. Next to the executable if that file exists (Windows portable)
+/// 3. `cameras.toml` in the working directory
+pub fn default_cameras_toml() -> PathBuf {
+    if let Some(dir) = appimage_dir() {
+        let beside = dir.join("cameras.toml");
+        if beside.is_file() {
+            return beside;
+        }
+        return xdg_config_cameras_toml();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let next_to_exe = dir.join("cameras.toml");
+            if next_to_exe.is_file() {
+                return next_to_exe;
+            }
+        }
+    }
+    PathBuf::from("cameras.toml")
 }
 
 fn default_layout() -> String {
@@ -603,5 +647,74 @@ mod tests {
         let cfg = AppConfig::default();
         let resolved = cfg.resolve().unwrap();
         assert!(resolved.cameras.is_empty());
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn with_env(key: &str, value: Option<&str>, f: impl FnOnce()) {
+        let _guard = env_lock();
+        let prev = std::env::var_os(key);
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn appimage_uses_toml_beside_image() {
+        let root = std::env::temp_dir().join(format!(
+            "rustcams-appimage-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("Citadel_CCTV-linux-x86_64.AppImage");
+        fs::write(&image, []).unwrap();
+        let toml_path = root.join("cameras.toml");
+        fs::write(&toml_path, "[]\n").unwrap();
+        with_env("APPIMAGE", Some(image.to_str().unwrap()), || {
+            assert_eq!(default_cameras_toml(), toml_path);
+        });
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn appimage_falls_back_to_xdg_config() {
+        let root = std::env::temp_dir().join(format!(
+            "rustcams-appimage-xdg-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("Citadel.AppImage");
+        fs::write(&image, []).unwrap();
+        let xdg = root.join("xdg-config");
+        fs::create_dir_all(&xdg).unwrap();
+        let _guard = env_lock();
+        let prev_app = std::env::var_os("APPIMAGE");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("APPIMAGE", &image);
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        }
+        let got = default_cameras_toml();
+        match prev_app {
+            Some(v) => unsafe { std::env::set_var("APPIMAGE", v) },
+            None => unsafe { std::env::remove_var("APPIMAGE") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        assert_eq!(got, xdg.join(LINUX_CONFIG_DIR).join("cameras.toml"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

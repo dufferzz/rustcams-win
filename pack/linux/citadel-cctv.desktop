@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Citadel CCTV
+Comment=Multi-camera RTSP CCTV viewer
+Exec=rustcams
+Icon=citadel-cctv
+Terminal=false
+Categories=AudioVideo;Video;Viewer;
+StartupWMClass=citadel-cctv

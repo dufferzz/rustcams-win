@@ -63,3 +63,13 @@ When changing the pipeline, update:
 - [`docs/streaming.md`](docs/streaming.md) — source of truth for RTSP → pixels
 - [`README.md`](README.md) — user-facing decode / debug / Notes
 - `scripts/package-windows.ps1` plugin allowlist comment if elements change
+- `scripts/package-linux-appimage.sh` plugin allowlist if elements change
+
+## Linux AppImage (GitHub release)
+
+```bash
+./scripts/package-linux-appimage.sh
+# → dist/Citadel_CCTV-linux-x86_64.AppImage
+```
+
+Uses the **dist** profile. Official portable builds should come from Ubuntu 22.04 (`.github/workflows/release.yml` on `v*` tags), not Manjaro (newer glibc). Config: `cameras.toml` beside the AppImage or `~/.config/citadel-cctv/`.

@@ -69,6 +69,9 @@ impl UiPrefs {
 
     pub fn save(&self, path: &Path) {
         if let Ok(text) = toml::to_string_pretty(self) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(path, text);
         }
     }

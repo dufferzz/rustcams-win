@@ -13,7 +13,7 @@ mod stream;
 mod views;
 
 use app::ViewerApp;
-use config::{default_app_name, AppConfig, ResolvedConfig};
+use config::{default_app_name, default_cameras_toml, AppConfig, ResolvedConfig};
 use eframe::egui;
 use log_buffer::LogBuffer;
 use std::path::PathBuf;
@@ -49,19 +49,6 @@ fn load_app_icon() -> Option<egui::IconData> {
     })
 }
 
-/// Prefer `cameras.toml` next to the exe (portable dist), else the working directory.
-fn default_cameras_toml() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let next_to_exe = dir.join("cameras.toml");
-            if next_to_exe.is_file() {
-                return next_to_exe;
-            }
-        }
-    }
-    PathBuf::from("cameras.toml")
-}
-
 fn main() -> eframe::Result<()> {
     let log_buffer = LogBuffer::new(2000);
     tracing_subscriber::fmt()
@@ -82,6 +69,7 @@ fn main() -> eframe::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(default_cameras_toml);
+    tracing::info!(path = %config_path.display(), "config path");
 
     let (cfg, config_warning) = match AppConfig::load(&config_path) {
         Ok(cfg) => {
