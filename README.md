@@ -30,7 +30,15 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 # → dist/Citadel_CCTV-linux-x86_64.AppImage
 ```
 
-`chmod +x` the file and run it. Put `cameras.toml` next to the AppImage, pass the path as the first argument, or use `~/.config/citadel-cctv/cameras.toml`. A Manjaro-built image may not run on older glibc (Debian/Ubuntu); the `v*` GitHub Actions workflow builds on `ubuntu-22.04`.
+`chmod +x` the file and run it. Put `cameras.toml` next to the AppImage, pass the path as the first argument, or use `~/.config/citadel-cctv/cameras.toml`. This image is built on the local distro (glibc must be ≥ the builder’s); it is not a GitHub Actions artifact.
+
+Publish a GitHub release from this machine (tag must already exist):
+
+```bash
+gh release create v0.1.0 \
+  dist/Citadel_CCTV-linux-x86_64.AppImage \
+  dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
+```
 
 ### Windows
 

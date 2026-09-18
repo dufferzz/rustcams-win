@@ -72,4 +72,4 @@ When changing the pipeline, update:
 # → dist/Citadel_CCTV-linux-x86_64.AppImage
 ```
 
-Uses the **dist** profile. Official portable builds should come from Ubuntu 22.04 (`.github/workflows/release.yml` on `v*` tags), not Manjaro (newer glibc). Config: `cameras.toml` beside the AppImage or `~/.config/citadel-cctv/`.
+Uses the **dist** profile. Package on this machine, then `gh release create` with the files under `dist/`. There is no GitHub Actions release job. Config: `cameras.toml` beside the AppImage or `~/.config/citadel-cctv/`.
