@@ -171,6 +171,11 @@ pub struct ViewerApp {
     /// Edge-detect gamepad face buttons.
     last_cross: bool,
     last_triangle: bool,
+    /// After PTZ target changes (select / camera fullscreen), ignore button
+    /// *press* edges so a held Cross does not fire preset 1 (often “home”).
+    ptz_rearm_buttons: bool,
+    /// Keyboard/gamepad was commanding PTZ; send STOP once on release.
+    ptz_hold_keys: bool,
     /// Perf overlay + verbose stream logging.
     debug_overlay: bool,
     debug_rows: Vec<StreamDebugRow>,
@@ -286,6 +291,8 @@ impl ViewerApp {
             last_ptz: PtzVector::STOP,
             last_cross: false,
             last_triangle: false,
+            ptz_rearm_buttons: false,
+            ptz_hold_keys: false,
             // Perf overlay: RUSTCAMS_DEBUG=1 or press D. stutter-stats.log always writes.
             debug_overlay: std::env::var_os("RUSTCAMS_DEBUG").is_some(),
             debug_rows: Vec::new(),
@@ -617,12 +624,12 @@ impl ViewerApp {
         }
         let target = cam.ptz.clone();
         self.ptz_stop();
+        self.ptz_rearm_buttons = true;
         self.sidebar_ptz_cam = Some(cam_id.to_string());
         if let Some(target) = target {
             self.ptz.prewarm(target.clone());
             self.ptz.fetch_presets(target.clone());
-            self.ptz.fetch_park_action(target.clone());
-            self.ptz.fetch_tracking(target);
+            self.ptz.fetch_park_action(target);
         }
     }
 
@@ -665,8 +672,10 @@ impl ViewerApp {
         if self.fullscreen_slot == Some(slot) {
             return;
         }
-        self.ptz_stop();
+        // Do not PTZ-stop here: a continuous STOP can make Hikvision run park
+        // (often preset/home). Fullscreen only switches the video URL.
         self.fullscreen_slot = Some(slot);
+        self.ptz_rearm_buttons = true;
         // Fullscreen arms main/HD by default (toolbar stays toggleable).
         self.hd = true;
         if let Some(cam_id) = self
@@ -687,8 +696,8 @@ impl ViewerApp {
         if self.fullscreen_slot.is_none() {
             return;
         }
-        self.ptz_stop();
         self.fullscreen_slot = None;
+        self.ptz_rearm_buttons = true;
     }
 
     fn set_window_fullscreen(&mut self, ctx: &egui::Context, on: bool) {

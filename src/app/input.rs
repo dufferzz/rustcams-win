@@ -17,10 +17,6 @@ impl ViewerApp {
                 self.set_window_fullscreen(ctx, false);
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F)) {
-            self.fit = self.fit.cycle();
-            self.save_ui_prefs();
-        }
         if ctx.input(|i| i.key_pressed(egui::Key::D)) {
             self.debug_overlay = !self.debug_overlay;
             info!(debug = self.debug_overlay, "debug overlay toggled");
@@ -31,13 +27,6 @@ impl ViewerApp {
     }
     /// Poll keyboard + DualShock axes into a continuous PTZ command.
     pub(super) fn handle_ptz_input(&mut self, ctx: &egui::Context) {
-        if self.active_ptz_target().is_none() {
-            if !self.last_ptz.is_stop() {
-                self.ptz_stop();
-            }
-            return;
-        }
-
         let (mut pan, mut tilt, mut zoom, mut focus) = (0i32, 0i32, 0i32, 0i32);
 
         ctx.input(|i| {
@@ -64,13 +53,6 @@ impl ViewerApp {
                 zoom -= PTZ_ZOOM_SPEED;
             }
         });
-
-        if ctx.input(|i| i.key_pressed(egui::Key::H)) {
-            if let Some(target) = self.active_ptz_target() {
-                self.ptz_stop();
-                self.ptz.home(target);
-            }
-        }
 
         let mut cross = false;
         let mut triangle = false;
@@ -107,27 +89,48 @@ impl ViewerApp {
             }
         }
 
-        if cross && !self.last_cross {
-            if let Some(target) = self.active_ptz_target() {
-                self.ptz_stop();
-                self.ptz.goto_preset(target, 1);
-            }
-        }
-        if triangle && !self.last_triangle {
-            if let Some(target) = self.active_ptz_target() {
-                self.ptz_stop();
-                self.ptz.start_patrol(target, 1);
-            }
-        }
-        self.last_cross = cross;
-        self.last_triangle = triangle;
+        let rearm = self.ptz_rearm_buttons;
+        self.ptz_rearm_buttons = false;
 
-        self.apply_ptz_vector(PtzVector {
+        let Some(target) = self.active_ptz_target() else {
+            self.last_cross = cross;
+            self.last_triangle = triangle;
+            if !self.last_ptz.is_stop() {
+                self.ptz_stop();
+            }
+            self.ptz_hold_keys = false;
+            return;
+        };
+
+        if rearm {
+            self.last_cross = cross;
+            self.last_triangle = triangle;
+        } else {
+            if cross && !self.last_cross {
+                self.ptz_stop();
+                self.ptz.goto_preset(target.clone(), 1);
+            }
+            if triangle && !self.last_triangle {
+                self.ptz_stop();
+                self.ptz.start_patrol(target.clone(), 1);
+            }
+            self.last_cross = cross;
+            self.last_triangle = triangle;
+        }
+
+        let vec = PtzVector {
             pan,
             tilt,
             zoom,
             focus,
-        });
+        };
+        if !vec.is_stop() {
+            self.apply_ptz_vector(vec);
+            self.ptz_hold_keys = true;
+        } else if self.ptz_hold_keys {
+            self.apply_ptz_vector(PtzVector::STOP);
+            self.ptz_hold_keys = false;
+        }
     }
 
 }

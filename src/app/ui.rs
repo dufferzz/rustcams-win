@@ -252,7 +252,7 @@ impl ViewerApp {
                                     format!("{mark}  {name}")
                                 };
                                 let color = if is_ptz_sel {
-                                    accent
+                                    selection_border(has_ptz)
                                 } else if on_view {
                                     super::settings::mix_rgb(
                                         accent,
@@ -383,11 +383,17 @@ impl ViewerApp {
         let pad_w = cell * 3.0 + gap * 2.0;
 
         let hold = |ui: &mut egui::Ui, label: &str| -> bool {
-            ui.add_sized(
+            let response = ui.add_sized(
                 [cell, cell],
-                egui::Button::new(egui::RichText::new(label).size(font)),
-            )
-            .is_pointer_button_down_on()
+                egui::Button::new(egui::RichText::new(label).size(font))
+                    .sense(Sense::click_and_drag()),
+            );
+            let down = response.is_pointer_button_down_on()
+                || (response.contains_pointer() && ui.input(|i| i.pointer.primary_down()));
+            if down {
+                ui.ctx().request_repaint();
+            }
+            down
         };
 
         ui.horizontal(|ui| {
@@ -404,7 +410,7 @@ impl ViewerApp {
                         pan = -PTZ_MOVE_SPEED;
                         tilt = PTZ_MOVE_SPEED;
                     }
-                    if hold(ui, "↑") {
+                    if hold(ui, "^") {
                         tilt = PTZ_MOVE_SPEED;
                     }
                     if hold(ui, "↗") {
@@ -413,20 +419,20 @@ impl ViewerApp {
                     }
                     ui.end_row();
 
-                    if hold(ui, "←") {
+                    if hold(ui, "<") {
                         pan = -PTZ_MOVE_SPEED;
                     }
                     if ui
                         .add_sized(
                             [cell, cell],
-                            egui::Button::new(egui::RichText::new("⌂").size(font)),
+                            egui::Button::new(egui::RichText::new("H").size(font)),
                         )
                         .on_hover_text("Home")
                         .clicked()
                     {
                         home = true;
                     }
-                    if hold(ui, "→") {
+                    if hold(ui, ">") {
                         pan = PTZ_MOVE_SPEED;
                     }
                     ui.end_row();
@@ -435,7 +441,7 @@ impl ViewerApp {
                         pan = -PTZ_MOVE_SPEED;
                         tilt = -PTZ_MOVE_SPEED;
                     }
-                    if hold(ui, "↓") {
+                    if hold(ui, "v") {
                         tilt = -PTZ_MOVE_SPEED;
                     }
                     if hold(ui, "↘") {
@@ -444,7 +450,7 @@ impl ViewerApp {
                     }
                     ui.end_row();
 
-                    if hold(ui, "−") {
+                    if hold(ui, "-") {
                         zoom = -PTZ_ZOOM_SPEED;
                     }
                     let (zoom_rect, _) =
@@ -491,7 +497,8 @@ impl ViewerApp {
 
         ui.add_space(8.0);
         self.sidebar_park_action(ui);
-        self.sidebar_tracking(ui);
+        // Tracking (FieldDetection) — hidden for now; querying it slews some PTZs.
+        // self.sidebar_tracking(ui);
     }
 
     fn sidebar_park_action(&mut self, ui: &mut egui::Ui) {
@@ -573,6 +580,7 @@ impl ViewerApp {
         }
     }
 
+    #[allow(dead_code)]
     fn sidebar_tracking(&mut self, ui: &mut egui::Ui) {
         let Some(target) = self.active_ptz_target() else {
             return;
@@ -589,12 +597,21 @@ impl ViewerApp {
 
             match self.ptz.tracking_status(&target) {
                 TrackingStatus::Idle => {
-                    self.ptz.fetch_tracking(target.clone());
-                    ui.label(
-                        egui::RichText::new("Tracking…")
-                            .small()
-                            .color(Color32::from_rgb(160, 160, 160)),
-                    );
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Tracking ?")
+                                    .color(Color32::from_rgb(180, 180, 180)),
+                            )
+                            .min_size(Vec2::new(ui.available_width(), 0.0)),
+                        )
+                        .on_hover_text(
+                            "Click to read intrusion detection from the camera.\nSome PTZs slew when this is queried.",
+                        )
+                        .clicked()
+                    {
+                        self.ptz.fetch_tracking(target.clone());
+                    }
                 }
                 TrackingStatus::Loading => {
                     ui.ctx().request_repaint();
@@ -1112,7 +1129,7 @@ impl ViewerApp {
                 label,
                 egui::FontId::proportional(13.0),
                 if selected {
-                    self.accent
+                    selection_border(cam.ptz.is_some())
                 } else {
                     Color32::WHITE
                 },
@@ -1153,6 +1170,9 @@ impl ViewerApp {
 
             if let Some(cam_id) = slot {
                 let selected = selected_id.as_deref() == Some(cam_id.as_str());
+                let has_ptz = self
+                    .camera_by_id(cam_id)
+                    .is_some_and(|c| c.ptz.is_some());
                 if let Some(cam) = self.camera_by_id(cam_id) {
                     self.paint_cell_contents(ui, cam, cell, response.hovered(), selected);
                 } else {
@@ -1170,7 +1190,7 @@ impl ViewerApp {
                     ui.painter().rect_stroke(
                         cell.shrink(1.0),
                         0.0,
-                        egui::Stroke::new(self.outline_width, self.accent),
+                        egui::Stroke::new(self.outline_width, selection_border(has_ptz)),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -1224,6 +1244,14 @@ impl ViewerApp {
         if let Some(idx) = clear {
             self.clear_slot(idx);
         }
+    }
+}
+
+fn selection_border(has_ptz: bool) -> Color32 {
+    if has_ptz {
+        Color32::from_rgb(70, 200, 110)
+    } else {
+        Color32::from_rgb(220, 70, 70)
     }
 }
 

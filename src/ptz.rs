@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tracing::warn;
 use ureq::Agent;
 
 /// Match typical Hikvision PTZ defaults (move 30 / zoom 25).
@@ -55,6 +56,14 @@ pub enum ParkActionStatus {
 #[derive(Debug, Clone)]
 pub struct Tracking {
     pub enabled: bool,
+}
+
+/// Hikvision `AbsoluteHigh` pose from `GET …/PTZCtrl/channels/{ch}/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbsolutePtz {
+    elevation: i32,
+    azimuth: i32,
+    zoom: i32,
 }
 
 /// Async snapshot of the last intrusion-detection fetch for a PTZ target.
@@ -978,9 +987,148 @@ fn get_field_detection_xml(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("FieldDetection not available")))
 }
 
+fn snapshot_restore<T>(
+    shared: &Shared,
+    target: &PtzTarget,
+    op: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let saved = match get_absolute_ptz(shared, target) {
+        Ok(pos) => Some(pos),
+        Err(err) => {
+            warn!(
+                host = %target.host,
+                channel = target.channel,
+                "PTZ status unavailable before tracking check: {err:#}"
+            );
+            None
+        }
+    };
+    let result = op();
+    if let Some(pos) = saved {
+        // FieldDetection can start a slew after the HTTP response returns.
+        thread::sleep(Duration::from_millis(250));
+        if let Err(err) = put_absolute_ptz(shared, target, pos) {
+            warn!(
+                host = %target.host,
+                channel = target.channel,
+                "restore PTZ after tracking failed: {err:#}"
+            );
+        } else {
+            thread::sleep(Duration::from_millis(400));
+            let _ = put_absolute_ptz(shared, target, pos);
+        }
+    }
+    result
+}
+
+fn get_absolute_ptz(shared: &Shared, target: &PtzTarget) -> anyhow::Result<AbsolutePtz> {
+    let mut last_err = None;
+    for rel in ["status", "absolute"] {
+        let path = format!("/ISAPI/PTZCtrl/channels/{}/{}", target.channel, rel);
+        match digest_request(
+            &shared.agent,
+            &shared.sessions,
+            "GET",
+            target,
+            &path,
+            None,
+            "",
+        ) {
+            Ok((_, body)) => match parse_absolute_ptz(&body) {
+                Ok(pos) => return Ok(pos),
+                Err(err) => last_err = Some(err),
+            },
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PTZ status not available")))
+}
+
+fn put_absolute_ptz(
+    shared: &Shared,
+    target: &PtzTarget,
+    pos: AbsolutePtz,
+) -> anyhow::Result<()> {
+    let path = format!("/ISAPI/PTZCtrl/channels/{}/absolute", target.channel);
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<PTZData>\
+<AbsoluteHigh>\
+<elevation>{}</elevation>\
+<azimuth>{}</azimuth>\
+<absoluteZoom>{}</absoluteZoom>\
+</AbsoluteHigh>\
+</PTZData>",
+        pos.elevation, pos.azimuth, pos.zoom
+    );
+    digest_request(
+        &shared.agent,
+        &shared.sessions,
+        "PUT",
+        target,
+        &path,
+        Some(body.as_bytes()),
+        "application/xml",
+    )?;
+    Ok(())
+}
+
+fn parse_absolute_ptz(xml: &str) -> anyhow::Result<AbsolutePtz> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut elevation = None;
+    let mut azimuth = None;
+    let mut zoom = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                path.push(xml_local_name(e.name().as_ref()));
+            }
+            Ok(Event::End(_)) => {
+                path.pop();
+            }
+            Ok(Event::Text(t)) => {
+                if path.is_empty() {
+                    continue;
+                }
+                let text = t.unescape().unwrap_or_default().into_owned();
+                if text.is_empty() {
+                    continue;
+                }
+                let leaf = path[path.len() - 1].to_ascii_lowercase();
+                let val = text.parse::<i32>().ok();
+                match leaf.as_str() {
+                    "elevation" | "tilt" => elevation = val.or(elevation),
+                    "azimuth" | "pan" => azimuth = val.or(azimuth),
+                    "absolutezoom" | "zoom" => zoom = val.or(zoom),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => anyhow::bail!("PTZ status XML parse error at {}: {e}", reader.buffer_position()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    match (elevation, azimuth, zoom) {
+        (Some(elevation), Some(azimuth), Some(zoom)) => Ok(AbsolutePtz {
+            elevation,
+            azimuth,
+            zoom,
+        }),
+        _ => anyhow::bail!("PTZ status XML missing elevation/azimuth/zoom"),
+    }
+}
+
 fn get_tracking(shared: &Shared, target: &PtzTarget) -> anyhow::Result<Tracking> {
-    let (_path, body) = get_field_detection_xml(shared, target)?;
-    parse_tracking(&body)
+    snapshot_restore(shared, target, || {
+        let (_path, body) = get_field_detection_xml(shared, target)?;
+        parse_tracking(&body)
+    })
 }
 
 fn set_tracking_enabled(
@@ -988,18 +1136,21 @@ fn set_tracking_enabled(
     target: &PtzTarget,
     enabled: bool,
 ) -> anyhow::Result<Tracking> {
-    let (path, body) = get_field_detection_xml(shared, target)?;
-    let xml = rewrite_tracking_enabled(&body, enabled)?;
-    digest_request(
-        &shared.agent,
-        &shared.sessions,
-        "PUT",
-        target,
-        &path,
-        Some(xml.as_bytes()),
-        "application/xml",
-    )?;
-    get_tracking(shared, target)
+    snapshot_restore(shared, target, || {
+        let (path, body) = get_field_detection_xml(shared, target)?;
+        let xml = rewrite_tracking_enabled(&body, enabled)?;
+        digest_request(
+            &shared.agent,
+            &shared.sessions,
+            "PUT",
+            target,
+            &path,
+            Some(xml.as_bytes()),
+            "application/xml",
+        )?;
+        let (_path, body) = get_field_detection_xml(shared, target)?;
+        parse_tracking(&body)
+    })
 }
 
 fn parse_tracking(xml: &str) -> anyhow::Result<Tracking> {
@@ -1321,5 +1472,26 @@ mod tests {
         assert!(out.contains("<FieldDetectionRegion><enabled>true</enabled>"));
         let tracking = parse_tracking(&out).unwrap();
         assert!(!tracking.enabled);
+    }
+
+    #[test]
+    fn parses_absolute_high_status() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<PTZStatus version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <AbsoluteHigh>
+    <elevation>450</elevation>
+    <azimuth>1350</azimuth>
+    <absoluteZoom>10</absoluteZoom>
+  </AbsoluteHigh>
+</PTZStatus>"#;
+        let pos = parse_absolute_ptz(xml).unwrap();
+        assert_eq!(
+            pos,
+            AbsolutePtz {
+                elevation: 450,
+                azimuth: 1350,
+                zoom: 10
+            }
+        );
     }
 }

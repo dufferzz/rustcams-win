@@ -35,7 +35,7 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.1.0 \
+gh release create v0.1.1 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
@@ -230,10 +230,10 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 |--------|-----|
 | Switch / create views | Toolbar dropdown, ➕, ✎ Rename, 🗑 Delete |
 | Layout | Toolbar `1` / `2` / `2×2` / `3×3`… (`2` = stacked dual / vertical split; `2×2` is toolbar-only) |
-| Fit mode | Settings — Contain / Cover / Fill (`F` still cycles) |
+| Fit mode | Settings — Contain / Cover / Fill |
 | HD | Toolbar toggle — main `…01` / `101` vs sub `…02` / `102` (1 / 2 / 2×2 only; denser grids force sub) |
 | Assign camera | Drag from left list onto a cell, or click a list camera to replace the selected cell |
-| Select camera | Click a cell (or the library) — accent border; arms PTZ when the camera has it |
+| Select camera | Click a cell (or the library) — green border if PTZ, red if not |
 | Reorder | Drag a cell onto another cell (swap) |
 | Clear cell | Right-click |
 | Fullscreen | Double-click / `Esc` — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
@@ -243,9 +243,9 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | Log | Settings or `L` — in-app log console (Windows release builds hide the OS console) |
 | PTZ pan / tilt | Sidebar pad (including diagonals) or arrow keys (**selected camera**) |
 | PTZ zoom | Sidebar `−` / `+`, or `=` / `+` / PageUp in; `-` / PageDown out |
-| PTZ home | Sidebar `⌂` or `H` |
+| PTZ home | Sidebar `H` |
 | PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol; click to toggle |
-| PTZ tracking | Sidebar **Tracking On/Off** — intrusion detection on the camera; click to toggle |
+| PTZ tracking | Hidden for now (FieldDetection query slews some PTZs) |
 | PTZ (DualShock 4) | Left stick pan/tilt; L2/R2 or right-stick Y zoom; L1/R1 focus; Cross = preset 1; Triangle = patrol 1 |
 
 PTZ talks **directly to each camera** (`http://{camera-host}:80/ISAPI/PTZCtrl/…`),
