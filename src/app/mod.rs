@@ -173,9 +173,12 @@ pub struct ViewerApp {
     /// Edge-detect gamepad face buttons.
     last_cross: bool,
     last_triangle: bool,
-    last_circle: bool,
+    last_square: bool,
+    last_dpad: (i8, i8),
+    /// D-pad highlight on the grid (slot index).
+    pad_focus_slot: Option<usize>,
     /// After PTZ target changes (select / camera fullscreen), ignore button
-    /// *press* edges so a held Cross does not fire preset 1 (often “home”).
+    /// *press* edges so a held Square does not fire patrol 1.
     ptz_rearm_buttons: bool,
     /// Keyboard/gamepad was commanding PTZ; send STOP once on release.
     ptz_hold_keys: bool,
@@ -272,14 +275,7 @@ impl ViewerApp {
             fullscreen_slot: None,
             window_fullscreen: false,
             hd: false,
-            app_name: {
-                let name = cfg.viewer.app_name.trim();
-                if name.is_empty() {
-                    crate::config::default_app_name()
-                } else {
-                    name.to_string()
-                }
-            },
+            app_name: crate::config::app_window_title(&cfg.viewer.app_name),
             pause_when_unfocused: cfg.viewer.pause_when_unfocused,
             paused: false,
             textures: HashMap::new(),
@@ -295,7 +291,9 @@ impl ViewerApp {
             last_ptz: PtzVector::STOP,
             last_cross: false,
             last_triangle: false,
-            last_circle: false,
+            last_square: false,
+            last_dpad: (0, 0),
+            pad_focus_slot: None,
             ptz_rearm_buttons: false,
             ptz_hold_keys: false,
             // Perf overlay: RUSTCAMS_DEBUG=1 or press D. stutter-stats.log always writes.
@@ -680,6 +678,7 @@ impl ViewerApp {
         // Do not PTZ-stop here: a continuous STOP can make Hikvision run park
         // (often preset/home). Fullscreen only switches the video URL.
         self.fullscreen_slot = Some(slot);
+        self.pad_focus_slot = Some(slot);
         self.ptz_rearm_buttons = true;
         // Fullscreen arms main/HD by default (toolbar stays toggleable).
         self.hd = true;

@@ -35,7 +35,7 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.1.2 \
+gh release create v0.1.3 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
@@ -234,11 +234,11 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | Fit mode | Settings — Contain / Cover / Fill |
 | HD | Toolbar toggle — main `…01` / `101` vs sub `…02` / `102` (1 / 2 / 2×2 only; denser grids force sub) |
 | Assign camera | Drag from left list onto a cell, or click a list camera to replace the selected cell |
-| Select camera | Click a cell (or the library) — green border if PTZ, red if not |
+| Select camera | Click a cell (or the library) — green border if PTZ, red if not; D-pad moves this on the grid; Cross/X confirms (camera fullscreen) |
 | Reorder | Drag a cell onto another cell (swap) |
 | Clear cell | Right-click, then confirm |
-| Fullscreen | Double-click / `Esc` / right-click / Circle — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
-| Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` / right-click grid / Circle exits (after camera FS) |
+| Fullscreen | Double-click / Cross(X) / `Esc` / right-click — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
+| Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` / right-click grid / Triangle toggles (after camera FS) |
 | Settings | ⚙ toolbar — fit, accent, outline width, perf overlay, log console |
 | Debug | Settings or `D` — perf overlay + stream decode metrics; status bar while open |
 | Log | Settings or `L` — in-app log console (Windows release builds hide the OS console) |
@@ -247,7 +247,7 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | PTZ home | Sidebar `H` |
 | PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol; click to toggle |
 | PTZ tracking | Hidden for now (FieldDetection query slews some PTZs) |
-| PTZ (DualShock 4) | Left stick or D-pad pan/tilt; L2/R2 or right-stick Y zoom; L1/R1 focus; Cross = preset 1; Triangle = patrol 1; Circle = exit fullscreen |
+| PTZ (DualShock 4) | Left stick pan/tilt (D-pad too in camera fullscreen); L2/R2 or right-stick Y zoom; L1/R1 focus; D-pad on grid moves selection; Cross/X = select (camera fullscreen); Triangle = back from camera FS, or toggle OS fullscreen on the grid; Square = patrol 1 |
 
 With **`[nvr]`**, video still comes from the NVR. PTZ prefers each camera’s
 ISAPI (`http://{camera}:80/ISAPI/PTZCtrl/…`) and falls back to the NVR

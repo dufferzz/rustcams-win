@@ -13,7 +13,7 @@ mod stream;
 mod views;
 
 use app::ViewerApp;
-use config::{default_app_name, default_cameras_toml, AppConfig, ResolvedConfig};
+use config::{app_window_title, default_cameras_toml, AppConfig, ResolvedConfig};
 use eframe::egui;
 use log_buffer::LogBuffer;
 use std::path::PathBuf;
@@ -98,14 +98,11 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    let app_name = if cfg.viewer.app_name.trim().is_empty() {
-        default_app_name()
-    } else {
-        cfg.viewer.app_name.clone()
-    };
+    let app_name = app_window_title(&cfg.viewer.app_name);
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
+        .with_maximized(true)
         .with_title(app_name);
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);

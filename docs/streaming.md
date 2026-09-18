@@ -298,7 +298,7 @@ Errors are shortened for the UI (`short_error` maps common RTSP/auth failures). 
 | `Layout` | 1, 2 (stacked), 2×2 … 6×6 (`layout.rs`) |
 | `View.slots` | Which camera id sits in which cell (`views.toml`) |
 | Active view only | Only that view’s slotted cameras are requested |
-| Fullscreen | Double-click cell → higher tier (+ direct URL when available); Esc / right-click / Circle exits |
+| Fullscreen | Double-click / Cross(X) → higher tier (+ direct URL when available); Esc / right-click / Triangle exits |
 | Select / PTZ | Click a cell (or library) → amber border; PTZ pad/keys target that camera |
 | DnD | Library → cell, cell ↔ cell swap (`app/ui.rs`) |
 

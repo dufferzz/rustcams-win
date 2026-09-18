@@ -123,7 +123,7 @@ impl ViewerApp {
             ui.separator();
             if ui
                 .selectable_label(self.window_fullscreen, "⛶")
-                .on_hover_text("OS / monitor fullscreen (Esc / right-click grid / Circle to exit)")
+                .on_hover_text("OS / monitor fullscreen (Esc / right-click grid / Triangle to toggle)")
                 .clicked()
             {
                 let on = !self.window_fullscreen;
@@ -1148,11 +1148,14 @@ impl ViewerApp {
 
         let slots = self.views.active_view().slots.clone();
         let selected_id = self.sidebar_ptz_cam.clone();
+        self.ensure_pad_focus();
+        let pad_focus = self.pad_focus_slot;
         let mut drop_action: Option<(usize, DragPayload)> = None;
         let mut fullscreen: Option<usize> = None;
         let mut clear: Option<usize> = None;
         let mut exit_os_fullscreen = false;
         let mut select: Option<String> = None;
+        let mut focus_slot: Option<usize> = None;
 
         for (i, slot) in slots.iter().enumerate() {
             let col = i % cols;
@@ -1195,6 +1198,14 @@ impl ViewerApp {
                         egui::StrokeKind::Inside,
                     );
                 }
+                if pad_focus == Some(i) && !selected {
+                    ui.painter().rect_stroke(
+                        cell.shrink(1.0),
+                        0.0,
+                        egui::Stroke::new(self.outline_width.max(2.0_f32), self.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 response.dnd_set_drag_payload(DragPayload::FromSlot(i));
             } else {
                 ui.painter()
@@ -1206,6 +1217,14 @@ impl ViewerApp {
                     egui::FontId::proportional(13.0),
                     Color32::from_rgb(90, 95, 105),
                 );
+                if pad_focus == Some(i) {
+                    ui.painter().rect_stroke(
+                        cell.shrink(1.0),
+                        0.0,
+                        egui::Stroke::new(self.outline_width.max(2.0_f32), self.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
 
             if response.dnd_hover_payload::<DragPayload>().is_some() {
@@ -1221,6 +1240,7 @@ impl ViewerApp {
                 drop_action = Some((i, (*payload).clone()));
             }
             if response.clicked() {
+                focus_slot = Some(i);
                 if let Some(cam_id) = slot {
                     select = Some(cam_id.clone());
                 }
@@ -1242,6 +1262,9 @@ impl ViewerApp {
         }
         if let Some(id) = select {
             self.select_camera(&id);
+        }
+        if let Some(idx) = focus_slot {
+            self.pad_focus_slot = Some(idx);
         }
         if let Some(idx) = fullscreen {
             self.enter_fullscreen(idx);

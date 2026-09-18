@@ -58,7 +58,8 @@ impl ViewerApp {
 
         let mut cross = false;
         let mut triangle = false;
-        let mut circle = false;
+        let mut square = false;
+        let mut dpad = (0i8, 0i8);
 
         if let Some(gilrs) = self.gilrs.as_mut() {
             while gilrs.next_event().is_some() {}
@@ -69,23 +70,20 @@ impl ViewerApp {
                 pan = merge_axis(pan, stick_to_speed(lx, PTZ_MOVE_SPEED));
                 tilt = merge_axis(tilt, stick_to_speed(ly, PTZ_MOVE_SPEED));
 
-                // D-pad: same mapping as arrows / left stick (up = tilt+).
-                if gamepad.is_pressed(Button::DPadLeft) {
-                    pan = merge_axis(pan, -PTZ_MOVE_SPEED);
+                dpad = dpad_dir(&gamepad);
+                // D-pad PTZ only in camera fullscreen; on the grid it moves focus.
+                if self.fullscreen_slot.is_some() {
+                    if dpad.0 < 0 {
+                        pan = merge_axis(pan, -PTZ_MOVE_SPEED);
+                    } else if dpad.0 > 0 {
+                        pan = merge_axis(pan, PTZ_MOVE_SPEED);
+                    }
+                    if dpad.1 < 0 {
+                        tilt = merge_axis(tilt, PTZ_MOVE_SPEED);
+                    } else if dpad.1 > 0 {
+                        tilt = merge_axis(tilt, -PTZ_MOVE_SPEED);
+                    }
                 }
-                if gamepad.is_pressed(Button::DPadRight) {
-                    pan = merge_axis(pan, PTZ_MOVE_SPEED);
-                }
-                if gamepad.is_pressed(Button::DPadUp) {
-                    tilt = merge_axis(tilt, PTZ_MOVE_SPEED);
-                }
-                if gamepad.is_pressed(Button::DPadDown) {
-                    tilt = merge_axis(tilt, -PTZ_MOVE_SPEED);
-                }
-                let dx = axis_with_deadzone(gamepad.value(Axis::DPadX), 0.5);
-                let dy = axis_with_deadzone(gamepad.value(Axis::DPadY), 0.5);
-                pan = merge_axis(pan, stick_to_speed(dx, PTZ_MOVE_SPEED));
-                tilt = merge_axis(tilt, stick_to_speed(dy, PTZ_MOVE_SPEED));
 
                 let l2 = trigger_value(&gamepad, Button::LeftTrigger2);
                 let r2 = trigger_value(&gamepad, Button::RightTrigger2);
@@ -105,27 +103,38 @@ impl ViewerApp {
                     focus = PTZ_ZOOM_SPEED;
                 }
 
-                cross = gamepad.is_pressed(Button::South); // Cross / A
-                triangle = gamepad.is_pressed(Button::North); // Triangle / Y
-                circle = gamepad.is_pressed(Button::East); // Circle / B
+                cross = gamepad.is_pressed(Button::South); // Cross / X
+                triangle = gamepad.is_pressed(Button::North); // Triangle
+                square = gamepad.is_pressed(Button::West); // Square
             }
         }
 
-        if circle && !self.last_circle {
+        let on_grid = self.fullscreen_slot.is_none();
+        if on_grid && dpad != (0, 0) && dpad != self.last_dpad {
+            self.move_pad_focus(dpad.0 as i32, dpad.1 as i32);
+        }
+        self.last_dpad = dpad;
+
+        if triangle && !self.last_triangle {
             if self.fullscreen_slot.is_some() {
                 self.exit_fullscreen();
-            } else if self.window_fullscreen {
-                self.set_window_fullscreen(ctx, false);
+            } else {
+                let on = !self.window_fullscreen;
+                self.set_window_fullscreen(ctx, on);
             }
         }
-        self.last_circle = circle;
+        self.last_triangle = triangle;
+
+        if on_grid && cross && !self.last_cross {
+            self.select_focused_slot();
+        }
+        self.last_cross = cross;
 
         let rearm = self.ptz_rearm_buttons;
         self.ptz_rearm_buttons = false;
 
         let Some(target) = self.active_ptz_target() else {
-            self.last_cross = cross;
-            self.last_triangle = triangle;
+            self.last_square = square;
             if !self.last_ptz.is_stop() {
                 self.ptz_stop();
             }
@@ -134,20 +143,12 @@ impl ViewerApp {
         };
 
         if rearm {
-            self.last_cross = cross;
-            self.last_triangle = triangle;
-        } else {
-            if cross && !self.last_cross {
-                self.ptz_stop();
-                self.ptz.goto_preset(target.clone(), 1);
-            }
-            if triangle && !self.last_triangle {
-                self.ptz_stop();
-                self.ptz.start_patrol(target.clone(), 1);
-            }
-            self.last_cross = cross;
-            self.last_triangle = triangle;
+            self.last_square = square;
+        } else if square && !self.last_square {
+            self.ptz_stop();
+            self.ptz.start_patrol(target.clone(), 1);
         }
+        self.last_square = square;
 
         let vec = PtzVector {
             pan,
@@ -164,6 +165,103 @@ impl ViewerApp {
         }
     }
 
+    pub(super) fn ensure_pad_focus(&mut self) {
+        let n = self.views.active_view().slots.len();
+        if n == 0 {
+            self.pad_focus_slot = None;
+            return;
+        }
+        if let Some(i) = self.pad_focus_slot {
+            if i < n {
+                return;
+            }
+        }
+        let selected = self.sidebar_ptz_cam.as_deref();
+        let idx = self
+            .views
+            .active_view()
+            .slots
+            .iter()
+            .position(|s| s.as_deref() == selected)
+            .unwrap_or(0);
+        self.pad_focus_slot = Some(idx.min(n - 1));
+    }
+
+    fn move_pad_focus(&mut self, dx: i32, dy: i32) {
+        self.ensure_pad_focus();
+        let layout = self.active_layout();
+        let cols = layout.cols() as i32;
+        let rows = layout.rows() as i32;
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let Some(idx) = self.pad_focus_slot else {
+            return;
+        };
+        let col = (idx as i32 % cols + dx).rem_euclid(cols);
+        let row = (idx as i32 / cols + dy).rem_euclid(rows);
+        let next = (row * cols + col) as usize;
+        self.pad_focus_slot = Some(next);
+        if let Some(id) = self
+            .views
+            .active_view()
+            .slots
+            .get(next)
+            .cloned()
+            .flatten()
+        {
+            self.select_camera(&id);
+        }
+    }
+
+    fn select_focused_slot(&mut self) {
+        self.ensure_pad_focus();
+        let Some(idx) = self.pad_focus_slot else {
+            return;
+        };
+        if let Some(id) = self
+            .views
+            .active_view()
+            .slots
+            .get(idx)
+            .cloned()
+            .flatten()
+        {
+            self.select_camera(&id);
+            self.enter_fullscreen(idx);
+        }
+    }
+
+}
+
+fn dpad_dir(gamepad: &gilrs::Gamepad<'_>) -> (i8, i8) {
+    let mut dx: i8 = 0;
+    let mut dy: i8 = 0;
+    if gamepad.is_pressed(Button::DPadLeft) {
+        dx -= 1;
+    }
+    if gamepad.is_pressed(Button::DPadRight) {
+        dx += 1;
+    }
+    if gamepad.is_pressed(Button::DPadUp) {
+        dy -= 1;
+    }
+    if gamepad.is_pressed(Button::DPadDown) {
+        dy += 1;
+    }
+    let ax = gamepad.value(Axis::DPadX);
+    let ay = gamepad.value(Axis::DPadY);
+    if ax <= -0.5 {
+        dx = -1;
+    } else if ax >= 0.5 {
+        dx = 1;
+    }
+    if ay <= -0.5 {
+        dy = -1;
+    } else if ay >= 0.5 {
+        dy = 1;
+    }
+    (dx, dy)
 }
 
 fn stick_to_speed(v: f32, base: i32) -> i32 {

@@ -155,6 +155,17 @@ pub fn default_app_name() -> String {
     "Citadel CCTV".into()
 }
 
+/// Window / toolbar title: configured brand plus crate version.
+pub fn app_window_title(name: &str) -> String {
+    let name = name.trim();
+    let name = if name.is_empty() {
+        default_app_name()
+    } else {
+        name.to_string()
+    };
+    format!("{name} v{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// XDG / AppImage config directory name (`~/.config/citadel-cctv`).
 pub const LINUX_CONFIG_DIR: &str = "citadel-cctv";
 
