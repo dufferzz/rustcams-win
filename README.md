@@ -5,7 +5,7 @@ Performant multi-camera RTSP CCTV viewer written in Rust.
 - Custom **views** with layout + camera slots (saved in `views.toml`)
 - Left **camera list** — drag onto grid cells
 - Drag cells to **reorder / swap** streams
-- Right-click a cell to clear it
+- Right-click a cell to remove it (asks to confirm)
 - Fit modes: Contain / Cover / Fill
 - Hover for camera name; status bar (CPU, RAM, network) while the perf overlay is open
 - Background pause when unfocused
@@ -35,7 +35,7 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.1.1 \
+gh release create v0.1.2 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
@@ -199,7 +199,8 @@ rtsp://user:pass@NVR:{rtsp_port}/Streaming/Channels/{channelNo * 100 + streamTyp
 Listed cameras keep stable ids (for `views.toml`) by matching the host and lens
 in `url` (`/Streaming/Channels/101` → lens 1, `…/201` → lens 2), or an explicit
 `channel = N`. Unmatched discovered channels get slug ids from the NVR name.
-Fullscreen / PTZ use the camera `url` (rewritten to main stream).
+Fullscreen uses the camera `url` (rewritten to main stream). PTZ prefers the
+camera’s own ISAPI and falls back to the NVR if that fails.
 
 ## Run
 
@@ -235,9 +236,9 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | Assign camera | Drag from left list onto a cell, or click a list camera to replace the selected cell |
 | Select camera | Click a cell (or the library) — green border if PTZ, red if not |
 | Reorder | Drag a cell onto another cell (swap) |
-| Clear cell | Right-click |
-| Fullscreen | Double-click / `Esc` — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
-| Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` exits (after camera FS) |
+| Clear cell | Right-click, then confirm |
+| Fullscreen | Double-click / `Esc` / right-click / Circle — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
+| Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` / right-click grid / Circle exits (after camera FS) |
 | Settings | ⚙ toolbar — fit, accent, outline width, perf overlay, log console |
 | Debug | Settings or `D` — perf overlay + stream decode metrics; status bar while open |
 | Log | Settings or `L` — in-app log console (Windows release builds hide the OS console) |
@@ -246,13 +247,14 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | PTZ home | Sidebar `H` |
 | PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol; click to toggle |
 | PTZ tracking | Hidden for now (FieldDetection query slews some PTZs) |
-| PTZ (DualShock 4) | Left stick pan/tilt; L2/R2 or right-stick Y zoom; L1/R1 focus; Cross = preset 1; Triangle = patrol 1 |
+| PTZ (DualShock 4) | Left stick or D-pad pan/tilt; L2/R2 or right-stick Y zoom; L1/R1 focus; Cross = preset 1; Triangle = patrol 1; Circle = exit fullscreen |
 
-PTZ talks **directly to each camera** (`http://{camera-host}:80/ISAPI/PTZCtrl/…`),
-not through the NVR. Digest auth is warmed when you **select** a PTZ camera.
-Credentials and host come from that camera’s RTSP `url`. Speeds default to move
-30 / zoom 25. Cameras whose id/name contain `ptz`, or that set `ptz = true`,
-get a PTZ target from `url`.
+With **`[nvr]`**, video still comes from the NVR. PTZ prefers each camera’s
+ISAPI (`http://{camera}:80/ISAPI/PTZCtrl/…`) and falls back to the NVR
+(`PTZCtrlProxy` / `PTZCtrl` / `ContentMgmt/PTZCtrl` + InputProxy channel).
+Digest is warmed when you **select** a PTZ camera. Speeds default to move 30 /
+zoom 25. Cameras whose id/name contain `ptz`, or that set `ptz = true`, get a
+PTZ target.
 
 **Fullscreen** switches that camera to its **direct main-stream** URL (same `url`
 rewritten to `…01`) at higher decode width (1280). Pipelines always use

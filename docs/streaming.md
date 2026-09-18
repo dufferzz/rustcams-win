@@ -79,6 +79,7 @@ Each `[[cameras]]` entry supplies `url = "rtsp://..."`. Resolve produces a `Came
    Stream digits: `1` = main, `2` = sub, `3` = third (`nvr::build_rtsp_url`).
 
 4. Fullscreen may switch to `direct_url` (camera LAN main stream) when available.
+5. PTZ prefers camera `http://{cam}:80/ISAPI/PTZCtrl/…`, then NVR `PTZCtrlProxy` / `PTZCtrl` with the InputProxy channel id.
 
 ### Stream digit rewriting
 
@@ -297,7 +298,7 @@ Errors are shortened for the UI (`short_error` maps common RTSP/auth failures). 
 | `Layout` | 1, 2 (stacked), 2×2 … 6×6 (`layout.rs`) |
 | `View.slots` | Which camera id sits in which cell (`views.toml`) |
 | Active view only | Only that view’s slotted cameras are requested |
-| Fullscreen | Double-click cell → higher tier (+ direct URL when available); Esc exits |
+| Fullscreen | Double-click cell → higher tier (+ direct URL when available); Esc / right-click / Circle exits |
 | Select / PTZ | Click a cell (or library) → amber border; PTZ pad/keys target that camera |
 | DnD | Library → cell, cell ↔ cell swap (`app/ui.rs`) |
 

@@ -165,12 +165,15 @@ pub struct ViewerApp {
     sidebar_controls: SidebarControls,
     rename_buffer: String,
     show_rename: bool,
+    /// Grid slot waiting on “remove camera” confirmation.
+    pending_clear_slot: Option<usize>,
     ptz: PtzWorker,
     gilrs: Option<Gilrs>,
     last_ptz: PtzVector,
     /// Edge-detect gamepad face buttons.
     last_cross: bool,
     last_triangle: bool,
+    last_circle: bool,
     /// After PTZ target changes (select / camera fullscreen), ignore button
     /// *press* edges so a held Cross does not fire preset 1 (often “home”).
     ptz_rearm_buttons: bool,
@@ -286,11 +289,13 @@ impl ViewerApp {
             sidebar_controls: SidebarControls::default(),
             rename_buffer: String::new(),
             show_rename: false,
+            pending_clear_slot: None,
             ptz,
             gilrs,
             last_ptz: PtzVector::STOP,
             last_cross: false,
             last_triangle: false,
+            last_circle: false,
             ptz_rearm_buttons: false,
             ptz_hold_keys: false,
             // Perf overlay: RUSTCAMS_DEBUG=1 or press D. stutter-stats.log always writes.
@@ -866,7 +871,7 @@ impl eframe::App for ViewerApp {
                         if let Some(cam) = self.camera_by_id(&id).cloned() {
                             let response = ui.interact(full, Id::new("fs"), Sense::click());
                             self.paint_cell_contents(ui, &cam, full, response.hovered(), false);
-                            if response.double_clicked() {
+                            if response.double_clicked() || response.secondary_clicked() {
                                 self.exit_fullscreen();
                             }
                         }
@@ -879,6 +884,7 @@ impl eframe::App for ViewerApp {
                 self.draw_grid(ui, full);
             });
 
+        self.draw_clear_slot_dialog(ctx);
         self.draw_debug_panel(ctx);
         self.draw_log_panel(ctx);
         self.settings_window(ctx);

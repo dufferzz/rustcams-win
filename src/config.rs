@@ -115,6 +115,10 @@ pub struct PtzTarget {
     pub username: String,
     pub password: String,
     pub channel: u32,
+    /// NVR `ContentMgmt/PTZCtrl` (InputProxy channel) instead of camera `PTZCtrl`.
+    pub via_nvr: bool,
+    /// If camera ISAPI fails, try this NVR route.
+    pub fallback: Option<Box<PtzTarget>>,
 }
 
 /// Resolved camera ready for the viewer / GStreamer.
@@ -130,7 +134,7 @@ pub struct CameraConfig {
     /// NVR InputProxy channel id when discovered via `[nvr]`.
     #[allow(dead_code)]
     pub channel_id: Option<u32>,
-    /// Direct-to-camera (or NVR-fallback) PTZ target, when available.
+    /// Camera ISAPI, or NVR `ContentMgmt/PTZCtrl` when `[nvr]` is set.
     pub ptz: Option<PtzTarget>,
 }
 
@@ -332,6 +336,7 @@ fn resolve_from_nvr(nvr: &NvrConfig, overrides: &[CameraEntry]) -> Result<Vec<Ca
         let id = unique_id(&base, &used_ids);
         used_ids.insert(id.clone());
         let url = nvr::build_rtsp_url(nvr, disc.channel_id, nvr.stream);
+        let ptz = name_wants_ptz(&id, Some(&disc.name)).then(|| nvr_ptz_target(nvr, disc.channel_id));
         cameras.push(CameraConfig {
             id,
             name: disc.name.clone(),
@@ -339,7 +344,7 @@ fn resolve_from_nvr(nvr: &NvrConfig, overrides: &[CameraEntry]) -> Result<Vec<Ca
             direct_url: None,
             protocols: nvr.protocols.clone(),
             channel_id: Some(disc.channel_id),
-            ptz: None,
+            ptz,
         });
     }
 
@@ -420,7 +425,23 @@ fn camera_url_identity(raw: &str) -> Option<(String, u32)> {
     Some((host, lens))
 }
 
-/// Build a PTZ target from the camera `url` (creds embedded), else NVR fallback.
+fn name_wants_ptz(id: &str, name: Option<&str>) -> bool {
+    id.to_ascii_lowercase().contains("ptz")
+        || name.is_some_and(|n| n.to_ascii_lowercase().contains("ptz"))
+}
+
+fn nvr_ptz_target(nvr: &NvrConfig, channel: u32) -> PtzTarget {
+    PtzTarget {
+        host: format!("{}:{}", nvr.host, nvr.http_port),
+        username: nvr.username.clone(),
+        password: nvr.password.clone(),
+        channel,
+        via_nvr: true,
+        fallback: None,
+    }
+}
+
+/// Camera-direct ISAPI when `url` is a camera; NVR ISAPI as fallback in `[nvr]` mode.
 fn resolve_ptz_target(
     entry: &CameraEntry,
     nvr: Option<&NvrConfig>,
@@ -428,47 +449,51 @@ fn resolve_ptz_target(
 ) -> Option<PtzTarget> {
     let wants_ptz = match entry.ptz {
         Some(flag) => flag,
-        None => {
-            entry.id.to_ascii_lowercase().contains("ptz")
-                || entry
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| n.to_ascii_lowercase().contains("ptz"))
-        }
+        None => name_wants_ptz(&entry.id, entry.name.as_deref()),
     };
-
-    let cam_url = entry.url.trim();
-    if !cam_url.is_empty() {
-        match target_from_rtsp_url(cam_url) {
-            Ok(t) => {
-                let is_nvr = nvr.is_some_and(|n| t.host.starts_with(&n.host));
-                if wants_ptz && !is_nvr {
-                    return Some(t);
-                }
-                if wants_ptz && is_nvr {
-                    // URL points at NVR — fall through to NVR ISAPI below.
-                } else if !wants_ptz {
-                    return None;
-                }
-            }
-            Err(err) => warn!(id = %entry.id, "invalid camera url for PTZ: {err:#}"),
-        }
-    }
-
     if !wants_ptz {
         return None;
     }
 
-    if let (Some(nvr), Some(ch)) = (nvr, nvr_channel) {
-        return Some(PtzTarget {
-            host: format!("{}:{}", nvr.host, nvr.http_port),
-            username: nvr.username.clone(),
-            password: nvr.password.clone(),
-            channel: ch,
-        });
-    }
+    let nvr_target = match (nvr, nvr_channel) {
+        (Some(nvr), Some(ch)) => Some(nvr_ptz_target(nvr, ch)),
+        _ => None,
+    };
 
-    None
+    let cam_url = entry.url.trim();
+    let camera_target = if cam_url.is_empty() {
+        None
+    } else {
+        match target_from_rtsp_url(cam_url) {
+            Ok(t) => {
+                let points_at_nvr = nvr.is_some_and(|n| {
+                    Url::parse(cam_url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_string))
+                        .is_some_and(|h| h.eq_ignore_ascii_case(&n.host))
+                });
+                if points_at_nvr {
+                    None
+                } else {
+                    Some(t)
+                }
+            }
+            Err(err) => {
+                warn!(id = %entry.id, "invalid camera url for PTZ: {err:#}");
+                None
+            }
+        }
+    };
+
+    match (camera_target, nvr_target) {
+        (Some(mut cam), Some(nvr_t)) => {
+            cam.fallback = Some(Box::new(nvr_t));
+            Some(cam)
+        }
+        (Some(cam), None) => Some(cam),
+        (None, Some(nvr_t)) => Some(nvr_t),
+        (None, None) => None,
+    }
 }
 
 /// Parse an RTSP (or HTTP) URL into an ISAPI host:port + channel.
@@ -489,6 +514,8 @@ pub fn target_from_rtsp_url(raw: &str) -> Result<PtzTarget> {
         username,
         password,
         channel,
+        via_nvr: false,
+        fallback: None,
     })
 }
 
@@ -604,6 +631,40 @@ mod tests {
                 username: "admin".into(),
                 password: "secret".into(),
                 channel: 1,
+                via_nvr: false,
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ptz_nvr_mode_uses_camera_then_nvr_fallback() {
+        let entry = CameraEntry {
+            id: "front_ptz".into(),
+            name: Some("Front PTZ".into()),
+            url: "rtsp://admin:secret@192.0.2.10:554/Streaming/Channels/101".into(),
+            ..Default::default()
+        };
+        let nvr = NvrConfig {
+            host: "198.51.100.20".into(),
+            http_port: 49000,
+            username: "nvr".into(),
+            password: "nvpass".into(),
+            ..Default::default()
+        };
+        let t = resolve_ptz_target(&entry, Some(&nvr), Some(17)).unwrap();
+        assert_eq!(t.host, "192.0.2.10:80");
+        assert!(!t.via_nvr);
+        let fb = t.fallback.expect("NVR fallback");
+        assert_eq!(
+            *fb,
+            PtzTarget {
+                host: "198.51.100.20:49000".into(),
+                username: "nvr".into(),
+                password: "nvpass".into(),
+                channel: 17,
+                via_nvr: true,
+                fallback: None,
             }
         );
     }

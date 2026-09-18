@@ -123,7 +123,7 @@ impl ViewerApp {
             ui.separator();
             if ui
                 .selectable_label(self.window_fullscreen, "⛶")
-                .on_hover_text("OS / monitor fullscreen (Esc to exit)")
+                .on_hover_text("OS / monitor fullscreen (Esc / right-click grid / Circle to exit)")
                 .clicked()
             {
                 let on = !self.window_fullscreen;
@@ -1151,6 +1151,7 @@ impl ViewerApp {
         let mut drop_action: Option<(usize, DragPayload)> = None;
         let mut fullscreen: Option<usize> = None;
         let mut clear: Option<usize> = None;
+        let mut exit_os_fullscreen = false;
         let mut select: Option<String> = None;
 
         for (i, slot) in slots.iter().enumerate() {
@@ -1228,7 +1229,11 @@ impl ViewerApp {
                 fullscreen = Some(i);
             }
             if response.secondary_clicked() {
-                clear = Some(i);
+                if self.window_fullscreen {
+                    exit_os_fullscreen = true;
+                } else if slot.is_some() {
+                    clear = Some(i);
+                }
             }
         }
 
@@ -1241,8 +1246,54 @@ impl ViewerApp {
         if let Some(idx) = fullscreen {
             self.enter_fullscreen(idx);
         }
+        if exit_os_fullscreen {
+            self.set_window_fullscreen(ui.ctx(), false);
+        }
         if let Some(idx) = clear {
+            self.pending_clear_slot = Some(idx);
+        }
+    }
+
+    pub(super) fn draw_clear_slot_dialog(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.pending_clear_slot else {
+            return;
+        };
+        let name = self
+            .views
+            .active_view()
+            .slots
+            .get(idx)
+            .and_then(|s| s.as_deref())
+            .and_then(|id| self.camera_by_id(id).map(|c| c.name.clone()))
+            .unwrap_or_else(|| "this camera".into());
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let mut open = true;
+        egui::Window::new("Remove camera")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Remove {name} from this view?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Remove").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            self.pending_clear_slot = None;
             self.clear_slot(idx);
+        } else if cancelled || !open {
+            self.pending_clear_slot = None;
         }
     }
 }

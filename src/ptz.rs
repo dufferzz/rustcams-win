@@ -7,11 +7,11 @@ use crate::config::PtzTarget;
 use parking_lot::{Condvar, Mutex};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 use ureq::Agent;
 
 /// Match typical Hikvision PTZ defaults (move 30 / zoom 25).
@@ -192,6 +192,9 @@ struct Shared {
     presets: Mutex<PresetFetchState>,
     park: Mutex<ParkFetchState>,
     tracking: Mutex<TrackingFetchState>,
+    /// Working (host, ISAPI root) after the first successful PTZ call.
+    route: Mutex<HashMap<String, (PtzTarget, String)>>,
+    route_logged: Mutex<HashSet<String>>,
     agent: Agent,
 }
 
@@ -216,6 +219,8 @@ impl PtzWorker {
             presets: Mutex::new(PresetFetchState::default()),
             park: Mutex::new(ParkFetchState::default()),
             tracking: Mutex::new(TrackingFetchState::default()),
+            route: Mutex::new(HashMap::new()),
+            route_logged: Mutex::new(HashSet::new()),
             agent,
         });
         let worker = Arc::clone(&shared);
@@ -248,17 +253,8 @@ impl PtzWorker {
         thread::Builder::new()
             .name("ptz-presets".into())
             .spawn(move || {
-                let path = format!("/ISAPI/PTZCtrl/channels/{}/presets", target.channel);
-                let result = digest_request(
-                    &shared.agent,
-                    &shared.sessions,
-                    "GET",
-                    &target,
-                    &path,
-                    None,
-                    "",
-                )
-                .and_then(|(_status, body)| parse_ptz_presets(&body));
+                let result = digest_ptz(&shared, "GET", &target, "presets", None, "")
+                    .and_then(|(_status, body)| parse_ptz_presets(&body));
 
                 let mut g = shared.presets.lock();
                 if g.gen != gen || g.key != key {
@@ -484,7 +480,7 @@ impl PtzWorker {
         self.shared.cv.notify_one();
     }
 
-    /// Warm digest + TCP keep-alive to the **camera** (not NVR) in the background.
+    /// Warm digest + TCP keep-alive to the PTZ HTTP host (camera or NVR) in the background.
     pub fn prewarm(&self, target: PtzTarget) {
         let shared = Arc::clone(&self.shared);
         thread::Builder::new()
@@ -791,8 +787,109 @@ fn worker_loop(shared: Arc<Shared>) {
     }
 }
 
+fn ptz_roots(target: &PtzTarget) -> &'static [&'static str] {
+    if target.via_nvr {
+        &["ContentMgmt/PTZCtrlProxy", "PTZCtrl", "ContentMgmt/PTZCtrl"]
+    } else {
+        &["PTZCtrl"]
+    }
+}
+
+fn ptz_candidates(target: &PtzTarget) -> Vec<(PtzTarget, &'static str)> {
+    let mut out = Vec::new();
+    for t in std::iter::once(target).chain(target.fallback.as_deref()) {
+        for root in ptz_roots(t) {
+            out.push((t.clone(), *root));
+        }
+    }
+    out
+}
+
+fn ptz_path(root: &str, channel: u32, rel: &str) -> String {
+    if rel.is_empty() {
+        format!("/ISAPI/{root}/channels/{channel}")
+    } else {
+        format!("/ISAPI/{root}/channels/{channel}/{rel}")
+    }
+}
+
+fn route_key(target: &PtzTarget) -> String {
+    format!("{}|{}", target.host, target.channel)
+}
+
+fn digest_ptz(
+    shared: &Shared,
+    method: &str,
+    target: &PtzTarget,
+    rel: &str,
+    body: Option<&[u8]>,
+    content_type: &str,
+) -> anyhow::Result<(u16, String)> {
+    let key = route_key(target);
+    if let Some((t, root)) = shared.route.lock().get(&key).cloned() {
+        let path = ptz_path(&root, t.channel, rel);
+        match digest_request(
+            &shared.agent,
+            &shared.sessions,
+            method,
+            &t,
+            &path,
+            body,
+            content_type,
+        ) {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                shared.route.lock().remove(&key);
+                warn!(
+                    host = %t.host,
+                    channel = t.channel,
+                    path,
+                    "PTZ route failed, trying alternatives: {err:#}"
+                );
+            }
+        }
+    }
+
+    let mut last_err = None;
+    for (t, root) in ptz_candidates(target) {
+        let path = ptz_path(root, t.channel, rel);
+        match digest_request(
+            &shared.agent,
+            &shared.sessions,
+            method,
+            &t,
+            &path,
+            body,
+            content_type,
+        ) {
+            Ok(v) => {
+                if shared.route_logged.lock().insert(key.clone()) {
+                    info!(
+                        host = %t.host,
+                        channel = t.channel,
+                        root,
+                        "PTZ route selected"
+                    );
+                }
+                shared.route.lock().insert(key, (t, root.to_string()));
+                return Ok(v);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    let err = last_err.unwrap_or_else(|| anyhow::anyhow!("no PTZ ISAPI route"));
+    if shared.route_logged.lock().insert(format!("fail|{key}")) {
+        warn!(
+            host = %target.host,
+            channel = target.channel,
+            "PTZ unavailable: {err:#}"
+        );
+    }
+    Err(err)
+}
+
 fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow::Result<()> {
-    let path = format!("/ISAPI/PTZCtrl/channels/{}/continuous", target.channel);
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <PTZData>\
@@ -803,12 +900,11 @@ fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow
          </PTZData>",
         vec.pan, vec.tilt, vec.zoom, vec.focus
     );
-    digest_request(
-        &shared.agent,
-        &shared.sessions,
+    digest_ptz(
+        shared,
         "PUT",
         target,
-        &path,
+        "continuous",
         Some(body.as_bytes()),
         "application/xml",
     )?;
@@ -816,34 +912,12 @@ fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow
 }
 
 fn oneshot_put(shared: &Shared, target: &PtzTarget, suffix: &str) -> anyhow::Result<()> {
-    let path = format!("/ISAPI/PTZCtrl/channels/{}/{}", target.channel, suffix);
-    digest_request(
-        &shared.agent,
-        &shared.sessions,
-        "PUT",
-        target,
-        &path,
-        None,
-        "",
-    )?;
+    digest_ptz(shared, "PUT", target, suffix, None, "")?;
     Ok(())
 }
 
-fn park_path(target: &PtzTarget) -> String {
-    format!("/ISAPI/PTZCtrl/channels/{}/parkaction", target.channel)
-}
-
 fn get_park_action(shared: &Shared, target: &PtzTarget) -> anyhow::Result<ParkAction> {
-    let path = park_path(target);
-    let (_status, body) = digest_request(
-        &shared.agent,
-        &shared.sessions,
-        "GET",
-        target,
-        &path,
-        None,
-        "",
-    )?;
+    let (_status, body) = digest_ptz(shared, "GET", target, "parkaction", None, "")?;
     parse_park_action(&body)
 }
 
@@ -852,23 +926,13 @@ fn set_park_enabled(
     target: &PtzTarget,
     enabled: bool,
 ) -> anyhow::Result<ParkAction> {
-    let path = park_path(target);
-    let (_status, body) = digest_request(
-        &shared.agent,
-        &shared.sessions,
-        "GET",
-        target,
-        &path,
-        None,
-        "",
-    )?;
+    let (_status, body) = digest_ptz(shared, "GET", target, "parkaction", None, "")?;
     let xml = rewrite_park_enabled(&body, enabled)?;
-    digest_request(
-        &shared.agent,
-        &shared.sessions,
+    digest_ptz(
+        shared,
         "PUT",
         target,
-        &path,
+        "parkaction",
         Some(xml.as_bytes()),
         "application/xml",
     )?;
@@ -1024,16 +1088,7 @@ fn snapshot_restore<T>(
 fn get_absolute_ptz(shared: &Shared, target: &PtzTarget) -> anyhow::Result<AbsolutePtz> {
     let mut last_err = None;
     for rel in ["status", "absolute"] {
-        let path = format!("/ISAPI/PTZCtrl/channels/{}/{}", target.channel, rel);
-        match digest_request(
-            &shared.agent,
-            &shared.sessions,
-            "GET",
-            target,
-            &path,
-            None,
-            "",
-        ) {
+        match digest_ptz(shared, "GET", target, rel, None, "") {
             Ok((_, body)) => match parse_absolute_ptz(&body) {
                 Ok(pos) => return Ok(pos),
                 Err(err) => last_err = Some(err),
@@ -1049,7 +1104,6 @@ fn put_absolute_ptz(
     target: &PtzTarget,
     pos: AbsolutePtz,
 ) -> anyhow::Result<()> {
-    let path = format!("/ISAPI/PTZCtrl/channels/{}/absolute", target.channel);
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <PTZData>\
@@ -1061,12 +1115,11 @@ fn put_absolute_ptz(
 </PTZData>",
         pos.elevation, pos.azimuth, pos.zoom
     );
-    digest_request(
-        &shared.agent,
-        &shared.sessions,
+    digest_ptz(
+        shared,
         "PUT",
         target,
-        &path,
+        "absolute",
         Some(body.as_bytes()),
         "application/xml",
     )?;

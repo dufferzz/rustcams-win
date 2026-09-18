@@ -11,6 +11,8 @@ impl ViewerApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.show_settings {
                 self.show_settings = false;
+            } else if self.pending_clear_slot.is_some() {
+                self.pending_clear_slot = None;
             } else if self.fullscreen_slot.is_some() {
                 self.exit_fullscreen();
             } else if self.window_fullscreen {
@@ -56,6 +58,7 @@ impl ViewerApp {
 
         let mut cross = false;
         let mut triangle = false;
+        let mut circle = false;
 
         if let Some(gilrs) = self.gilrs.as_mut() {
             while gilrs.next_event().is_some() {}
@@ -65,6 +68,24 @@ impl ViewerApp {
                 // Stick up (gilrs Y negative) → tilt+; keyboard already uses +tilt for Up.
                 pan = merge_axis(pan, stick_to_speed(lx, PTZ_MOVE_SPEED));
                 tilt = merge_axis(tilt, stick_to_speed(ly, PTZ_MOVE_SPEED));
+
+                // D-pad: same mapping as arrows / left stick (up = tilt+).
+                if gamepad.is_pressed(Button::DPadLeft) {
+                    pan = merge_axis(pan, -PTZ_MOVE_SPEED);
+                }
+                if gamepad.is_pressed(Button::DPadRight) {
+                    pan = merge_axis(pan, PTZ_MOVE_SPEED);
+                }
+                if gamepad.is_pressed(Button::DPadUp) {
+                    tilt = merge_axis(tilt, PTZ_MOVE_SPEED);
+                }
+                if gamepad.is_pressed(Button::DPadDown) {
+                    tilt = merge_axis(tilt, -PTZ_MOVE_SPEED);
+                }
+                let dx = axis_with_deadzone(gamepad.value(Axis::DPadX), 0.5);
+                let dy = axis_with_deadzone(gamepad.value(Axis::DPadY), 0.5);
+                pan = merge_axis(pan, stick_to_speed(dx, PTZ_MOVE_SPEED));
+                tilt = merge_axis(tilt, stick_to_speed(dy, PTZ_MOVE_SPEED));
 
                 let l2 = trigger_value(&gamepad, Button::LeftTrigger2);
                 let r2 = trigger_value(&gamepad, Button::RightTrigger2);
@@ -86,8 +107,18 @@ impl ViewerApp {
 
                 cross = gamepad.is_pressed(Button::South); // Cross / A
                 triangle = gamepad.is_pressed(Button::North); // Triangle / Y
+                circle = gamepad.is_pressed(Button::East); // Circle / B
             }
         }
+
+        if circle && !self.last_circle {
+            if self.fullscreen_slot.is_some() {
+                self.exit_fullscreen();
+            } else if self.window_fullscreen {
+                self.set_window_fullscreen(ctx, false);
+            }
+        }
+        self.last_circle = circle;
 
         let rearm = self.ptz_rearm_buttons;
         self.ptz_rearm_buttons = false;
