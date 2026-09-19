@@ -56,7 +56,7 @@ Crate/binary/dist folder names stay `rustcams` (packaging identity, not branding
 
 ## Streaming / decode (keep docs in sync)
 
-Default decode is **software** (`avdec_*`) via an **explicit** depay/parse chain — not `decodebin`, and not `videorate`. `RUSTCAMS_DECODE=hw` forces D3D11/MF/NV. Dense-grid tiers are sized for readable OSD (e.g. 5×5 → 352 px).
+Default decode is **software** (`avdec_*`) via an **explicit** depay/parse chain — not `decodebin`, and not `videorate`. `RUSTCAMS_DECODE=hw` forces D3D11/MF/NV or Linux V4L2. Dense-grid tiers are sized for readable OSD (e.g. 5×5 → 352 px).
 
 When changing the pipeline, update:
 
@@ -69,7 +69,20 @@ When changing the pipeline, update:
 
 ```bash
 ./scripts/package-linux-appimage.sh
-# → dist/Citadel_CCTV-linux-x86_64.AppImage
+# → dist/Citadel_CCTV-linux-x86_64.AppImage   (on x86_64; dist profile)
+# → dist/Citadel_CCTV-linux-aarch64.AppImage  (on Pi; release profile)
 ```
 
-Uses the **dist** profile. Package on this machine, then `gh release create` with the files under `dist/`. There is no GitHub Actions release job. Config: `cameras.toml` beside the AppImage or `~/.config/citadel-cctv/`.
+x86_64 shipping uses the **dist** profile; package on Ubuntu 22.04 when possible, then `gh release create` with the files under `dist/`. There is no GitHub Actions release job. Config: `cameras.toml` beside the AppImage or `~/.config/citadel-cctv/`.
+
+## Raspberry Pi 4 (64-bit, SSH)
+
+From the PC:
+
+```bash
+./scripts/build-on-pi.sh user@pi
+# make pi HOST=user@pi
+# ./scripts/build-on-pi.sh user@pi --appimage
+```
+
+On the Pi: `./scripts/setup-pi-deps.sh` then `cargo build --release`. Run `target/release/rustcams` with system GStreamer. Use `RUSTCAMS_DECODE=hw` for V4L2. Optional AppImage on-device with `CARGO_PROFILE=release`.

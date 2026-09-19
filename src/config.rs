@@ -11,6 +11,8 @@ use url::Url;
 pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvr: Option<NvrConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cameras: Vec<CameraEntry>,
     #[serde(default)]
@@ -20,11 +22,26 @@ pub struct AppConfig {
 /// Hikvision NVR used for ISAPI discovery and RTSP proxy streaming.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NvrConfig {
+    /// When false, keep `[nvr]` credentials but stream from `[[cameras]]` URLs only.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     pub host: String,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
     #[serde(default = "default_rtsp_port")]
     pub rtsp_port: u16,
+    /// Remapped HTTPS (device default 443). Recorded for operators; ISAPI uses `http_port`.
+    #[serde(
+        default = "default_https_port",
+        skip_serializing_if = "is_default_https_port"
+    )]
+    pub https_port: u16,
+    /// Hikvision SDK / iVMS “Server Port” (device default 8000). Not used by this app.
+    #[serde(
+        default = "default_server_port",
+        skip_serializing_if = "is_default_server_port"
+    )]
+    pub server_port: u16,
     pub username: String,
     pub password: String,
     /// Default stream when a camera override does not set `stream`.
@@ -38,9 +55,12 @@ pub struct NvrConfig {
 impl Default for NvrConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host: String::new(),
             http_port: default_http_port(),
             rtsp_port: default_rtsp_port(),
+            https_port: default_https_port(),
+            server_port: default_server_port(),
             username: "admin".into(),
             password: String::new(),
             stream: StreamType::Sub,
@@ -49,12 +69,98 @@ impl Default for NvrConfig {
     }
 }
 
+/// Hikvision Access Control door / gate (`PUT …/RemoteControl/door/{id}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateConfig {
+    pub host: String,
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+    #[serde(default = "default_gate_user")]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_door_id")]
+    pub door_id: String,
+    #[serde(default = "default_gate_action")]
+    pub action: String,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            http_port: default_http_port(),
+            username: default_gate_user(),
+            password: String::new(),
+            door_id: default_door_id(),
+            action: default_gate_action(),
+        }
+    }
+}
+
+impl GateConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.host.trim().is_empty() && !self.username.trim().is_empty()
+    }
+
+    pub fn request_path(&self) -> String {
+        let door = self.door_id.trim();
+        let door = if door.is_empty() { "1" } else { door };
+        format!("/ISAPI/AccessControl/RemoteControl/door/{door}")
+    }
+
+    pub fn request_url(&self) -> String {
+        let host = self.host.trim();
+        if self.http_port == 80 {
+            format!("http://{host}{}", self.request_path())
+        } else {
+            format!("http://{host}:{}{}", self.http_port, self.request_path())
+        }
+    }
+}
+
 fn default_http_port() -> u16 {
     80
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn default_gate_user() -> String {
+    "admin".into()
+}
+
+fn default_door_id() -> String {
+    "1".into()
+}
+
+fn default_gate_action() -> String {
+    "open".into()
+}
+
 fn default_rtsp_port() -> u16 {
     554
+}
+
+fn default_https_port() -> u16 {
+    443
+}
+
+fn is_default_https_port(v: &u16) -> bool {
+    *v == default_https_port()
+}
+
+fn default_server_port() -> u16 {
+    8000
+}
+
+fn is_default_server_port(v: &u16) -> bool {
+    *v == default_server_port()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -155,18 +261,29 @@ pub fn default_app_name() -> String {
     "Citadel CCTV".into()
 }
 
-/// Window / toolbar title: configured brand plus crate version.
-pub fn app_window_title(name: &str) -> String {
+/// Brand shown in the toolbar (`[viewer] app_name`, default Citadel CCTV).
+pub fn app_brand_name(name: &str) -> String {
     let name = name.trim();
-    let name = if name.is_empty() {
+    if name.is_empty() {
         default_app_name()
     } else {
         name.to_string()
-    };
-    format!("{name} v{}", env!("CARGO_PKG_VERSION"))
+    }
+}
+
+/// OS window title: `Citadel CCTV [Screen 1] v0.2.0`.
+///
+/// AppImage otherwise falls back to the wrapper binary name (`AppRun.wrapped`).
+pub fn app_screen_title(name: &str, screen: u32) -> String {
+    format!(
+        "{} [Screen {screen}] v{}",
+        app_brand_name(name),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// XDG / AppImage config directory name (`~/.config/citadel-cctv`).
+/// Also the Wayland/X11 app id so the window is not named `AppRun.wrapped`.
 pub const LINUX_CONFIG_DIR: &str = "citadel-cctv";
 
 fn appimage_dir() -> Option<PathBuf> {
@@ -266,13 +383,14 @@ impl AppConfig {
     }
 
     pub fn resolve(self) -> Result<ResolvedConfig> {
-        let cameras = if let Some(nvr) = &self.nvr {
-            if nvr.host.trim().is_empty() {
-                bail!("[nvr] host is empty");
+        let cameras = match &self.nvr {
+            Some(nvr) if nvr.enabled => {
+                if nvr.host.trim().is_empty() {
+                    bail!("[nvr] host is empty");
+                }
+                resolve_from_nvr(nvr, &self.cameras)?
             }
-            resolve_from_nvr(nvr, &self.cameras)?
-        } else {
-            resolve_direct(&self.cameras)?
+            _ => resolve_direct(&self.cameras)?,
         };
 
         let ptz_ready = cameras.iter().filter(|c| c.ptz.is_some()).count();
@@ -347,7 +465,8 @@ fn resolve_from_nvr(nvr: &NvrConfig, overrides: &[CameraEntry]) -> Result<Vec<Ca
         let id = unique_id(&base, &used_ids);
         used_ids.insert(id.clone());
         let url = nvr::build_rtsp_url(nvr, disc.channel_id, nvr.stream);
-        let ptz = name_wants_ptz(&id, Some(&disc.name)).then(|| nvr_ptz_target(nvr, disc.channel_id));
+        let ptz =
+            name_wants_ptz(&id, Some(&disc.name)).then(|| nvr_ptz_target(nvr, disc.channel_id));
         cameras.push(CameraConfig {
             id,
             name: disc.name.clone(),
@@ -380,18 +499,15 @@ fn find_override_match<'a>(
                         .is_some_and(|sip| sip.eq_ignore_ascii_case(&ip))
             })
             .collect();
-        if let Some(d) = candidates
-            .iter()
-            .find(|d| d.src_input_port == Some(lens))
-        {
+        if let Some(d) = candidates.iter().find(|d| d.src_input_port == Some(lens)) {
             return Some(*d);
         }
         return candidates.first().copied();
     }
     let name_key = ovr.name.as_deref()?.to_ascii_lowercase();
-    discovered.iter().find(|d| {
-        !matched.contains(&d.channel_id) && d.name.to_ascii_lowercase() == name_key
-    })
+    discovered
+        .iter()
+        .find(|d| !matched.contains(&d.channel_id) && d.name.to_ascii_lowercase() == name_key)
 }
 
 fn camera_from_discovery(
@@ -412,10 +528,7 @@ fn camera_from_discovery(
     let ptz = resolve_ptz_target(ovr, Some(nvr), Some(disc.channel_id));
     CameraConfig {
         id: ovr.id.clone(),
-        name: ovr
-            .name
-            .clone()
-            .unwrap_or_else(|| disc.name.clone()),
+        name: ovr.name.clone().unwrap_or_else(|| disc.name.clone()),
         url: grid_url,
         direct_url,
         protocols: ovr.protocols.clone().or_else(|| nvr.protocols.clone()),
@@ -599,6 +712,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gate_url_omits_port_80() {
+        let g = GateConfig {
+            host: "192.0.2.80".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            g.request_url(),
+            "http://192.0.2.80/ISAPI/AccessControl/RemoteControl/door/1"
+        );
+    }
+
+    #[test]
+    fn gate_url_includes_nondefault_port() {
+        let g = GateConfig {
+            host: "192.0.2.80".into(),
+            http_port: 8080,
+            door_id: "2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            g.request_url(),
+            "http://192.0.2.80:8080/ISAPI/AccessControl/RemoteControl/door/2"
+        );
+    }
+
+    #[test]
+    fn screen_title_includes_brand_screen_and_version() {
+        assert_eq!(
+            app_screen_title("Citadel CCTV", 1),
+            format!("Citadel CCTV [Screen 1] v{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            app_screen_title("  ", 2),
+            format!("Citadel CCTV [Screen 2] v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
     fn slugify_basic() {
         assert_eq!(slugify("Front PTZ"), "front_ptz");
         assert_eq!(slugify("  "), "cam");
@@ -606,10 +757,8 @@ mod tests {
 
     #[test]
     fn parses_ptz_from_camera_rtsp() {
-        let t = target_from_rtsp_url(
-            "rtsp://admin:secret@192.0.2.10:554/Streaming/Channels/101",
-        )
-        .unwrap();
+        let t = target_from_rtsp_url("rtsp://admin:secret@192.0.2.10:554/Streaming/Channels/101")
+            .unwrap();
         assert_eq!(t.host, "192.0.2.10:80");
         assert_eq!(t.channel, 1);
         assert_eq!(t.username, "admin");
@@ -618,10 +767,9 @@ mod tests {
 
     #[test]
     fn parses_ptz_from_nvr_rtsp() {
-        let t = target_from_rtsp_url(
-            "rtsp://admin:pass@198.51.100.20:49002/Streaming/Channels/502",
-        )
-        .unwrap();
+        let t =
+            target_from_rtsp_url("rtsp://admin:pass@198.51.100.20:49002/Streaming/Channels/502")
+                .unwrap();
         assert_eq!(t.host, "198.51.100.20:49000");
         assert_eq!(t.channel, 5);
     }
@@ -666,7 +814,8 @@ mod tests {
         let t = resolve_ptz_target(&entry, Some(&nvr), Some(17)).unwrap();
         assert_eq!(t.host, "192.0.2.10:80");
         assert!(!t.via_nvr);
-        let fb = t.fallback.expect("NVR fallback");
+        assert_eq!(t.channel, 1);
+        let fb = t.fallback.expect("nvr fallback");
         assert_eq!(
             *fb,
             PtzTarget {
@@ -707,9 +856,7 @@ mod tests {
     #[test]
     fn identity_from_url() {
         assert_eq!(
-            camera_url_identity(
-                "rtsp://admin:x@192.0.2.10:554/Streaming/Channels/201"
-            ),
+            camera_url_identity("rtsp://admin:x@192.0.2.10:554/Streaming/Channels/201"),
             Some(("192.0.2.10".into(), 2))
         );
     }
@@ -742,10 +889,8 @@ mod tests {
 
     #[test]
     fn appimage_uses_toml_beside_image() {
-        let root = std::env::temp_dir().join(format!(
-            "rustcams-appimage-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rustcams-appimage-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let image = root.join("Citadel_CCTV-linux-x86_64.AppImage");
@@ -760,10 +905,8 @@ mod tests {
 
     #[test]
     fn appimage_falls_back_to_xdg_config() {
-        let root = std::env::temp_dir().join(format!(
-            "rustcams-appimage-xdg-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rustcams-appimage-xdg-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let image = root.join("Citadel.AppImage");

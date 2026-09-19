@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod gate;
 mod gst_env;
 mod gst_link;
 mod layout;
@@ -13,7 +14,7 @@ mod stream;
 mod views;
 
 use app::ViewerApp;
-use config::{app_window_title, default_cameras_toml, AppConfig, ResolvedConfig};
+use config::{app_screen_title, default_cameras_toml, AppConfig, ResolvedConfig, LINUX_CONFIG_DIR};
 use eframe::egui;
 use log_buffer::LogBuffer;
 use std::path::PathBuf;
@@ -71,24 +72,38 @@ fn main() -> eframe::Result<()> {
         .unwrap_or_else(default_cameras_toml);
     tracing::info!(path = %config_path.display(), "config path");
 
-    let (cfg, config_warning) = match AppConfig::load(&config_path) {
-        Ok(cfg) => {
-            let warning = if cfg.cameras.is_empty() {
-                Some(format!(
-                    "No cameras in {} — edit cameras.toml to configure.",
-                    config_path.display()
-                ))
-            } else {
-                None
-            };
-            (cfg, warning)
-        }
+    let (raw_cfg, cfg, config_warning) = match AppConfig::read(&config_path) {
+        Ok(raw) => match raw.clone().resolve() {
+            Ok(resolved) => {
+                let warning = if resolved.cameras.is_empty() {
+                    Some(format!(
+                        "No cameras in {} — edit cameras.toml or Settings → NVR.",
+                        config_path.display()
+                    ))
+                } else {
+                    None
+                };
+                (raw, resolved, warning)
+            }
+            Err(err) => {
+                tracing::warn!("failed to resolve {}: {err:#}", config_path.display());
+                (
+                    raw,
+                    ResolvedConfig::default(),
+                    Some(format!(
+                        "Config needs setup ({}): {err:#}\nFix cameras.toml or Settings → NVR.",
+                        config_path.display()
+                    )),
+                )
+            }
+        },
         Err(err) => {
             tracing::warn!(
                 "failed to load {}: {err:#} — starting without cameras",
                 config_path.display()
             );
             (
+                AppConfig::default(),
                 ResolvedConfig::default(),
                 Some(format!(
                     "Config needs setup ({}): {err:#}\nEdit cameras.toml to configure cameras.",
@@ -98,12 +113,11 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    let app_name = app_window_title(&cfg.viewer.app_name);
-
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
         .with_maximized(true)
-        .with_title(app_name);
+        .with_app_id(LINUX_CONFIG_DIR)
+        .with_title(app_screen_title(&cfg.viewer.app_name, 1));
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -116,9 +130,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "citadel-cctv",
         options,
-        Box::new(move |_cc| match ViewerApp::new(cfg, config_path, config_warning, log_buffer) {
-            Ok(app) => Ok(Box::new(app)),
-            Err(err) => Err(err.into()),
+        Box::new(move |cc| {
+            app::icons::install(&cc.egui_ctx);
+            match ViewerApp::new(raw_cfg, cfg, config_path, config_warning, log_buffer) {
+                Ok(app) => Ok(Box::new(app)),
+                Err(err) => Err(err.into()),
+            }
         }),
     )
 }

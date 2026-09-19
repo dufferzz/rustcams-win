@@ -149,6 +149,10 @@ pub(crate) fn prefer_hardware_decoders() {
         "nvh265dec",
         "vah264dec",
         "vah265dec",
+        "v4l2slh264dec",
+        "v4l2slh265dec",
+        "v4l2h264dec",
+        "v4l2h265dec",
     ];
     for name in HW_DECODERS {
         if let Some(factory) = gst::ElementFactory::find(name) {
@@ -156,7 +160,7 @@ pub(crate) fn prefer_hardware_decoders() {
             debug!(element = name, rank = ?hw_rank, "preferred hardware decoder");
         }
     }
-    // Keep software as a fallback, but below DXVA / NVDEC / VAAPI.
+    // Keep software as a fallback, but below DXVA / NVDEC / VAAPI / V4L2.
     let sw_rank = gst::Rank::PRIMARY - 1;
     for name in ["avdec_h264", "avdec_h265"] {
         if let Some(factory) = gst::ElementFactory::find(name) {
@@ -177,6 +181,10 @@ pub(crate) fn log_decoder_availability() {
         "nvh265dec",
         "vah264dec",
         "vah265dec",
+        "v4l2slh264dec",
+        "v4l2slh265dec",
+        "v4l2h264dec",
+        "v4l2h265dec",
         "avdec_h264",
         "avdec_h265",
         "jpegdec",
@@ -185,12 +193,16 @@ pub(crate) fn log_decoder_availability() {
         "d3d11download",
     ];
     let mut d3d11_dec = false;
+    let mut v4l2_dec = false;
     for name in NAMES {
         match gst::ElementFactory::find(name) {
             Some(f) => {
                 debug!(element = name, rank = ?f.rank(), "decoder available");
                 if *name == "d3d11h264dec" || *name == "d3d11h265dec" {
                     d3d11_dec = true;
+                }
+                if name.starts_with("v4l2") {
+                    v4l2_dec = true;
                 }
             }
             None => debug!(element = name, "decoder not found"),
@@ -199,6 +211,9 @@ pub(crate) fn log_decoder_availability() {
     if d3d11_dec {
         info!("D3D11/DXVA hardware decoders present (Intel/AMD/NVIDIA via Direct3D11)");
     }
+    if v4l2_dec {
+        info!("V4L2 hardware decoders present (Raspberry Pi / Linux stateless or stateful)");
+    }
 }
 
 pub(crate) fn d3d11_postproc_available() -> bool {
@@ -206,4 +221,3 @@ pub(crate) fn d3d11_postproc_available() -> bool {
         && gst::ElementFactory::find("d3d11scale").is_some()
         && gst::ElementFactory::find("d3d11download").is_some()
 }
-

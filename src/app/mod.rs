@@ -1,8 +1,10 @@
+pub(crate) mod icons;
 mod input;
 mod settings;
 mod ui;
 
-use crate::config::{CameraConfig, ResolvedConfig, StreamType};
+use self::settings::{CANVAS_BG, PANEL_BG, STATUS_BG};
+use crate::config::{AppConfig, CameraConfig, ResolvedConfig, StreamType};
 use crate::layout::{FitMode, Layout};
 use crate::log_buffer::LogBuffer;
 use crate::nvr::rewrite_stream_digit;
@@ -11,10 +13,12 @@ use crate::stats::SystemStats;
 use crate::stream::{StreamDebugRow, StreamManager};
 use crate::views::ViewStore;
 use eframe::egui;
-use egui::{Color32, ColorImage, Id, Sense, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use gilrs::Gilrs;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -22,7 +26,7 @@ use tracing::{info, warn};
 #[derive(Clone, Debug)]
 enum DragPayload {
     FromLibrary(String),
-    FromSlot(usize),
+    FromSlot { view: usize, slot: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +147,15 @@ impl UiPerf {
 pub struct ViewerApp {
     /// Shown when config is missing / empty / failed to load.
     config_warning: Option<String>,
+    config_path: PathBuf,
+    app_config: AppConfig,
+    nvr_enabled: bool,
+    nvr_draft: crate::config::NvrConfig,
+    nvr_protocols: String,
+    nvr_status: Option<String>,
+    gate_draft: crate::config::GateConfig,
+    gate_status: Arc<Mutex<Option<String>>>,
+    gate_inflight: Arc<AtomicBool>,
     cameras: Vec<CameraConfig>,
     camera_index: HashMap<String, usize>,
     streams: StreamManager,
@@ -166,7 +179,10 @@ pub struct ViewerApp {
     rename_buffer: String,
     show_rename: bool,
     /// Grid slot waiting on “remove camera” confirmation.
-    pending_clear_slot: Option<usize>,
+    /// `(view_idx, slot)` waiting on “remove camera” confirmation.
+    pending_clear_slot: Option<(usize, usize)>,
+    pending_gate_confirm: bool,
+    settings_tab: settings::SettingsTab,
     ptz: PtzWorker,
     gilrs: Option<Gilrs>,
     last_ptz: PtzVector,
@@ -174,9 +190,13 @@ pub struct ViewerApp {
     last_cross: bool,
     last_triangle: bool,
     last_square: bool,
+    last_l1: bool,
+    last_gate_cancel: bool,
     last_dpad: (i8, i8),
-    /// D-pad highlight on the grid (slot index).
+    /// D-pad highlight on the main grid.
     pad_focus_slot: Option<usize>,
+    /// D-pad highlight on Screen 2.
+    aux_pad_focus_slot: Option<usize>,
     /// After PTZ target changes (select / camera fullscreen), ignore button
     /// *press* edges so a held Square does not fire patrol 1.
     ptz_rearm_buttons: bool,
@@ -190,6 +210,26 @@ pub struct ViewerApp {
     ui_perf: UiPerf,
     /// Append-only hitch diagnostics next to cameras.toml (every ~2s).
     stutter_log_path: PathBuf,
+    stutter_log_file: bool,
+    decode_1: i32,
+    decode_1_hd: i32,
+    decode_2: i32,
+    decode_2_hd: i32,
+    decode_2x2: i32,
+    decode_2x2_hd: i32,
+    decode_3x3: i32,
+    decode_4x4: i32,
+    decode_5x5: i32,
+    decode_6x6: i32,
+    /// Second monitor window (same process, shared selection / PTZ).
+    aux_open: bool,
+    aux_view: usize,
+    aux_fullscreen_slot: Option<usize>,
+    aux_focused: bool,
+    aux_window_fullscreen: bool,
+    /// In-flight drag so drops work across the auxiliary viewport.
+    cross_drag: Option<DragPayload>,
+    aux_pointer_down: bool,
     /// In-app log / console window (OS console is hidden on Windows release builds).
     show_log: bool,
     show_settings: bool,
@@ -207,6 +247,7 @@ pub struct ViewerApp {
 
 impl ViewerApp {
     pub fn new(
+        app_config: AppConfig,
         cfg: ResolvedConfig,
         config_path: PathBuf,
         config_warning: Option<String>,
@@ -227,10 +268,7 @@ impl ViewerApp {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("stutter-stats.log");
-        info!(
-            path = %stutter_log_path.display(),
-            "stutter diagnostics on — writing every 2s; perf overlay + log panel open"
-        );
+        let (nvr_enabled, nvr_draft, nvr_protocols) = settings::nvr_edit_state(&app_config);
 
         let views_path = config_path
             .parent()
@@ -240,10 +278,25 @@ impl ViewerApp {
 
         let ui_prefs_path = settings::UiPrefs::path_next_to(&config_path);
         let ui_prefs = settings::UiPrefs::load(&ui_prefs_path);
-        if let Some(name) = ui_prefs.last_view.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        if let Some(name) = ui_prefs
+            .last_view
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
             if let Some(i) = views.views.iter().position(|v| v.name == name) {
                 views.active = i;
+            }
+        }
+        let mut aux_view = 0usize;
+        if let Some(name) = ui_prefs
+            .last_aux_view
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(i) = views.views.iter().position(|v| v.name == name) {
+                aux_view = i;
             }
         }
         let fit = ui_prefs
@@ -265,8 +318,25 @@ impl ViewerApp {
             }
         };
 
+        if ui_prefs.stutter_log_file {
+            info!(
+                path = %stutter_log_path.display(),
+                "stutter-stats.log enabled"
+            );
+        }
+
+        let gate_draft = app_config.gate.clone().unwrap_or_default();
         let app = Self {
             config_warning,
+            config_path: config_path.clone(),
+            app_config,
+            nvr_enabled,
+            nvr_draft,
+            nvr_protocols,
+            nvr_status: None,
+            gate_draft,
+            gate_status: Arc::new(Mutex::new(None)),
+            gate_inflight: Arc::new(AtomicBool::new(false)),
             cameras: cfg.cameras,
             camera_index,
             streams,
@@ -275,7 +345,7 @@ impl ViewerApp {
             fullscreen_slot: None,
             window_fullscreen: false,
             hd: false,
-            app_name: crate::config::app_window_title(&cfg.viewer.app_name),
+            app_name: crate::config::app_brand_name(&cfg.viewer.app_name),
             pause_when_unfocused: cfg.viewer.pause_when_unfocused,
             paused: false,
             textures: HashMap::new(),
@@ -286,23 +356,45 @@ impl ViewerApp {
             rename_buffer: String::new(),
             show_rename: false,
             pending_clear_slot: None,
+            pending_gate_confirm: false,
+            settings_tab: settings::SettingsTab::default(),
             ptz,
             gilrs,
             last_ptz: PtzVector::STOP,
             last_cross: false,
             last_triangle: false,
             last_square: false,
+            last_l1: false,
+            last_gate_cancel: false,
             last_dpad: (0, 0),
             pad_focus_slot: None,
+            aux_pad_focus_slot: None,
             ptz_rearm_buttons: false,
             ptz_hold_keys: false,
-            // Perf overlay: RUSTCAMS_DEBUG=1 or press D. stutter-stats.log always writes.
             debug_overlay: std::env::var_os("RUSTCAMS_DEBUG").is_some(),
             debug_rows: Vec::new(),
             last_debug_sample: Instant::now() - std::time::Duration::from_secs(2),
             last_debug_log: Instant::now(),
             ui_perf: UiPerf::new(),
             stutter_log_path,
+            stutter_log_file: ui_prefs.stutter_log_file,
+            decode_1: settings::clamp_decode_width(ui_prefs.decode_1),
+            decode_1_hd: settings::clamp_decode_width(ui_prefs.decode_1_hd),
+            decode_2: settings::clamp_decode_width(ui_prefs.decode_2),
+            decode_2_hd: settings::clamp_decode_width(ui_prefs.decode_2_hd),
+            decode_2x2: settings::clamp_decode_width(ui_prefs.decode_2x2),
+            decode_2x2_hd: settings::clamp_decode_width(ui_prefs.decode_2x2_hd),
+            decode_3x3: settings::clamp_decode_width(ui_prefs.decode_3x3),
+            decode_4x4: settings::clamp_decode_width(ui_prefs.decode_4x4),
+            decode_5x5: settings::clamp_decode_width(ui_prefs.decode_5x5),
+            decode_6x6: settings::clamp_decode_width(ui_prefs.decode_6x6),
+            aux_open: false,
+            aux_view,
+            aux_fullscreen_slot: None,
+            aux_focused: false,
+            aux_window_fullscreen: false,
+            cross_drag: None,
+            aux_pointer_down: false,
             show_log: false,
             show_settings: false,
             accent: ui_prefs.accent_color(),
@@ -319,10 +411,49 @@ impl ViewerApp {
         Ok(app)
     }
 
+    pub(super) fn apply_resolved_cameras(&mut self, cameras: Vec<CameraConfig>) {
+        let keep = self.sidebar_ptz_cam.clone();
+        self.streams.stop_all();
+        self.textures.clear();
+        let mut camera_index = HashMap::new();
+        for (i, cam) in cameras.iter().enumerate() {
+            camera_index.insert(cam.id.clone(), i);
+        }
+        self.cameras = cameras;
+        self.camera_index = camera_index;
+        if let Some(id) = keep {
+            if self.camera_index.contains_key(&id) {
+                self.sidebar_ptz_cam = Some(id);
+            } else {
+                self.sidebar_ptz_cam = None;
+                self.ptz_stop();
+            }
+        }
+    }
+
+    fn clamp_aux_view(&mut self) {
+        self.aux_view = self.views.clamp_index(self.aux_view);
+    }
+
+    fn ensure_distinct_aux_view(&mut self) {
+        self.clamp_aux_view();
+        if self.aux_view != self.views.active {
+            return;
+        }
+        if let Some(i) = (0..self.views.views.len()).find(|&i| i != self.views.active) {
+            self.aux_view = i;
+            return;
+        }
+        let layout = self.active_layout();
+        self.views
+            .views
+            .push(crate::views::View::new("Screen 2", layout));
+        self.aux_view = self.views.views.len() - 1;
+        self.persist_views();
+    }
+
     fn camera_by_id(&self, id: &str) -> Option<&CameraConfig> {
-        self.camera_index
-            .get(id)
-            .and_then(|&i| self.cameras.get(i))
+        self.camera_index.get(id).and_then(|&i| self.cameras.get(i))
     }
 
     fn active_layout(&self) -> Layout {
@@ -341,20 +472,28 @@ impl ViewerApp {
         self.save_ui_prefs();
     }
 
-    /// All cameras slotted in the active view.
-    fn view_camera_ids(&self) -> Vec<String> {
+    /// All cameras slotted in a view.
+    fn view_camera_ids_at(&self, view_idx: usize) -> Vec<String> {
         self.views
-            .active_view()
+            .view(view_idx)
             .slots
             .iter()
             .filter_map(|s| s.clone())
             .collect()
     }
 
-    /// Cameras currently painted (fullscreen = one; otherwise the full grid).
-    fn displayed_camera_ids(&self) -> Vec<String> {
-        let view = self.views.active_view();
-        if let Some(slot) = self.fullscreen_slot {
+    /// All cameras slotted in the active view.
+    fn view_camera_ids(&self) -> Vec<String> {
+        self.view_camera_ids_at(self.views.active)
+    }
+
+    fn displayed_camera_ids_at(
+        &self,
+        view_idx: usize,
+        fullscreen_slot: Option<usize>,
+    ) -> Vec<String> {
+        let view = self.views.view(view_idx);
+        if let Some(slot) = fullscreen_slot {
             return view
                 .slots
                 .get(slot)
@@ -362,95 +501,132 @@ impl ViewerApp {
                 .into_iter()
                 .collect();
         }
-        self.view_camera_ids()
+        self.view_camera_ids_at(view_idx)
     }
 
-    /// With D3D11, solo modes drop off-screen decodes to free GPU/CPU.
-    fn solo_decode_mode(&self) -> bool {
-        self.streams.d3d11_available()
-            && (self.fullscreen_slot.is_some()
-                || matches!(self.active_layout(), Layout::One))
+    /// Cameras currently painted (fullscreen = one; otherwise the full grid).
+    fn displayed_camera_ids(&self) -> Vec<String> {
+        self.displayed_camera_ids_at(self.views.active, self.fullscreen_slot)
     }
 
-    /// HD (main stream) on 1 / 2 / 2×2 layouts, or whenever a camera is fullscreen.
+    fn all_painted_camera_ids(&self) -> Vec<String> {
+        let mut ids = self.displayed_camera_ids();
+        if self.aux_open {
+            ids.extend(self.displayed_camera_ids_at(self.aux_view, self.aux_fullscreen_slot));
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     fn hd_allowed(&self) -> bool {
         self.fullscreen_slot.is_some()
+            || self.aux_fullscreen_slot.is_some()
             || matches!(
                 self.active_layout(),
                 Layout::One | Layout::Two | Layout::Grid2
             )
+            || (self.aux_open
+                && matches!(
+                    self.views.view(self.aux_view).layout,
+                    Layout::One | Layout::Two | Layout::Grid2
+                ))
     }
 
     /// Decode width / fps tier for a stream (fullscreen overrides grid tier).
-    fn stream_tier(&self, fullscreen: bool) -> (i32, i32, StreamType) {
+    fn stream_tier_for(&self, layout: Layout, fullscreen: bool) -> (i32, i32, StreamType) {
         if fullscreen {
-            // Fullscreen always allows HD; default on when entering.
             if self.hd {
-                return (1280, 30, StreamType::Main);
+                return (self.decode_1_hd, 30, StreamType::Main);
             }
-            return (640, 15, StreamType::Sub);
+            return (self.decode_1, 15, StreamType::Sub);
         }
-        let hd = self.hd
-            && matches!(
-                self.active_layout(),
-                Layout::One | Layout::Two | Layout::Grid2
-            );
-        match self.active_layout() {
-            Layout::One if hd => (1280, 30, StreamType::Main),
-            Layout::One => (640, 15, StreamType::Sub),
-            Layout::Two if hd => (960, 20, StreamType::Main),
-            Layout::Two => (640, 15, StreamType::Sub),
-            Layout::Grid2 if hd => (640, 15, StreamType::Main),
-            Layout::Grid2 => (640, 15, StreamType::Sub),
-            // Dense grids: sharp enough for OSD timestamps; SW decode handles this.
-            Layout::Grid3 => (480, 15, StreamType::Sub),
-            Layout::Grid4 => (400, 15, StreamType::Sub),
-            Layout::Grid5 => (352, 15, StreamType::Sub),
-            Layout::Grid6 => (288, 15, StreamType::Sub),
+        let hd = self.hd && matches!(layout, Layout::One | Layout::Two | Layout::Grid2);
+        match layout {
+            Layout::One if hd => (self.decode_1_hd, 30, StreamType::Main),
+            Layout::One => (self.decode_1, 15, StreamType::Sub),
+            Layout::Two if hd => (self.decode_2_hd, 20, StreamType::Main),
+            Layout::Two => (self.decode_2, 15, StreamType::Sub),
+            Layout::Grid2 if hd => (self.decode_2x2_hd, 15, StreamType::Main),
+            Layout::Grid2 => (self.decode_2x2, 15, StreamType::Sub),
+            Layout::Grid3 => (self.decode_3x3, 15, StreamType::Sub),
+            Layout::Grid4 => (self.decode_4x4, 15, StreamType::Sub),
+            Layout::Grid5 => (self.decode_5x5, 15, StreamType::Sub),
+            Layout::Grid6 => (self.decode_6x6, 15, StreamType::Sub),
         }
     }
 
-    fn desired_streams(&self) -> Vec<crate::stream::StreamRequest> {
-        let fullscreen_id = self.fullscreen_slot.and_then(|slot| {
-            self.views
-                .active_view()
-                .slots
-                .get(slot)
-                .and_then(|s| s.clone())
-        });
+    fn merge_stream_request(
+        into: &mut HashMap<String, crate::stream::StreamRequest>,
+        req: crate::stream::StreamRequest,
+    ) {
+        match into.get_mut(&req.id) {
+            Some(existing) => {
+                existing.max_width = existing.max_width.max(req.max_width);
+                existing.max_fps = existing.max_fps.max(req.max_fps);
+                if req.url.contains("01") || req.url.contains("101") {
+                    existing.url = req.url;
+                    existing.protocols = req.protocols;
+                }
+            }
+            None => {
+                into.insert(req.id.clone(), req);
+            }
+        }
+    }
 
-        // D3D11 1×1 / camera-fullscreen: only the visible camera(s).
-        // Otherwise keep the whole view decoding so leaving fullscreen is instant.
-        let ids = if self.solo_decode_mode() {
-            self.displayed_camera_ids()
+    fn collect_view_streams(
+        &self,
+        view_idx: usize,
+        fullscreen_slot: Option<usize>,
+        into: &mut HashMap<String, crate::stream::StreamRequest>,
+    ) {
+        let view = self.views.view(view_idx);
+        let layout = view.layout;
+        let solo = self.streams.d3d11_available()
+            && (fullscreen_slot.is_some() || matches!(layout, Layout::One));
+        let fullscreen_id =
+            fullscreen_slot.and_then(|slot| view.slots.get(slot).and_then(|s| s.clone()));
+        let ids = if solo {
+            self.displayed_camera_ids_at(view_idx, fullscreen_slot)
         } else {
-            self.view_camera_ids()
+            self.view_camera_ids_at(view_idx)
         };
-
-        ids.into_iter()
-            .filter_map(|id| {
-                let cam = self.camera_by_id(&id)?;
-                let fullscreen = fullscreen_id.as_deref() == Some(cam.id.as_str());
-                let (max_width, max_fps, stream) = self.stream_tier(fullscreen);
-                let (base_url, protocols) = if fullscreen {
-                    if let Some(direct) = cam.direct_url.as_ref() {
-                        // Direct camera LAN: prefer UDP (typical default).
-                        (direct.clone(), None)
-                    } else {
-                        (cam.url.clone(), cam.protocols.clone())
-                    }
+        for id in ids {
+            let Some(cam) = self.camera_by_id(&id) else {
+                continue;
+            };
+            let fullscreen = fullscreen_id.as_deref() == Some(cam.id.as_str());
+            let (max_width, max_fps, stream) = self.stream_tier_for(layout, fullscreen);
+            let (base_url, protocols) = if fullscreen {
+                if let Some(direct) = cam.direct_url.as_ref() {
+                    (direct.clone(), None)
                 } else {
                     (cam.url.clone(), cam.protocols.clone())
-                };
-                Some(crate::stream::StreamRequest {
+                }
+            } else {
+                (cam.url.clone(), cam.protocols.clone())
+            };
+            Self::merge_stream_request(
+                into,
+                crate::stream::StreamRequest {
                     id: cam.id.clone(),
                     url: rewrite_stream_digit(&base_url, stream),
                     protocols,
                     max_width,
                     max_fps,
-                })
-            })
-            .collect()
+                },
+            );
+        }
+    }
+
+    fn desired_streams(&self) -> Vec<crate::stream::StreamRequest> {
+        let mut map = HashMap::new();
+        self.collect_view_streams(self.views.active, self.fullscreen_slot, &mut map);
+        if self.aux_open {
+            self.collect_view_streams(self.aux_view, self.aux_fullscreen_slot, &mut map);
+        }
+        map.into_values().collect()
     }
 
     fn sync_streams(&mut self, active: bool) {
@@ -477,16 +653,24 @@ impl ViewerApp {
 
     fn update_textures(&mut self, ctx: &egui::Context) {
         let pass_t0 = Instant::now();
-        let ids = self.displayed_camera_ids();
+        let ids = self.all_painted_camera_ids();
         if ids.is_empty() {
             return;
         }
         // Uploads are cheap (~3–30µs in stutter-stats); update every tile that has
         // a newer frame. Capping to 1–2/frame made dense grids look like 2fps.
-        let dense = matches!(
-            self.active_layout(),
-            Layout::Grid3 | Layout::Grid4 | Layout::Grid5 | Layout::Grid6
-        );
+        let dense = {
+            let main_dense = matches!(
+                self.active_layout(),
+                Layout::Grid3 | Layout::Grid4 | Layout::Grid5 | Layout::Grid6
+            );
+            let aux_dense = self.aux_open
+                && matches!(
+                    self.views.view(self.aux_view).layout,
+                    Layout::Grid3 | Layout::Grid4 | Layout::Grid5 | Layout::Grid6
+                );
+            main_dense || aux_dense
+        };
         let tex_opts = if dense {
             TextureOptions::NEAREST
         } else {
@@ -532,13 +716,7 @@ impl ViewerApp {
                 entry.seq = seq;
             } else {
                 let handle = ctx.load_texture(format!("cam-{id}"), image, tex_opts);
-                self.textures.insert(
-                    id,
-                    TexCache {
-                        handle,
-                        seq,
-                    },
-                );
+                self.textures.insert(id, TexCache { handle, seq });
             }
             self.ui_perf
                 .note_upload(bytes, t0.elapsed().as_nanos() as u64, cloned);
@@ -547,8 +725,8 @@ impl ViewerApp {
             .note_tex_pass(pass_t0.elapsed().as_nanos() as u64);
     }
 
-    fn apply_drop(&mut self, slot_idx: usize, payload: DragPayload) {
-        let n = self.views.active_view().slots.len();
+    fn apply_drop(&mut self, view_idx: usize, slot_idx: usize, payload: DragPayload) {
+        let n = self.views.view(view_idx).slots.len();
         if slot_idx >= n {
             return;
         }
@@ -557,41 +735,69 @@ impl ViewerApp {
                 if self.camera_by_id(&cam_id).is_none() {
                     return;
                 }
-                self.views.active_view_mut().slots[slot_idx] = Some(cam_id);
+                self.views.view_mut(view_idx).slots[slot_idx] = Some(cam_id);
                 self.views.mark_dirty();
             }
-            DragPayload::FromSlot(from) => {
-                if from >= n || from == slot_idx {
-                    return;
-                }
-                self.views.active_view_mut().slots.swap(from, slot_idx);
-                self.views.mark_dirty();
-                if let Some(fs) = self.fullscreen_slot.as_mut() {
-                    if *fs == from {
-                        *fs = slot_idx;
-                    } else if *fs == slot_idx {
-                        *fs = from;
+            DragPayload::FromSlot {
+                view: src_view,
+                slot: from,
+            } => {
+                if src_view == view_idx {
+                    if from >= n || from == slot_idx {
+                        return;
                     }
+                    self.views.view_mut(view_idx).slots.swap(from, slot_idx);
+                    self.views.mark_dirty();
+                    let remap = |cur: &mut Option<usize>| {
+                        if let Some(fs) = cur.as_mut() {
+                            if *fs == from {
+                                *fs = slot_idx;
+                            } else if *fs == slot_idx {
+                                *fs = from;
+                            }
+                        }
+                    };
+                    if view_idx == self.views.active {
+                        remap(&mut self.fullscreen_slot);
+                    }
+                    if view_idx == self.aux_view {
+                        remap(&mut self.aux_fullscreen_slot);
+                    }
+                } else {
+                    let cam = self.views.view(src_view).slots.get(from).cloned().flatten();
+                    let Some(cam) = cam else {
+                        return;
+                    };
+                    self.views.view_mut(view_idx).slots[slot_idx] = Some(cam);
+                    self.views.mark_dirty();
                 }
             }
         }
         self.persist_view_file();
     }
 
-    fn clear_slot(&mut self, slot_idx: usize) {
-        if let Some(slot) = self.views.active_view_mut().slots.get_mut(slot_idx) {
+    fn clear_slot(&mut self, view_idx: usize, slot_idx: usize) {
+        if let Some(slot) = self.views.view_mut(view_idx).slots.get_mut(slot_idx) {
             *slot = None;
             self.views.mark_dirty();
             self.persist_view_file();
         }
-        if self.fullscreen_slot == Some(slot_idx) {
+        if self.fullscreen_slot == Some(slot_idx) && view_idx == self.views.active {
             self.exit_fullscreen();
+        }
+        if self.aux_fullscreen_slot == Some(slot_idx) && view_idx == self.aux_view {
+            self.aux_fullscreen_slot = None;
         }
     }
 
-    fn set_layout(&mut self, layout: Layout) {
-        self.views.active_view_mut().resize_for_layout(layout);
-        self.exit_fullscreen();
+    fn set_layout_at(&mut self, view_idx: usize, layout: Layout) {
+        self.views.view_mut(view_idx).resize_for_layout(layout);
+        if view_idx == self.views.active {
+            self.exit_fullscreen();
+        }
+        if view_idx == self.aux_view {
+            self.aux_fullscreen_slot = None;
+        }
         self.views.mark_dirty();
         self.persist_view_file();
     }
@@ -601,18 +807,8 @@ impl ViewerApp {
         self.last_ptz = PtzVector::STOP;
     }
 
-    /// Prefer the fullscreen camera when it has PTZ; otherwise the selection.
+    /// PTZ follows the single selected camera (never two at once).
     fn active_ptz_target(&self) -> Option<crate::config::PtzTarget> {
-        if let Some(slot) = self.fullscreen_slot {
-            if let Some(cam_id) = self.views.active_view().slots.get(slot).and_then(|s| s.as_ref())
-            {
-                if let Some(cam) = self.camera_by_id(cam_id) {
-                    if let Some(ptz) = cam.ptz.clone() {
-                        return Some(ptz);
-                    }
-                }
-            }
-        }
         let cam_id = self.sidebar_ptz_cam.as_ref()?;
         self.camera_by_id(cam_id)?.ptz.clone()
     }
@@ -636,8 +832,8 @@ impl ViewerApp {
         }
     }
 
-    /// If a grid cell is selected, put `cam_id` in that cell (swap if it is already on the view).
-    fn place_library_camera(&mut self, cam_id: &str) {
+    /// If a grid cell is selected on `view_idx`, put `cam_id` in that cell.
+    fn place_library_camera(&mut self, cam_id: &str, view_idx: usize) {
         if self.camera_by_id(cam_id).is_none() {
             return;
         }
@@ -650,7 +846,7 @@ impl ViewerApp {
             return;
         }
         let found = {
-            let slots = &self.views.active_view().slots;
+            let slots = &self.views.view(view_idx).slots;
             slots
                 .iter()
                 .position(|s| s.as_deref() == Some(selected.as_str()))
@@ -664,35 +860,52 @@ impl ViewerApp {
             return;
         };
         if let Some(other_idx) = already {
-            self.apply_drop(sel_idx, DragPayload::FromSlot(other_idx));
+            self.apply_drop(
+                view_idx,
+                sel_idx,
+                DragPayload::FromSlot {
+                    view: view_idx,
+                    slot: other_idx,
+                },
+            );
         } else {
-            self.apply_drop(sel_idx, DragPayload::FromLibrary(cam_id.to_string()));
+            self.apply_drop(
+                view_idx,
+                sel_idx,
+                DragPayload::FromLibrary(cam_id.to_string()),
+            );
         }
         self.select_camera(cam_id);
     }
 
     fn enter_fullscreen(&mut self, slot: usize) {
-        if self.fullscreen_slot == Some(slot) {
+        self.enter_fullscreen_at(self.views.active, slot, false);
+    }
+
+    fn enter_fullscreen_at(&mut self, view_idx: usize, slot: usize, is_aux: bool) {
+        let fs = if is_aux {
+            &mut self.aux_fullscreen_slot
+        } else {
+            &mut self.fullscreen_slot
+        };
+        if *fs == Some(slot) {
             return;
         }
-        // Do not PTZ-stop here: a continuous STOP can make Hikvision run park
-        // (often preset/home). Fullscreen only switches the video URL.
-        self.fullscreen_slot = Some(slot);
-        self.pad_focus_slot = Some(slot);
+        *fs = Some(slot);
+        if !is_aux {
+            self.pad_focus_slot = Some(slot);
+        }
         self.ptz_rearm_buttons = true;
-        // Fullscreen arms main/HD by default (toolbar stays toggleable).
         self.hd = true;
         if let Some(cam_id) = self
             .views
-            .active_view()
+            .view(view_idx)
             .slots
             .get(slot)
             .and_then(|s| s.as_ref())
             .cloned()
         {
             self.select_camera(&cam_id);
-        } else if let Some(target) = self.active_ptz_target() {
-            self.ptz.prewarm(target);
         }
     }
 
@@ -701,6 +914,14 @@ impl ViewerApp {
             return;
         }
         self.fullscreen_slot = None;
+        self.ptz_rearm_buttons = true;
+    }
+
+    fn exit_aux_fullscreen(&mut self) {
+        if self.aux_fullscreen_slot.is_none() {
+            return;
+        }
+        self.aux_fullscreen_slot = None;
         self.ptz_rearm_buttons = true;
     }
 
@@ -735,6 +956,52 @@ impl ViewerApp {
         }
     }
 
+    pub(super) fn prompt_open_gates(&mut self) {
+        if !self.gate_draft.is_configured() {
+            *self.gate_status.lock() = Some("Set gate host and user in Settings.".into());
+            return;
+        }
+        if self.gate_busy() {
+            return;
+        }
+        self.pending_gate_confirm = true;
+    }
+
+    pub(super) fn open_gates(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.gate_draft.is_configured() {
+            *self.gate_status.lock() = Some("Set gate host and user in Settings.".into());
+            return;
+        }
+        if self
+            .gate_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        *self.gate_status.lock() = Some("Opening gates…".into());
+        let cfg = self.gate_draft.clone();
+        let status = self.gate_status.clone();
+        let inflight = self.gate_inflight.clone();
+        std::thread::spawn(move || {
+            let msg = match crate::gate::remote_control_door(&cfg) {
+                Ok(()) => "Gates opened.".to_string(),
+                Err(err) => format!("Gate failed: {err:#}"),
+            };
+            info!("{msg}");
+            *status.lock() = Some(msg);
+            inflight.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub(super) fn gate_status_text(&self) -> Option<String> {
+        self.gate_status.lock().clone()
+    }
+
+    pub(super) fn gate_busy(&self) -> bool {
+        self.gate_inflight.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl eframe::App for ViewerApp {
@@ -742,10 +1009,12 @@ impl eframe::App for ViewerApp {
         self.ui_perf.tick_frame();
         self.sync_window_fullscreen(ctx);
         self.apply_accent_visuals(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            crate::config::app_screen_title(&self.app_name, 1),
+        ));
         self.handle_keys(ctx);
-        self.handle_ptz_input(ctx);
 
-        let focused = ctx.input(|i| i.focused);
+        let focused = ctx.input(|i| i.focused) || self.aux_focused;
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         let active = if self.pause_when_unfocused {
             focused && !minimized
@@ -762,16 +1031,22 @@ impl eframe::App for ViewerApp {
         self.refresh_debug();
 
         if !self.window_fullscreen {
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                self.toolbar(ui);
-            });
+            egui::TopBottomPanel::top("toolbar")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(PANEL_BG)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(ctx, |ui| {
+                    self.toolbar(ui, self.views.active, false);
+                });
 
             if self.debug_overlay {
                 egui::TopBottomPanel::bottom("statusbar")
                     .exact_height(26.0)
                     .frame(
                         egui::Frame::NONE
-                            .fill(Color32::from_rgb(16, 18, 22))
+                            .fill(STATUS_BG)
                             .inner_margin(egui::Margin::symmetric(10, 4)),
                     )
                     .show(ctx, |ui| {
@@ -786,13 +1061,13 @@ impl eframe::App for ViewerApp {
                     .width_range(160.0..=360.0)
                     .frame(
                         egui::Frame::NONE
-                            .fill(Color32::from_rgb(14, 16, 20))
+                            .fill(PANEL_BG)
                             .inner_margin(egui::Margin::symmetric(10, 8)),
                     )
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             if ui
-                                .small_button("◀")
+                                .small_button(icons::CARET_LEFT)
                                 .on_hover_text("Collapse sidebar")
                                 .clicked()
                             {
@@ -800,7 +1075,7 @@ impl eframe::App for ViewerApp {
                                 self.save_ui_prefs();
                             }
                         });
-                        self.camera_sidebar(ui);
+                        self.camera_sidebar(ui, self.views.active, false);
                     });
             } else {
                 egui::SidePanel::left("cameras_collapsed")
@@ -808,12 +1083,12 @@ impl eframe::App for ViewerApp {
                     .resizable(false)
                     .frame(
                         egui::Frame::NONE
-                            .fill(Color32::from_rgb(14, 16, 20))
+                            .fill(PANEL_BG)
                             .inner_margin(egui::Margin::symmetric(4, 6)),
                     )
                     .show(ctx, |ui| {
                         if ui
-                            .small_button("▶")
+                            .small_button(icons::CARET_RIGHT)
                             .on_hover_text("Show sidebar")
                             .clicked()
                         {
@@ -827,7 +1102,7 @@ impl eframe::App for ViewerApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(8, 9, 12))
+                    .fill(CANVAS_BG)
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
@@ -858,35 +1133,21 @@ impl eframe::App for ViewerApp {
                     return;
                 }
 
-                if let Some(slot_idx) = self.fullscreen_slot {
-                    let cam_id = self
-                        .views
-                        .active_view()
-                        .slots
-                        .get(slot_idx)
-                        .cloned()
-                        .flatten();
-                    if let Some(id) = cam_id {
-                        if let Some(cam) = self.camera_by_id(&id).cloned() {
-                            let response = ui.interact(full, Id::new("fs"), Sense::click());
-                            self.paint_cell_contents(ui, &cam, full, response.hovered(), false);
-                            if response.double_clicked() || response.secondary_clicked() {
-                                self.exit_fullscreen();
-                            }
-                        }
-                    } else {
-                        self.exit_fullscreen();
-                    }
-                    return;
-                }
-
-                self.draw_grid(ui, full);
+                self.paint_monitor(ui, full, self.views.active, self.fullscreen_slot, false);
             });
 
         self.draw_clear_slot_dialog(ctx);
+        self.draw_gate_confirm_dialog(ctx);
         self.draw_debug_panel(ctx);
         self.draw_log_panel(ctx);
         self.settings_window(ctx);
+        self.show_aux_window(ctx);
+        self.handle_ptz_input(ctx);
+
+        let main_down = ctx.input(|i| i.pointer.primary_down());
+        if !main_down && !self.aux_pointer_down {
+            self.cross_drag = None;
+        }
 
         if let Err(err) = self.views.save_if_dirty() {
             warn!("failed to save views: {err:#}");

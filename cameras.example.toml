@@ -6,9 +6,12 @@ url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
 
 # --- OR discover / stream via Hikvision NVR ---
 # [nvr]
+# enabled = false   # keep credentials but use [[cameras]] URLs only
 # host = "198.51.100.20"
 # http_port = 49000
 # rtsp_port = 49002   # remapped RTSP; default device port is 554
+# https_port = 49003  # remapped HTTPS; default 443
+# server_port = 49001 # Hikvision SDK (“Server Port”); default 8000
 # username = "admin"
 # password = "changeme"
 # stream = "sub"   # main | sub | third  (default: sub)
@@ -41,3 +44,10 @@ app_name = "Citadel CCTV"
 default_layout = "3x3"
 default_fit = "contain"  # contain | cover | fill
 pause_when_unfocused = true
+
+# Hikvision Access Control (toolbar Gates / DualShock L1, then confirm).
+# [gate]
+# host = "192.0.2.80"
+# http_port = 80
+# username = "admin"
+# password = "changeme"

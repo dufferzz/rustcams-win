@@ -2,7 +2,7 @@
 
 How Citadel CCTV (rustcams) takes an RTSP camera from config to pixels on screen.
 
-Video is **RTSP only**. HTTP is used for Hikvision NVR discovery (ISAPI) and PTZ, not for media. The UI is **eframe/egui + glow (OpenGL)** — frames are CPU RGBA uploaded as egui textures, not shared GPU surfaces with the decoder.
+Video is **RTSP only**. HTTP is used for Hikvision NVR discovery (ISAPI), PTZ, and optional gate/door open (`PUT /ISAPI/AccessControl/RemoteControl/door/{id}`), not for media. The UI is **eframe/egui + glow (OpenGL)** — frames are CPU RGBA uploaded as egui textures, not shared GPU surfaces with the decoder.
 
 ---
 
@@ -49,7 +49,7 @@ On startup (`main.rs` → `ViewerApp::new` → `StreamManager::new`):
 
 See `gst_env.rs`.
 
-**Default decode path is software (`avdec_h264` / `avdec_h265`).** DXVA/`d3d11h264dec` caused ~300–900 ms emit gaps around GOP boundaries on this workload; libav is smoother. Set `RUSTCAMS_DECODE=hw` to force hardware again.
+**Default decode path is software (`avdec_h264` / `avdec_h265`).** DXVA/`d3d11h264dec` caused ~300–900 ms emit gaps around GOP boundaries on this workload; libav is smoother. Set `RUSTCAMS_DECODE=hw` to force hardware (D3D11/MF/NV, or V4L2 on Linux/Pi).
 
 ---
 
@@ -65,7 +65,7 @@ Each `[[cameras]]` entry supplies `url = "rtsp://..."`. Resolve produces a `Came
 - `direct_url` — often a rewrite toward the camera’s main stream (used in fullscreen when set)
 - optional `protocols` (`udp` / `tcp` / `udp+tcp`)
 
-### Hikvision NVR mode (`[nvr]` present)
+### Hikvision NVR mode (`[nvr]` present and `enabled = true`)
 
 1. HTTP digest `GET` to  
    `http://{host}:{http_port}/ISAPI/ContentMgmt/InputProxy/channels`
@@ -79,7 +79,7 @@ Each `[[cameras]]` entry supplies `url = "rtsp://..."`. Resolve produces a `Came
    Stream digits: `1` = main, `2` = sub, `3` = third (`nvr::build_rtsp_url`).
 
 4. Fullscreen may switch to `direct_url` (camera LAN main stream) when available.
-5. PTZ prefers camera `http://{cam}:80/ISAPI/PTZCtrl/…`, then NVR `PTZCtrlProxy` / `PTZCtrl` with the InputProxy channel id.
+5. PTZ prefers camera `http://{cam}:80/ISAPI/PTZCtrl/…`, then NVR `PTZCtrlProxy` / `PTZCtrl` / `ContentMgmt/PTZCtrl` with the InputProxy channel id. Manual focus is `PUT /ISAPI/System/Video/inputs/channels/{ch}/focus` (`FocusData`), not the continuous PTZ XML.
 
 ### Stream digit rewriting
 
@@ -128,7 +128,7 @@ Built in `ViewerApp::desired_streams()` (`app/mod.rs`):
 | 5×5 | 352 @ 15 | **Sub only** |
 | 6×6 | 288 @ 15 | **Sub only** |
 
-Dense-grid widths are sized so on-screen OSD (date/time) stays readable while keeping substreams.
+These are the **defaults**. Settings → **Grid decode width** (saved in `ui.toml`) overrides `max_width` per layout.
 
 Fullscreen prefers `direct_url` with protocols cleared (UDP default unless `protocols` is set). Grid uses the NVR/grid URL and configured protocols.
 
@@ -151,7 +151,7 @@ Built in `start_pipeline` (`stream.rs`). One pipeline per active camera.
       → h264parse / h265parse
       → decoder
            default: avdec_h264 / avdec_h265
-           RUSTCAMS_DECODE=hw: d3d11h264dec / … (MF / NV fallbacks)
+           RUSTCAMS_DECODE=hw: d3d11h264dec / … (MF / NV / V4L2 fallbacks)
       │
       ├── HW + D3D11 plugins: d3d11convert → d3d11scale → caps(RGBA) → d3d11download
       └── else: direct link from decoder
@@ -185,9 +185,11 @@ Built in `start_pipeline` (`stream.rs`). One pipeline per active camera.
 | `RUSTCAMS_DECODE` | Behavior |
 |-------------------|----------|
 | unset / `sw` / `software` / `avdec` | Software (`avdec_*`) — **default** |
-| `hw` / `hardware` / `d3d11` | Prefer `d3d11h264dec` / `d3d11h265dec`, then MF/NV, else SW |
+| `hw` / `hardware` / `d3d11` | Prefer `d3d11h264dec` / `d3d11h265dec`, then MF/NV, then V4L2 (`v4l2sl*` / `v4l2h*`), else SW |
 
-When HW decode is used and `d3d11convert` / `d3d11scale` / `d3d11download` exist, frames go through GPU convert/scale to RGBA in `D3D11Memory`, then download into the leaky queue. On link failure, decoder links straight to the queue (CPU convert/scale).
+When HW decode is used and `d3d11convert` / `d3d11scale` / `d3d11download` exist, frames go through GPU convert/scale to RGBA in `D3D11Memory`, then download into the leaky queue. On link failure (or Linux V4L2), decoder links straight to the queue (CPU convert/scale).
+
+On a **Raspberry Pi 4**, build natively (`scripts/build-on-pi.sh` / `scripts/setup-pi-deps.sh`) and run `RUSTCAMS_DECODE=hw` so the explicit chain can pick VideoCore V4L2 decoders. The UI still needs host Mesa OpenGL/EGL; if the window fails to create, try an X11 session.
 
 `prefer_hardware_decoders` still ranks HW factories above SW for any path that uses ranks; the explicit graph ignores rank when `RUSTCAMS_DECODE` forces SW.
 
@@ -253,7 +255,7 @@ Cell placeholders: Connecting… / Reconnecting… / Error / Offline / Paused (`
 
 ### Stutter / perf logging
 
-While Debug is on (toolbar / `D` / `RUSTCAMS_DEBUG=1`), the overlay shows per-stream rates. Independently, the app appends a snapshot every ~2 s to **`stutter-stats.log`** next to the executable (e.g. `dist/rustcams/stutter-stats.log`):
+While Debug is on (Settings → Diagnostics / `RUSTCAMS_DEBUG=1`), the overlay shows per-stream rates. **Write stutter-stats.log** in Settings (off by default) appends a snapshot every ~2 s next to `cameras.toml`:
 
 - UI / texture FPS and upload cost
 - Per cam: `out` / `in` fps, stale, drops, **`gap_ms`** (worst emit spacing), `copy_us`, `dec=`
@@ -350,7 +352,7 @@ ViewerApp (UI thread)
 
 | Variable | Effect |
 |----------|--------|
-| `RUSTCAMS_DECODE` | `hw` = force D3D11/MF/NV; default / `sw` = libav |
+| `RUSTCAMS_DECODE` | `hw` = force D3D11/MF/NV/V4L2; default / `sw` = libav |
 | `RUSTCAMS_DEBUG` | Perf overlay on at start; periodic `perf *` logs |
 | `RUST_LOG`, `GST_DEBUG` | Module / GStreamer traces |
 | Bundled GStreamer | Exe-relative tree on Windows packages |

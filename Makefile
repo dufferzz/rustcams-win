@@ -2,11 +2,12 @@
 #
 #   make            # release build (Linux)
 #   make run        # cargo run --release
+#   make pi HOST=user@pi   # rsync + native build on Raspberry Pi 4
 #   make windows    # cross-build + portable dist/rustcams/
 #   make help
 
 .PHONY: help build release run check clippy clean \
-	windows windows-build windows-package windows-gst appimage
+	windows windows-build windows-package windows-gst appimage pi
 
 CARGO   ?= cargo
 TARGET_WIN := x86_64-pc-windows-gnu
@@ -25,7 +26,8 @@ help:
 	@echo "  check             cargo check"
 	@echo "  clippy            cargo clippy -- -D warnings"
 	@echo "  clean             cargo clean + remove dist/"
-	@echo "  appimage          Linux AppImage → dist/Citadel_CCTV-linux-x86_64.AppImage"
+	@echo "  appimage          Linux AppImage → dist/Citadel_CCTV-linux-<arch>.AppImage"
+	@echo "  pi HOST=user@pi   rsync + native --release on Raspberry Pi 4 (aarch64)"
 	@echo "  windows           Cross-build + package dist/rustcams/"
 	@echo "  windows-build     Cross-compile only (x86_64-pc-windows-gnu)"
 	@echo "  windows-package   Package existing Windows exe + GStreamer"
@@ -39,6 +41,13 @@ run:
 
 appimage:
 	./scripts/package-linux-appimage.sh
+
+# Raspberry Pi 4 (64-bit OS): rsync to ~/rustcams and cargo build --release.
+#   make pi HOST=user@pi
+#   make pi HOST=user@pi APPIMAGE=1
+pi:
+	@test -n "$(HOST)" || { echo "usage: make pi HOST=user@pi [APPIMAGE=1]"; exit 1; }
+	./scripts/build-on-pi.sh $(HOST) $(if $(APPIMAGE),--appimage,)
 
 check:
 	$(CARGO) check

@@ -194,6 +194,8 @@ struct Shared {
     tracking: Mutex<TrackingFetchState>,
     /// Working (host, ISAPI root) after the first successful PTZ call.
     route: Mutex<HashMap<String, (PtzTarget, String)>>,
+    /// Working `PUT …/focus` path after the first successful FocusData call.
+    focus_route: Mutex<HashMap<String, (PtzTarget, String)>>,
     route_logged: Mutex<HashSet<String>>,
     agent: Agent,
 }
@@ -220,6 +222,7 @@ impl PtzWorker {
             park: Mutex::new(ParkFetchState::default()),
             tracking: Mutex::new(TrackingFetchState::default()),
             route: Mutex::new(HashMap::new()),
+            focus_route: Mutex::new(HashMap::new()),
             route_logged: Mutex::new(HashSet::new()),
             agent,
         });
@@ -739,7 +742,7 @@ fn worker_loop(shared: Arc<Shared>) {
 
         if let Some(shot) = oneshot {
             if let Some((t, _)) = &desired {
-                let _ = continuous_put(&shared, t, PtzVector::STOP);
+                stop_axes(&shared, t);
                 last_sent = Some((t.clone(), PtzVector::STOP));
             }
             match shot {
@@ -773,13 +776,12 @@ fn worker_loop(shared: Arc<Shared>) {
 
         if let Some((prev, prev_vec)) = &last_sent {
             if prev != &target && !prev_vec.is_stop() {
-                let _ = continuous_put(&shared, prev, PtzVector::STOP);
+                stop_axes(&shared, prev);
             }
         }
 
-        if continuous_put(&shared, &target, vec).is_ok() {
-            last_sent = Some((target, vec));
-        }
+        send_vector(&shared, &target, vec, last_sent.as_ref().map(|(_, v)| *v));
+        last_sent = Some((target, vec));
 
         if shared.state.lock().gen != gen {
             continue;
@@ -889,16 +891,46 @@ fn digest_ptz(
     Err(err)
 }
 
+fn stop_axes(shared: &Shared, target: &PtzTarget) {
+    let _ = continuous_put(shared, target, PtzVector::STOP);
+    let _ = focus_put(shared, target, 0);
+}
+
+fn send_vector(shared: &Shared, target: &PtzTarget, vec: PtzVector, last: Option<PtzVector>) {
+    let move_changed = last.map(|v| (v.pan, v.tilt, v.zoom)) != Some((vec.pan, vec.tilt, vec.zoom));
+    let focus_changed = last.map(|v| v.focus) != Some(vec.focus);
+    if move_changed {
+        if let Err(err) = continuous_put(shared, target, vec) {
+            warn!(
+                host = %target.host,
+                channel = target.channel,
+                "PTZ continuous failed: {err:#}"
+            );
+        }
+    }
+    if focus_changed {
+        if let Err(err) = focus_put(shared, target, vec.focus) {
+            warn!(
+                host = %target.host,
+                channel = target.channel,
+                focus = vec.focus,
+                "PTZ focus failed: {err:#}"
+            );
+        }
+    }
+}
+
 fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow::Result<()> {
+    // Official ISAPI continuous PTZ is pan/tilt/zoom only. Focus is a separate
+    // `/System/Video/inputs/channels/{ch}/focus` FocusData PUT.
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <PTZData>\
            <pan>{}</pan>\
            <tilt>{}</tilt>\
            <zoom>{}</zoom>\
-           <focus>{}</focus>\
          </PTZData>",
-        vec.pan, vec.tilt, vec.zoom, vec.focus
+        vec.pan, vec.tilt, vec.zoom
     );
     digest_ptz(
         shared,
@@ -909,6 +941,128 @@ fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow
         "application/xml",
     )?;
     Ok(())
+}
+
+fn focus_body(speed: i32) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><FocusData><focus>{}</focus></FocusData>",
+        speed.clamp(-100, 100)
+    )
+}
+
+fn focus_candidates(target: &PtzTarget) -> Vec<(PtzTarget, String)> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for t in std::iter::once(target).chain(target.fallback.as_deref()) {
+        let mut channels = vec![t.channel];
+        if t.channel != 1 {
+            channels.push(1);
+        }
+        for ch in channels {
+            for tmpl in [
+                "/ISAPI/System/Video/inputs/channels/{ch}/focus",
+                "/ISAPI/Image/channels/{ch}/focus",
+            ] {
+                let path = tmpl.replace("{ch}", &ch.to_string());
+                if seen.insert((t.host.clone(), path.clone())) {
+                    out.push((t.clone(), path));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn focus_put(shared: &Shared, target: &PtzTarget, speed: i32) -> anyhow::Result<()> {
+    let body = focus_body(speed);
+    let key = route_key(target);
+    if let Some((t, path)) = shared.focus_route.lock().get(&key).cloned() {
+        match digest_request(
+            &shared.agent,
+            &shared.sessions,
+            "PUT",
+            &t,
+            &path,
+            Some(body.as_bytes()),
+            "application/xml",
+        ) {
+            Ok((_status, resp)) if isapi_status_error(&resp).is_none() => return Ok(()),
+            Ok((_status, resp)) => {
+                shared.focus_route.lock().remove(&key);
+                warn!(
+                    host = %t.host,
+                    path,
+                    "PTZ focus route rejected, trying alternatives: {}",
+                    isapi_status_error(&resp).unwrap_or_else(|| resp)
+                );
+            }
+            Err(err) => {
+                shared.focus_route.lock().remove(&key);
+                warn!(
+                    host = %t.host,
+                    path,
+                    "PTZ focus route failed, trying alternatives: {err:#}"
+                );
+            }
+        }
+    }
+
+    let mut last_err = None;
+    for (t, path) in focus_candidates(target) {
+        match digest_request(
+            &shared.agent,
+            &shared.sessions,
+            "PUT",
+            &t,
+            &path,
+            Some(body.as_bytes()),
+            "application/xml",
+        ) {
+            Ok((_status, resp)) if isapi_status_error(&resp).is_none() => {
+                if shared.route_logged.lock().insert(format!("focus|{key}")) {
+                    info!(host = %t.host, path, "PTZ focus route selected");
+                }
+                shared.focus_route.lock().insert(key, (t, path));
+                return Ok(());
+            }
+            Ok((_status, resp)) => {
+                last_err = Some(anyhow::anyhow!(
+                    "{path}: {}",
+                    isapi_status_error(&resp).unwrap_or_else(|| resp)
+                ));
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no ISAPI focus route")))
+}
+
+fn isapi_status_error(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("responsestatus") {
+        return None;
+    }
+    let code = xml_tag_text(&lower, "statuscode")
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1);
+    if code <= 1 {
+        return None;
+    }
+    let detail = xml_tag_text(&lower, "statusstring").unwrap_or_else(|| code.to_string());
+    Some(format!("ISAPI statusCode {code} ({detail})"))
+}
+
+fn xml_tag_text(xml_lower: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml_lower.find(&open)? + open.len();
+    let end = xml_lower[start..].find(&close)? + start;
+    let text = xml_lower[start..end].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 fn oneshot_put(shared: &Shared, target: &PtzTarget, suffix: &str) -> anyhow::Result<()> {
@@ -1454,6 +1608,36 @@ mod tests {
         assert_eq!(list[0].name, "Gate");
         assert_eq!(list[1].id, 10);
         assert_eq!(list[1].name, "Parking");
+    }
+
+    #[test]
+    fn focus_xml_uses_focusdata() {
+        let xml = focus_body(-25);
+        assert!(xml.contains("<FocusData>"));
+        assert!(xml.contains("<focus>-25</focus>"));
+        assert!(!xml.contains("PTZData"));
+    }
+
+    #[test]
+    fn isapi_ok_response_is_not_an_error() {
+        let xml = r#"<ResponseStatus>
+  <statusCode>1</statusCode>
+  <statusString>OK</statusString>
+</ResponseStatus>"#;
+        assert_eq!(isapi_status_error(xml), None);
+    }
+
+    #[test]
+    fn isapi_invalid_operation_is_an_error() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ResponseStatus>
+  <requestURL>/ISAPI/System/Video/inputs/channels/1/focus</requestURL>
+  <statusCode>4</statusCode>
+  <statusString>Invalid Operation</statusString>
+</ResponseStatus>"#;
+        let err = isapi_status_error(xml).unwrap();
+        assert!(err.contains("4"));
+        assert!(err.to_ascii_lowercase().contains("invalid operation"));
     }
 
     #[test]

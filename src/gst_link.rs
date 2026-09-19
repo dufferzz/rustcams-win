@@ -23,7 +23,7 @@ pub(crate) enum VideoCodec {
 }
 
 /// Prefer software decode (`avdec_*`). Default on for stutter A/B vs D3D11;
-/// set `RUSTCAMS_DECODE=hw` to force hardware again.
+/// set `RUSTCAMS_DECODE=hw` to force hardware (D3D11/MF/NV/V4L2).
 pub(crate) fn prefer_software_decode() -> bool {
     match std::env::var("RUSTCAMS_DECODE") {
         Ok(v) => {
@@ -100,9 +100,7 @@ pub(crate) fn link_explicit_video(
     let depay_sink = depay
         .static_pad("sink")
         .ok_or_else(|| anyhow!("depay sink pad"))?;
-    src_pad
-        .link(&depay_sink)
-        .context("link rtspsrc → depay")?;
+    src_pad.link(&depay_sink).context("link rtspsrc → depay")?;
 
     if used_hw && d3d11_postproc_available() {
         match link_d3d11_postproc(pipeline, &decoder, &queue_sink, max_width, max_height) {
@@ -140,7 +138,13 @@ fn build_h264_chain(force_sw: bool) -> Result<(gst::Element, gst::Element, gst::
         .context("create h264parse")?;
     let (decoder, hw) = make_decoder(
         force_sw,
-        &["d3d11h264dec", "mfh264dec", "nvh264dec"],
+        &[
+            "d3d11h264dec",
+            "mfh264dec",
+            "nvh264dec",
+            "v4l2slh264dec",
+            "v4l2h264dec",
+        ],
         "avdec_h264",
     )?;
     Ok((depay, parse, decoder, hw))
@@ -157,17 +161,19 @@ fn build_h265_chain(force_sw: bool) -> Result<(gst::Element, gst::Element, gst::
         .context("create h265parse")?;
     let (decoder, hw) = make_decoder(
         force_sw,
-        &["d3d11h265dec", "mfh265dec", "nvh265dec"],
+        &[
+            "d3d11h265dec",
+            "mfh265dec",
+            "nvh265dec",
+            "v4l2slh265dec",
+            "v4l2h265dec",
+        ],
         "avdec_h265",
     )?;
     Ok((depay, parse, decoder, hw))
 }
 
-fn make_decoder(
-    force_sw: bool,
-    hw_names: &[&str],
-    sw_name: &str,
-) -> Result<(gst::Element, bool)> {
+fn make_decoder(force_sw: bool, hw_names: &[&str], sw_name: &str) -> Result<(gst::Element, bool)> {
     if !force_sw {
         for name in hw_names {
             if let Ok(el) = gst::ElementFactory::make(name).name("dec").build() {
@@ -186,9 +192,7 @@ fn link_decoder_to_queue(decoder: &gst::Element, queue_sink: &gst::Pad) -> Resul
     let dec_src = decoder
         .static_pad("src")
         .ok_or_else(|| anyhow!("decoder src pad"))?;
-    dec_src
-        .link(queue_sink)
-        .context("link decoder → queue")?;
+    dec_src.link(queue_sink).context("link decoder → queue")?;
     Ok(())
 }
 

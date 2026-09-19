@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Build a portable Linux AppImage (GStreamer plugins + lib closure).
 #
-# Prefer Ubuntu 22.04 (Docker / GitHub Actions) so the glibc requirement
-# stays old enough for other distros. A Manjaro-built image may fail on Debian.
+# Prefer Ubuntu 22.04 (x86_64) so the glibc requirement stays old enough
+# for other distros. A Manjaro-built image may fail on Debian.
+# On Raspberry Pi 4, run this on the Pi (aarch64) with CARGO_PROFILE=release
+# (default on aarch64) — that AppImage matches Pi OS glibc, not Ubuntu x86_64.
 #
 # Usage (from repo root):
 #   ./scripts/package-linux-appimage.sh
 #   ./scripts/package-linux-appimage.sh --skip-build
+#   CARGO_PROFILE=release ./scripts/package-linux-appimage.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,16 +31,25 @@ for arg in "$@"; do
 done
 
 ARCH="$(uname -m)"
-if [[ "$ARCH" != "x86_64" ]]; then
-  echo "This script currently packages x86_64 only (got $ARCH)." >&2
-  exit 1
-fi
+case "$ARCH" in
+  x86_64|aarch64) ;;
+  *)
+    echo "AppImage packaging supports x86_64 and aarch64 only (got $ARCH)." >&2
+    exit 1
+    ;;
+esac
 
 OUT_DIR="$ROOT/dist"
 APPDIR="$OUT_DIR/Citadel_CCTV.AppDir"
 TOOLS="$ROOT/.deps"
-OUT_APPIMAGE="$OUT_DIR/Citadel_CCTV-linux-x86_64.AppImage"
-CARGO_PROFILE="${CARGO_PROFILE:-dist}"
+OUT_APPIMAGE="$OUT_DIR/Citadel_CCTV-linux-${ARCH}.AppImage"
+if [[ -z "${CARGO_PROFILE:-}" ]]; then
+  if [[ "$ARCH" == "aarch64" ]]; then
+    CARGO_PROFILE=release
+  else
+    CARGO_PROFILE=dist
+  fi
+fi
 BIN="$ROOT/target/$CARGO_PROFILE/rustcams"
 
 export APPIMAGE_EXTRACT_AND_RUN=1
@@ -76,11 +88,11 @@ fetch() {
   chmod +x "$dest"
 }
 
-LINUXDEPLOY="$TOOLS/linuxdeploy-x86_64.AppImage"
-PLUGIN_APPIMAGE="$TOOLS/linuxdeploy-plugin-appimage-x86_64.AppImage"
-fetch "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" \
+LINUXDEPLOY="$TOOLS/linuxdeploy-${ARCH}.AppImage"
+PLUGIN_APPIMAGE="$TOOLS/linuxdeploy-plugin-appimage-${ARCH}.AppImage"
+fetch "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${ARCH}.AppImage" \
   "$LINUXDEPLOY"
-fetch "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage" \
+fetch "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-${ARCH}.AppImage" \
   "$PLUGIN_APPIMAGE"
 
 run_linuxdeploy() {
@@ -142,6 +154,7 @@ OPTIONAL_PLUGINS=(
   libgstvideoscale.so
   libgstvideofilter.so
   libgstjpeg.so
+  libgstvideo4linux2.so
 )
 
 echo "GStreamer plugins: $PLUGINS_SRC"
@@ -271,7 +284,8 @@ if [[ -z "$FOUND" ]]; then
   # Plugin may name it after the desktop file in cwd.
   mapfile -t extra < <(find "$ROOT" "$OUT_DIR" -maxdepth 1 -name '*.AppImage' ! -name 'linuxdeploy*' 2>/dev/null | head -n 20)
   for f in "${extra[@]:-}"; do
-    if [[ -f "$f" && "$(basename "$f")" != "linuxdeploy-x86_64.AppImage" ]]; then
+    if [[ -f "$f" && "$(basename "$f")" != "linuxdeploy-${ARCH}.AppImage" \
+       && "$(basename "$f")" != "linuxdeploy-plugin-appimage-${ARCH}.AppImage" ]]; then
       FOUND="$f"
       break
     fi

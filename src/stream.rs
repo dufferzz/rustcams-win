@@ -221,8 +221,7 @@ impl StreamManager {
             if let Some(slot) = self.slots.get_mut(&req.id) {
                 let url_changed = slot.url != req.url;
                 let proto_changed = slot.protocols_override != req.protocols;
-                let res_changed =
-                    slot.max_width != req.max_width || slot.max_fps != req.max_fps;
+                let res_changed = slot.max_width != req.max_width || slot.max_fps != req.max_fps;
                 if url_changed || proto_changed || res_changed {
                     stop_slot_inner(slot);
                     slot.url = req.url.clone();
@@ -407,10 +406,7 @@ impl StreamManager {
             let drop_delta = slot.counters.drop_delta.load(Ordering::Relaxed);
             let drop_key = slot.counters.drop_key.load(Ordering::Relaxed);
             let drop_corrupt = slot.counters.drop_corrupt.load(Ordering::Relaxed);
-            let emit_gap_max_ms = slot
-                .counters
-                .emit_gap_max_ms
-                .swap(0, Ordering::Relaxed);
+            let emit_gap_max_ms = slot.counters.emit_gap_max_ms.swap(0, Ordering::Relaxed);
             let dt = now
                 .saturating_duration_since(slot.rate_window.at)
                 .as_secs_f32()
@@ -423,8 +419,7 @@ impl StreamManager {
             let d_drop_rate = drop_rate.saturating_sub(slot.rate_window.drop_rate) as f32;
             let d_drop_delta = drop_delta.saturating_sub(slot.rate_window.drop_delta) as f32;
             let d_drop_key = drop_key.saturating_sub(slot.rate_window.drop_key) as f32;
-            let d_drop_corrupt =
-                drop_corrupt.saturating_sub(slot.rate_window.drop_corrupt) as f32;
+            let d_drop_corrupt = drop_corrupt.saturating_sub(slot.rate_window.drop_corrupt) as f32;
             let d_frame_i = d_frames.max(1.0);
             slot.rate_window = SlotRateWindow {
                 frames,
@@ -561,7 +556,12 @@ fn short_error(text: &str) -> String {
         "Cannot connect to camera".into()
     } else {
         // Keep first line only
-        text.lines().next().unwrap_or(text).chars().take(120).collect()
+        text.lines()
+            .next()
+            .unwrap_or(text)
+            .chars()
+            .take(120)
+            .collect()
     }
 }
 
@@ -770,7 +770,7 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
     }
 
     // Explicit depay/parse/decode (no decodebin). Default SW via
-    // prefer_software_decode(); set RUSTCAMS_DECODE=hw for D3D11/MF/NV.
+    // prefer_software_decode(); set RUSTCAMS_DECODE=hw for D3D11/MF/NV/V4L2.
     let pipeline_weak = pipeline.downgrade();
     let queue_weak = queue.downgrade();
     let max_width_link = max_width;
@@ -785,9 +785,7 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
             }
         }
 
-        let caps = pad
-            .current_caps()
-            .unwrap_or_else(|| pad.query_caps(None));
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
         if caps.is_any() || pad.current_caps().is_none() {
             let pipeline_weak = pipeline_weak.clone();
             let queue_weak = queue_weak.clone();
@@ -857,14 +855,11 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
                     .map_err(|_| gst::FlowError::Error)?;
                 let t0 = Instant::now();
                 // Avoid an extra full-buffer copy before reading plane data.
-                let frame =
-                    gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-                        .map_err(|_| gst::FlowError::Error)?;
+                let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                    .map_err(|_| gst::FlowError::Error)?;
                 let width = frame.width();
                 let height = frame.height();
-                let src = frame
-                    .plane_data(0)
-                    .map_err(|_| gst::FlowError::Error)?;
+                let src = frame.plane_data(0).map_err(|_| gst::FlowError::Error)?;
                 let stride = frame.plane_stride()[0] as usize;
                 let row_bytes = (width as usize).saturating_mul(4);
                 let rgba = copy_rgba_plane(src, stride, row_bytes, height as usize)
@@ -966,4 +961,3 @@ fn copy_rgba_plane(src: &[u8], stride: usize, row_bytes: usize, height: usize) -
     }
     Some(rgba)
 }
-

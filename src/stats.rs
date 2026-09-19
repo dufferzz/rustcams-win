@@ -1,5 +1,5 @@
-use sysinfo::{Networks, Pid, ProcessesToUpdate, System};
 use std::time::{Duration, Instant};
+use sysinfo::{Networks, Pid, ProcessesToUpdate, System};
 
 pub struct SystemStats {
     sys: System,
@@ -52,7 +52,8 @@ impl SystemStats {
 
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        self.sys.refresh_processes(ProcessesToUpdate::Some(&[self.pid]), true);
+        self.sys
+            .refresh_processes(ProcessesToUpdate::Some(&[self.pid]), true);
         self.networks.refresh(true);
 
         self.cpu_pct = self.sys.global_cpu_usage();

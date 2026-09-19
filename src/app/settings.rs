@@ -1,13 +1,27 @@
+use super::icons;
 use super::ViewerApp;
+use crate::config::{AppConfig, NvrConfig, StreamType};
 use crate::layout::FitMode;
 use eframe::egui;
 use egui::{Color32, Stroke};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum SettingsTab {
+    #[default]
+    Nvr,
+    Gates,
+    Display,
+    Diagnostics,
+}
 
 /// Default selection / outline blue (`rgb(140, 200, 255)`).
 pub const DEFAULT_ACCENT: Color32 = Color32::from_rgb(140, 200, 255);
+pub const PANEL_BG: Color32 = Color32::from_rgb(14, 16, 20);
+pub const CANVAS_BG: Color32 = Color32::from_rgb(8, 9, 12);
+pub const STATUS_BG: Color32 = Color32::from_rgb(16, 18, 22);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiPrefs {
@@ -22,9 +36,34 @@ pub struct UiPrefs {
     /// Name of the last selected view; restored on launch if it still exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_view: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_aux_view: Option<String>,
     /// Contain / cover / fill. If omitted, `cameras.toml` `[viewer] default_fit` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit: Option<String>,
+    /// Append `stutter-stats.log` next to cameras.toml (~2s). Off by default.
+    #[serde(default)]
+    pub stutter_log_file: bool,
+    #[serde(default = "default_w1")]
+    pub decode_1: i32,
+    #[serde(default = "default_w1_hd")]
+    pub decode_1_hd: i32,
+    #[serde(default = "default_w2")]
+    pub decode_2: i32,
+    #[serde(default = "default_w2_hd")]
+    pub decode_2_hd: i32,
+    #[serde(default = "default_w2x2")]
+    pub decode_2x2: i32,
+    #[serde(default = "default_w2x2_hd")]
+    pub decode_2x2_hd: i32,
+    #[serde(default = "default_w3")]
+    pub decode_3x3: i32,
+    #[serde(default = "default_w4")]
+    pub decode_4x4: i32,
+    #[serde(default = "default_w5")]
+    pub decode_5x5: i32,
+    #[serde(default = "default_w6")]
+    pub decode_6x6: i32,
 }
 
 fn default_accent_hex() -> String {
@@ -39,6 +78,41 @@ fn default_outline_width() -> f32 {
     3.0
 }
 
+pub fn default_w1() -> i32 {
+    640
+}
+pub fn default_w1_hd() -> i32 {
+    1280
+}
+pub fn default_w2() -> i32 {
+    640
+}
+pub fn default_w2_hd() -> i32 {
+    960
+}
+pub fn default_w2x2() -> i32 {
+    640
+}
+pub fn default_w2x2_hd() -> i32 {
+    640
+}
+pub fn default_w3() -> i32 {
+    480
+}
+pub fn default_w4() -> i32 {
+    400
+}
+pub fn default_w5() -> i32 {
+    352
+}
+pub fn default_w6() -> i32 {
+    288
+}
+
+pub fn clamp_decode_width(w: i32) -> i32 {
+    w.clamp(160, 1920)
+}
+
 impl Default for UiPrefs {
     fn default() -> Self {
         Self {
@@ -47,7 +121,19 @@ impl Default for UiPrefs {
             camera_list_open: true,
             sidebar_open: true,
             last_view: None,
+            last_aux_view: None,
             fit: None,
+            stutter_log_file: false,
+            decode_1: default_w1(),
+            decode_1_hd: default_w1_hd(),
+            decode_2: default_w2(),
+            decode_2_hd: default_w2_hd(),
+            decode_2x2: default_w2x2(),
+            decode_2x2_hd: default_w2x2_hd(),
+            decode_3x3: default_w3(),
+            decode_4x4: default_w4(),
+            decode_5x5: default_w5(),
+            decode_6x6: default_w6(),
         }
     }
 }
@@ -114,25 +200,130 @@ impl ViewerApp {
         let accent = self.accent;
         let [r, g, b, _] = accent.to_array();
         let fill = Color32::from_rgba_unmultiplied(r, g, b, 70);
-        ctx.style_mut(|style| {
-            style.visuals.selection.bg_fill = fill;
-            style.visuals.selection.stroke = Stroke::new(1.0_f32, accent);
-            style.visuals.hyperlink_color = accent;
-            style.visuals.widgets.hovered.bg_stroke.color = accent;
-            style.visuals.widgets.active.bg_stroke.color = accent;
-        });
+        let mut v = egui::Visuals::dark();
+        v.dark_mode = true;
+        v.panel_fill = PANEL_BG;
+        v.window_fill = Color32::from_rgb(20, 22, 26);
+        v.extreme_bg_color = CANVAS_BG;
+        v.faint_bg_color = Color32::from_rgb(28, 30, 36);
+        v.widgets.noninteractive.bg_fill = Color32::from_rgb(20, 22, 26);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(32, 36, 42);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(42, 48, 56);
+        v.widgets.active.bg_fill = Color32::from_rgb(48, 54, 64);
+        v.widgets.open.bg_fill = Color32::from_rgb(32, 36, 42);
+        v.selection.bg_fill = fill;
+        v.selection.stroke = Stroke::new(1.0_f32, accent);
+        v.hyperlink_color = accent;
+        v.widgets.hovered.bg_stroke.color = accent;
+        v.widgets.active.bg_stroke.color = accent;
+        ctx.set_visuals(v);
     }
 
     pub(super) fn save_ui_prefs(&self) {
+        let aux_name = self.views.views.get(self.aux_view).map(|v| v.name.clone());
         UiPrefs {
             accent: color_to_hex(self.accent),
             outline_width: self.outline_width,
             camera_list_open: self.camera_list_open,
             sidebar_open: self.sidebar_open,
             last_view: Some(self.views.active_view().name.clone()),
+            last_aux_view: aux_name,
             fit: Some(self.fit.as_str().to_string()),
+            stutter_log_file: self.stutter_log_file,
+            decode_1: self.decode_1,
+            decode_1_hd: self.decode_1_hd,
+            decode_2: self.decode_2,
+            decode_2_hd: self.decode_2_hd,
+            decode_2x2: self.decode_2x2,
+            decode_2x2_hd: self.decode_2x2_hd,
+            decode_3x3: self.decode_3x3,
+            decode_4x4: self.decode_4x4,
+            decode_5x5: self.decode_5x5,
+            decode_6x6: self.decode_6x6,
         }
         .save(&self.ui_prefs_path);
+    }
+
+    fn apply_nvr_from_settings(&mut self) {
+        let mut nvr = self.nvr_draft.clone();
+        nvr.enabled = self.nvr_enabled;
+        if nvr.host.trim().is_empty() {
+            if self.nvr_enabled {
+                self.nvr_status = Some("NVR host is empty — not saved.".into());
+                return;
+            }
+            self.app_config.nvr = None;
+        } else {
+            let proto = self.nvr_protocols.trim();
+            nvr.protocols = if proto.is_empty() || proto == "default" {
+                None
+            } else {
+                Some(proto.to_string())
+            };
+            self.app_config.nvr = Some(nvr);
+        }
+        self.sync_gate_into_app_config();
+
+        if let Err(err) = self.app_config.save(&self.config_path) {
+            self.nvr_status = Some(format!("Failed to save cameras.toml: {err:#}"));
+            warn!("failed to save cameras.toml: {err:#}");
+            return;
+        }
+
+        match self.app_config.clone().resolve() {
+            Ok(resolved) => {
+                let n = resolved.cameras.len();
+                self.apply_resolved_cameras(resolved.cameras);
+                if self.cameras.is_empty() {
+                    self.config_warning = Some(if self.nvr_enabled {
+                        "NVR saved but no cameras resolved.".into()
+                    } else {
+                        "No cameras resolved — add [[cameras]] URLs or enable NVR.".into()
+                    });
+                } else {
+                    self.config_warning = None;
+                }
+                self.nvr_status = Some(format!("Saved. {n} camera(s) resolved."));
+                info!(
+                    cameras = n,
+                    nvr = self.nvr_enabled,
+                    "reloaded cameras after settings save"
+                );
+            }
+            Err(err) => {
+                self.nvr_status = Some(format!("Saved file, but resolve failed: {err:#}"));
+                warn!("resolve after NVR save failed: {err:#}");
+            }
+        }
+    }
+
+    fn sync_gate_into_app_config(&mut self) {
+        self.app_config.gate = if self.gate_draft.host.trim().is_empty() {
+            None
+        } else {
+            Some(self.gate_draft.clone())
+        };
+    }
+
+    fn apply_gate_from_settings(&mut self) {
+        if self.gate_draft.host.trim().is_empty() {
+            *self.gate_status.lock() = Some("Gate host is empty — not saved.".into());
+            return;
+        }
+        if self.gate_draft.username.trim().is_empty() {
+            *self.gate_status.lock() = Some("Gate username is empty — not saved.".into());
+            return;
+        }
+        self.gate_draft.door_id = "1".into();
+        self.gate_draft.action = "open".into();
+        self.sync_gate_into_app_config();
+        if let Err(err) = self.app_config.save(&self.config_path) {
+            *self.gate_status.lock() = Some(format!("Failed to save cameras.toml: {err:#}"));
+            warn!("failed to save cameras.toml: {err:#}");
+            return;
+        }
+        *self.gate_status.lock() = Some("Gate settings saved.".into());
+        info!(host = %self.gate_draft.host, "saved gate settings");
     }
 
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
@@ -141,28 +332,231 @@ impl ViewerApp {
         }
 
         let mut open = self.show_settings;
-        egui::Window::new("⚙ Settings")
+        let mut save_nvr = false;
+        let mut save_gate = false;
+        let mut save_ui = false;
+        egui::Window::new(icons::labeled(icons::GEAR, "Settings"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(320.0)
+            .resizable(true)
+            .default_width(440.0)
+            .default_height(520.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Nvr, "NVR");
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Gates, "Gates");
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Display, "Display");
+                    ui.selectable_value(
+                        &mut self.settings_tab,
+                        SettingsTab::Diagnostics,
+                        "Diagnostics",
+                    );
+                });
+                ui.separator();
+                ui.add_space(6.0);
+
+                match self.settings_tab {
+                    SettingsTab::Diagnostics => {
                 ui.heading("Diagnostics");
                 ui.add_space(4.0);
                 if ui
-                    .selectable_label(self.debug_overlay, "🐛  Perf overlay")
-                    .on_hover_text("Stream metrics (D). Also: RUSTCAMS_DEBUG=1")
+                    .selectable_label(self.debug_overlay, icons::labeled(icons::BUG, "Perf overlay"))
+                    .on_hover_text("Stream metrics. Also: RUSTCAMS_DEBUG=1")
                     .clicked()
                 {
                     self.debug_overlay = !self.debug_overlay;
                     info!(debug = self.debug_overlay, "debug overlay toggled");
                 }
                 if ui
-                    .selectable_label(self.show_log, "📋  Log console")
-                    .on_hover_text("In-app log (L) — replaces the hidden Windows console")
+                    .selectable_label(
+                        self.show_log,
+                        icons::labeled(icons::TERMINAL_WINDOW, "Log console"),
+                    )
+                    .on_hover_text("In-app log — replaces the hidden Windows console")
                     .clicked()
                 {
                     self.show_log = !self.show_log;
+                }
+                if ui
+                    .checkbox(&mut self.stutter_log_file, "Write stutter-stats.log")
+                    .on_hover_text(
+                        "Append hitch samples next to cameras.toml every ~2s. Off by default.",
+                    )
+                    .changed()
+                {
+                    save_ui = true;
+                }
+                    }
+                    SettingsTab::Nvr => {
+                ui.heading("NVR");
+                ui.label(
+                    egui::RichText::new(
+                        "Hikvision discovery + RTSP proxy. Uncheck Use NVR to keep credentials but stream from [[cameras]] URLs. Saved to cameras.toml.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.nvr_enabled, "Use NVR")
+                    .on_hover_text(
+                        "Off: do not discover/stream via the NVR. [nvr] stays in cameras.toml when a host is set.",
+                    );
+                ui.add_enabled_ui(self.nvr_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Host");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.nvr_draft.host)
+                                .desired_width(220.0)
+                                .hint_text("192.168.x.x"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("HTTP port");
+                        ui.add(egui::DragValue::new(&mut self.nvr_draft.http_port).range(1..=65535))
+                            .on_hover_text("NVR HTTP / ISAPI (this app). Default 80, often remapped e.g. 49000.");
+                        ui.label("RTSP port");
+                        ui.add(egui::DragValue::new(&mut self.nvr_draft.rtsp_port).range(1..=65535))
+                            .on_hover_text("NVR RTSP for grid streams. Default 554, often remapped e.g. 49002.");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("HTTPS port");
+                        ui.add(egui::DragValue::new(&mut self.nvr_draft.https_port).range(1..=65535))
+                            .on_hover_text("NVR HTTPS (mapped 443, e.g. 49003). Same ISAPI as HTTP.");
+                        ui.label("Server port");
+                        ui.add(egui::DragValue::new(&mut self.nvr_draft.server_port).range(1..=65535))
+                            .on_hover_text("Hikvision SDK port (mapped 8000, e.g. 49001). iVMS uses this; this app does not.");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("User");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.nvr_draft.username)
+                                .desired_width(120.0),
+                        );
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.nvr_draft.password)
+                                .password(true)
+                                .desired_width(140.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Stream");
+                        for (label, st) in [
+                            ("sub", StreamType::Sub),
+                            ("main", StreamType::Main),
+                            ("third", StreamType::Third),
+                        ] {
+                            if ui
+                                .selectable_label(self.nvr_draft.stream == st, label)
+                                .clicked()
+                            {
+                                self.nvr_draft.stream = st;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("RTSP");
+                        let current = if self.nvr_protocols.is_empty() {
+                            "default".to_string()
+                        } else {
+                            self.nvr_protocols.clone()
+                        };
+                        egui::ComboBox::from_id_salt("nvr_proto")
+                            .selected_text(&current)
+                            .show_ui(ui, |ui| {
+                                for p in ["default", "udp", "tcp", "udp+tcp"] {
+                                    if ui.selectable_label(current.as_str() == p, p).clicked() {
+                                        self.nvr_protocols = if p == "default" {
+                                            String::new()
+                                        } else {
+                                            p.to_string()
+                                        };
+                                    }
+                                }
+                            });
+                    });
+                });
+                if ui
+                    .button("Save NVR & rediscover")
+                    .on_hover_text("Write [nvr] to cameras.toml and reload the camera list")
+                    .clicked()
+                {
+                    save_nvr = true;
+                }
+                if let Some(msg) = &self.nvr_status {
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
+                    }
+                    SettingsTab::Gates => {
+                ui.heading("Gates");
+                ui.label(
+                    egui::RichText::new(
+                        "Hikvision Access Control. Toolbar Gates / DualShock Share, then confirm (Enter or ✕).",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Host");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.gate_draft.host)
+                            .desired_width(220.0)
+                            .hint_text("192.168.x.x"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("HTTP port");
+                    ui.add(
+                        egui::DragValue::new(&mut self.gate_draft.http_port).range(1..=65535),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("User");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.gate_draft.username)
+                            .desired_width(120.0),
+                    );
+                    ui.label("Password");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.gate_draft.password)
+                            .password(true)
+                            .desired_width(140.0),
+                    );
+                });
+                if ui
+                    .button("Save gate")
+                    .on_hover_text("Write [gate] to cameras.toml")
+                    .clicked()
+                {
+                    save_gate = true;
+                }
+                if let Some(msg) = self.gate_status_text() {
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
+                    }
+                    SettingsTab::Display => {
+                ui.heading("Grid decode width");
+                ui.label(
+                    egui::RichText::new(
+                        "Max pixels on the long edge after scale. Dense grids stay on substreams.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let mut wchg = false;
+                wchg |= decode_slider(ui, "1×1", &mut self.decode_1);
+                wchg |= decode_slider(ui, "1×1 HD", &mut self.decode_1_hd);
+                wchg |= decode_slider(ui, "2 stacked", &mut self.decode_2);
+                wchg |= decode_slider(ui, "2 stacked HD", &mut self.decode_2_hd);
+                wchg |= decode_slider(ui, "2×2", &mut self.decode_2x2);
+                wchg |= decode_slider(ui, "2×2 HD", &mut self.decode_2x2_hd);
+                wchg |= decode_slider(ui, "3×3", &mut self.decode_3x3);
+                wchg |= decode_slider(ui, "4×4", &mut self.decode_4x4);
+                wchg |= decode_slider(ui, "5×5", &mut self.decode_5x5);
+                wchg |= decode_slider(ui, "6×6", &mut self.decode_6x6);
+                if wchg {
+                    save_ui = true;
                 }
 
                 ui.add_space(12.0);
@@ -175,7 +569,7 @@ impl ViewerApp {
                     let mut rgb = [r, g, b];
                     if ui.color_edit_button_srgb(&mut rgb).changed() {
                         self.accent = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                        self.save_ui_prefs();
+                        save_ui = true;
                     }
                     ui.monospace(color_to_hex(self.accent));
                 });
@@ -199,7 +593,7 @@ impl ViewerApp {
                             .clicked()
                         {
                             self.fit = *mode;
-                            self.save_ui_prefs();
+                            save_ui = true;
                         }
                     }
                 });
@@ -219,15 +613,64 @@ impl ViewerApp {
                     .changed()
                 {
                     self.outline_width = self.outline_width.clamp(1.0, 16.0);
-                    self.save_ui_prefs();
+                    save_ui = true;
                 }
                 ui.add_space(6.0);
                 if ui.button("Reset appearance").clicked() {
                     self.accent = DEFAULT_ACCENT;
                     self.outline_width = default_outline_width();
-                    self.save_ui_prefs();
+                    self.decode_1 = default_w1();
+                    self.decode_1_hd = default_w1_hd();
+                    self.decode_2 = default_w2();
+                    self.decode_2_hd = default_w2_hd();
+                    self.decode_2x2 = default_w2x2();
+                    self.decode_2x2_hd = default_w2x2_hd();
+                    self.decode_3x3 = default_w3();
+                    self.decode_4x4 = default_w4();
+                    self.decode_5x5 = default_w5();
+                    self.decode_6x6 = default_w6();
+                    save_ui = true;
+                }
+                    }
                 }
             });
         self.show_settings = open;
+        if save_ui {
+            self.save_ui_prefs();
+        }
+        if save_nvr {
+            self.apply_nvr_from_settings();
+        }
+        if save_gate {
+            self.apply_gate_from_settings();
+        }
+    }
+}
+
+fn decode_slider(ui: &mut egui::Ui, label: &str, value: &mut i32) -> bool {
+    let mut v = *value as f32;
+    let resp = ui.add(
+        egui::Slider::new(&mut v, 160.0..=1920.0)
+            .text(label)
+            .suffix(" px")
+            .integer(),
+    );
+    if resp.changed() {
+        *value = clamp_decode_width(v as i32);
+        true
+    } else {
+        false
+    }
+}
+
+/// Seed NVR edit fields from loaded `cameras.toml`.
+pub fn nvr_edit_state(cfg: &AppConfig) -> (bool, NvrConfig, String) {
+    match &cfg.nvr {
+        Some(nvr) => (
+            nvr.enabled,
+            nvr.clone(),
+            nvr.protocols.clone().unwrap_or_default(),
+        ),
+        None => (false, NvrConfig::default(), String::new()),
     }
 }

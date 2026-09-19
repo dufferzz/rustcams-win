@@ -35,10 +35,37 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.1.3 \
+gh release create v0.2.0 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
+
+### Raspberry Pi 4 (64-bit)
+
+**64-bit Raspberry Pi OS Bookworm** (or Ubuntu aarch64). 32-bit Pi OS is not supported. Build **on the Pi** so glibc and GStreamer match the device.
+
+From this repo on your PC:
+
+```bash
+./scripts/build-on-pi.sh user@pi-hostname
+# or: make pi HOST=user@pi
+# optional AppImage on the Pi: ./scripts/build-on-pi.sh user@pi --appimage
+```
+
+That rsyncs the tree to `~/rustcams`, installs apt + rustup, and runs `cargo build --release` (not fat LTO). Run **`~/rustcams/target/release/rustcams`** with system GStreamer — not a Windows-style `dist/` folder.
+
+Logged in on the Pi:
+
+```bash
+./scripts/setup-pi-deps.sh
+cargo build --release
+./target/release/rustcams
+# VideoCore: RUSTCAMS_DECODE=hw ./target/release/rustcams
+```
+
+Optional AppImage on the Pi (`CARGO_PROFILE=release` is the aarch64 default): `./scripts/package-linux-appimage.sh` → `dist/Citadel_CCTV-linux-aarch64.AppImage`. That image is for Pi OS-generation glibc, not a substitute for the Ubuntu 22.04 x86_64 release.
+
+eframe uses OpenGL from the OS (Mesa). If the window fails to create, use an X11 session or a desktop with working GL/EGL; Wayland on Pi can be picky.
 
 ### Windows
 
@@ -130,7 +157,7 @@ licenses\gstreamer\
 
 GStreamer / codecs have LGPL/GPL obligations when redistributing — keep the copied license files with the package.
 
-**Decode (default = software):** rustcams uses an **explicit** pipeline (`rtph264depay` → `h264parse` → decoder), not `decodebin`. By default it selects **libav** (`avdec_h264` / `avdec_h265`), which measured smoother than DXVA on multi-cam grids (lower emit gaps around keyframes). Set `RUSTCAMS_DECODE=hw` to prefer Direct3D11/DXVA (`d3d11h264dec` / `d3d11h265dec`) with GPU scale/download when `gstd3d11.dll` is present. In **Debug** (`D` or `RUSTCAMS_DEBUG=1`), per-stream `dec=` shows the factory in use; `stutter-stats.log` next to the exe records `gap_ms` every ~2 s.
+**Decode (default = software):** rustcams uses an **explicit** pipeline (`rtph264depay` → `h264parse` → decoder), not `decodebin`. By default it selects **libav** (`avdec_h264` / `avdec_h265`), which measured smoother than DXVA on multi-cam grids (lower emit gaps around keyframes). Set `RUSTCAMS_DECODE=hw` to prefer Direct3D11/DXVA (`d3d11h264dec` / `d3d11h265dec`) with GPU scale/download when `gstd3d11.dll` is present, or **V4L2** (`v4l2slh264dec` / `v4l2h264dec` and H.265 equivalents) on Raspberry Pi / Linux. In **Debug** (Settings → Diagnostics, or `RUSTCAMS_DEBUG=1`), per-stream `dec=` shows the factory in use.
 
 ## Config
 
@@ -186,7 +213,9 @@ Omit `[nvr]`. Grid and fullscreen both use each camera’s `url`.
 
 ### Hikvision NVR mode
 
-Add an `[nvr]` block. On startup rustcams calls
+Add an `[nvr]` block (`enabled = true` by default). Uncheck **Use NVR** in Settings
+(or set `enabled = false`) to keep the host/password in `cameras.toml` but stream
+from `[[cameras]]` URLs only. On startup with NVR enabled, rustcams calls
 `GET /ISAPI/ContentMgmt/InputProxy/channels` (HTTP digest) and builds grid RTSP
 URLs through the NVR:
 
@@ -212,11 +241,11 @@ cargo run --release
 
 | Knob | Effect |
 |------|--------|
-| Toolbar **Debug** or `D` | On-screen per-stream fps, size, decoder, stale frames, RGBA copy cost, emit `gap_ms`; status-bar UI/tex rates |
+| Toolbar **Debug** | On-screen per-stream fps, size, decoder, stale frames, RGBA copy cost, emit `gap_ms`; status-bar UI/tex rates |
 | `RUSTCAMS_DEBUG=1` | Starts with Debug on; logs `perf summary` / `perf stream` / `perf ui` every 5s |
-| `RUSTCAMS_DECODE=hw` | Force hardware decode (D3D11/MF/NV); default is software `avdec_*` |
+| `RUSTCAMS_DECODE=hw` | Force hardware decode (D3D11/MF/NV, or V4L2 on Pi/Linux); default is software `avdec_*` |
 | `RUSTCAMS_DECODE=sw` | Explicit software decode (same as default) |
-| `stutter-stats.log` | Always written beside the exe (~2 s); use `gap_ms` / `dec=` to compare hitch |
+| Settings → **Write stutter-stats.log** | Optional hitch log next to `cameras.toml` (~2s). Off by default. |
 | `RUST_LOG=rustcams=debug` | Verbose module logs (links, stops, …) |
 | `GST_DEBUG=2` or `GST_DEBUG=rtsp*:3,videodecoder:3` | GStreamer-side RTSP/decode traces |
 
@@ -239,11 +268,14 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | Clear cell | Right-click, then confirm |
 | Fullscreen | Double-click / Cross(X) / `Esc` / right-click — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
 | Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` / right-click grid / Triangle toggles (after camera FS) |
-| Settings | ⚙ toolbar — fit, accent, outline width, perf overlay, log console |
-| Debug | Settings or `D` — perf overlay + stream decode metrics; status bar while open |
-| Log | Settings or `L` — in-app log console (Windows release builds hide the OS console) |
+| Settings | ⚙ toolbar — tabs for NVR, gates, display, diagnostics |
+| Open gates | Toolbar **Gates** or DualShock **Share**, then confirm (Enter / ✕ / OK). Any other controller button or Cancel aborts. |
+| Second window | 🖵 toolbar — auxiliary window for another monitor; click a cell to select (one camera / PTZ target at a time) |
+| Debug | Settings → Diagnostics — perf overlay + stream decode metrics; status bar while open |
+| Log | Settings → Diagnostics — in-app log console (Windows release builds hide the OS console) |
 | PTZ pan / tilt | Sidebar pad (including diagonals) or arrow keys (**selected camera**) |
 | PTZ zoom | Sidebar `−` / `+`, or `=` / `+` / PageUp in; `-` / PageDown out |
+| PTZ focus | Sidebar **F−** / **F+**, DualShock L1/R1, or `,` / `.` |
 | PTZ home | Sidebar `H` |
 | PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol; click to toggle |
 | PTZ tracking | Hidden for now (FieldDetection query slews some PTZs) |
@@ -267,7 +299,7 @@ grid panes cap size/fps by layout. Exit fullscreen returns to the NVR substream 
 - Prefer substreams (`stream = "sub"`, `/…02`) for grid viewing.
 - Dense grids (3×3+) always use substreams and a moderate decode width (e.g. 5×5 → 352 px) so OSD timestamps stay readable; **HD** (main stream) is only available on 1×1 / 2×2 and fullscreen.
 - Default RTSP transport is **UDP** (LAN-friendly) unless you set `protocols` in config. On failure, reconnects alternate to **TCP** when protocols are not pinned. Some Hikvision cams return SETUP **500** with TCP interleaved — pin `protocols = "udp"` in `cameras.toml` if needed.
-- Default video decode is **software** (`avdec_*`). Use `RUSTCAMS_DECODE=hw` only if you want DXVA and accept possible GOP hitch; compare with `stutter-stats.log` (`gap_ms`).
+- Default video decode is **software** (`avdec_*`). Use `RUSTCAMS_DECODE=hw` for DXVA (Windows) or V4L2 (Raspberry Pi); compare hitch with `stutter-stats.log` (`gap_ms`).
 - Opening many streams to one camera IP can hit its concurrent-session limit; use fewer slots or substreams only.
 - In NVR mode, concurrent viewers hit **one** NVR. Prefer substreams and fewer slots; the NVR’s own session limits still apply.
 

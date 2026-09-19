@@ -100,7 +100,11 @@ pub struct ViewStore {
 }
 
 impl ViewStore {
-    pub fn load_or_default(path: impl AsRef<Path>, camera_ids: &[String], default_layout: Layout) -> Self {
+    pub fn load_or_default(
+        path: impl AsRef<Path>,
+        camera_ids: &[String],
+        default_layout: Layout,
+    ) -> Self {
         let path = path.as_ref().to_path_buf();
         if let Ok(text) = fs::read_to_string(&path) {
             if let Ok(file) = toml::from_str::<ViewsFile>(&text) {
@@ -127,12 +131,30 @@ impl ViewStore {
         }
     }
 
+    pub fn clamp_index(&self, idx: usize) -> usize {
+        if self.views.is_empty() {
+            0
+        } else {
+            idx.min(self.views.len() - 1)
+        }
+    }
+
+    pub fn view(&self, idx: usize) -> &View {
+        &self.views[self.clamp_index(idx)]
+    }
+
+    pub fn view_mut(&mut self, idx: usize) -> &mut View {
+        let i = self.clamp_index(idx);
+        &mut self.views[i]
+    }
+
     pub fn active_view(&self) -> &View {
-        &self.views[self.active]
+        self.view(self.active)
     }
 
     pub fn active_view_mut(&mut self) -> &mut View {
-        &mut self.views[self.active]
+        let i = self.active;
+        self.view_mut(i)
     }
 
     pub fn mark_dirty(&mut self) {
@@ -155,8 +177,7 @@ impl ViewStore {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::write(&self.path, text)
-            .with_context(|| format!("write {}", self.path.display()))?;
+        fs::write(&self.path, text).with_context(|| format!("write {}", self.path.display()))?;
         self.dirty = false;
         Ok(())
     }

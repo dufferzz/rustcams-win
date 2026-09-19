@@ -1,3 +1,4 @@
+use super::icons;
 use super::{DragPayload, SidebarControls, ViewerApp};
 use crate::config::CameraConfig;
 use crate::layout::{FitMode, Layout};
@@ -12,15 +13,21 @@ use egui::{Color32, Id, Rect, Sense, Vec2};
 use std::time::Instant;
 use tracing::info;
 
+use super::settings::{CANVAS_BG, PANEL_BG};
+
 impl ViewerApp {
-    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
         ui.horizontal(|ui| {
-            ui.heading(&self.app_name);
+            if is_aux {
+                ui.heading("Screen 2");
+            } else {
+                ui.heading(&self.app_name);
+            }
             ui.separator();
 
             let view_names: Vec<String> = self.views.views.iter().map(|v| v.name.clone()).collect();
-            let mut active = self.views.active;
-            egui::ComboBox::from_id_salt("view_select")
+            let mut active = view_idx;
+            egui::ComboBox::from_id_salt(("view_select", is_aux))
                 .selected_text(
                     view_names
                         .get(active)
@@ -34,58 +41,75 @@ impl ViewerApp {
                         }
                     }
                 });
-            if active != self.views.active {
-                self.views.active = active;
-                self.exit_fullscreen();
+            if active != view_idx {
+                if is_aux {
+                    self.aux_view = active;
+                    self.aux_fullscreen_slot = None;
+                } else {
+                    self.views.active = active;
+                    self.exit_fullscreen();
+                }
                 self.persist_views();
             }
 
             if ui
-                .small_button("➕")
+                .small_button(icons::PLUS)
                 .on_hover_text("New view")
                 .clicked()
             {
                 let name = format!("View {}", self.views.views.len() + 1);
-                let layout = self.active_layout();
+                let layout = self.views.view(view_idx).layout;
                 self.views.views.push(View::new(name, layout));
-                self.views.active = self.views.views.len() - 1;
-                self.exit_fullscreen();
+                let idx = self.views.views.len() - 1;
+                if is_aux {
+                    self.aux_view = idx;
+                    self.aux_fullscreen_slot = None;
+                } else {
+                    self.views.active = idx;
+                    self.exit_fullscreen();
+                }
                 self.persist_views();
             }
 
-            if ui
-                .small_button("✎")
-                .on_hover_text("Rename view")
-                .clicked()
-            {
-                self.rename_buffer = self.views.active_view().name.clone();
-                self.show_rename = true;
+            if !is_aux {
+                if ui
+                    .small_button(icons::PENCIL_SIMPLE)
+                    .on_hover_text("Rename view")
+                    .clicked()
+                {
+                    self.rename_buffer = self.views.active_view().name.clone();
+                    self.show_rename = true;
+                }
             }
 
             let can_delete = self.views.views.len() > 1;
             if ui
-                .add_enabled(can_delete, egui::Button::new("🗑").small())
+                .add_enabled(can_delete, egui::Button::new(icons::TRASH).small())
                 .on_hover_text("Delete view")
                 .clicked()
             {
-                let idx = self.views.active;
+                let idx = view_idx;
                 self.views.views.remove(idx);
                 if self.views.active >= self.views.views.len() {
                     self.views.active = self.views.views.len() - 1;
                 }
+                self.clamp_aux_view();
                 self.exit_fullscreen();
+                self.aux_fullscreen_slot = None;
                 self.persist_views();
             }
 
             ui.separator();
 
-            let current_layout = self.active_layout();
+            let current_layout = self.views.view(view_idx).layout;
+            let no_cam_fs = if is_aux {
+                self.aux_fullscreen_slot.is_none()
+            } else {
+                self.fullscreen_slot.is_none()
+            };
             for layout in Layout::all() {
                 if ui
-                    .selectable_label(
-                        current_layout == *layout && self.fullscreen_slot.is_none(),
-                        layout.label(),
-                    )
+                    .selectable_label(current_layout == *layout && no_cam_fs, layout.label())
                     .on_hover_text(match layout {
                         Layout::One => "Single camera",
                         Layout::Two => "Two cameras stacked (vertical split)",
@@ -97,7 +121,7 @@ impl ViewerApp {
                     })
                     .clicked()
                 {
-                    self.set_layout(*layout);
+                    self.set_layout_at(view_idx, *layout);
                 }
             }
 
@@ -106,7 +130,10 @@ impl ViewerApp {
             let hd_response = ui
                 .add_enabled(
                     hd_allowed,
-                    egui::SelectableLabel::new(self.hd && hd_allowed, "HD"),
+                    egui::SelectableLabel::new(
+                        self.hd && hd_allowed,
+                        icons::labeled(icons::MONITOR_PLAY, "HD"),
+                    ),
                 )
                 .on_hover_text(if self.fullscreen_slot.is_some() {
                     "HD: main stream at higher decode width. Off: sub stream. Available in fullscreen."
@@ -121,28 +148,91 @@ impl ViewerApp {
             }
 
             ui.separator();
+            let gate_ready = self.gate_draft.is_configured();
+            let gate_busy = self.gate_busy();
+            let gate_tip = if !gate_ready {
+                "Set host, user, and password in Settings → Gates. DualShock Share also opens."
+                    .to_string()
+            } else if let Some(msg) = self.gate_status_text() {
+                format!("{msg} · Share · confirm with Enter or ✕")
+            } else {
+                "Open gates (confirms first). DualShock Share, then Enter or ✕.".to_string()
+            };
             if ui
-                .selectable_label(self.window_fullscreen, "⛶")
-                .on_hover_text("OS / monitor fullscreen (Esc / right-click grid / Triangle to toggle)")
+                .add_enabled(
+                    gate_ready && !gate_busy && !self.pending_gate_confirm,
+                    egui::Button::new(if gate_busy {
+                        "Opening…".to_string()
+                    } else {
+                        icons::labeled(icons::DOOR_OPEN, "Gates")
+                    }),
+                )
+                .on_hover_text(gate_tip)
                 .clicked()
             {
-                let on = !self.window_fullscreen;
-                self.set_window_fullscreen(ui.ctx(), on);
+                self.prompt_open_gates();
             }
 
-            if self.fullscreen_slot.is_some() {
+            ui.separator();
+            if !is_aux {
+                if ui
+                    .selectable_label(self.window_fullscreen, icons::CORNERS_OUT)
+                    .on_hover_text("OS / monitor fullscreen (Esc / right-click grid / Triangle to toggle)")
+                    .clicked()
+                {
+                    let on = !self.window_fullscreen;
+                    self.set_window_fullscreen(ui.ctx(), on);
+                }
+                if ui
+                    .selectable_label(self.aux_open, icons::MONITOR)
+                    .on_hover_text("Open a second window for another monitor (shared PTZ selection)")
+                    .clicked()
+                {
+                    self.aux_open = !self.aux_open;
+                    if self.aux_open {
+                        self.ensure_distinct_aux_view();
+                    }
+                }
+            } else {
+                if ui
+                    .selectable_label(self.aux_window_fullscreen, icons::CORNERS_OUT)
+                    .on_hover_text("OS / monitor fullscreen for this window (Esc to toggle)")
+                    .clicked()
+                {
+                    let on = !self.aux_window_fullscreen;
+                    self.aux_window_fullscreen = on;
+                }
+                if ui
+                    .button(icons::X)
+                    .on_hover_text("Close second window")
+                    .clicked()
+                {
+                    self.aux_open = false;
+                }
+            }
+
+            let fs_slot = if is_aux {
+                self.aux_fullscreen_slot
+            } else {
+                self.fullscreen_slot
+            };
+            if fs_slot.is_some() {
                 ui.separator();
                 if ui
-                    .button("↩")
+                    .button(icons::ARROW_U_UP_LEFT)
                     .on_hover_text("Exit camera fullscreen")
                     .clicked()
                 {
-                    self.exit_fullscreen();
+                    if is_aux {
+                        self.exit_aux_fullscreen();
+                    } else {
+                        self.exit_fullscreen();
+                    }
                 }
-                if let Some(slot) = self.fullscreen_slot {
+                if let Some(slot) = fs_slot {
                     let label = self
                         .views
-                        .active_view()
+                        .view(view_idx)
                         .slots
                         .get(slot)
                         .and_then(|s| s.as_ref())
@@ -159,18 +249,23 @@ impl ViewerApp {
                 }
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("⚙")
-                    .on_hover_text("Settings — accent color, perf overlay, log")
-                    .clicked()
-                {
-                    self.show_settings = !self.show_settings;
-                }
-                if self.paused {
-                    ui.colored_label(Color32::from_rgb(255, 180, 80), "⏸ Paused (background)");
-                }
-            });
+            if !is_aux {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(icons::GEAR)
+                        .on_hover_text("Settings — NVR, gates, decode width, log file, accent")
+                        .clicked()
+                    {
+                        self.show_settings = !self.show_settings;
+                    }
+                    if self.paused {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 80),
+                            icons::labeled(icons::PAUSE, "Paused (background)"),
+                        );
+                    }
+                });
+            }
         });
 
         if self.show_rename {
@@ -197,95 +292,99 @@ impl ViewerApp {
         }
     }
 
-    pub(super) fn camera_sidebar(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn camera_sidebar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
         let mut list_open = self.camera_list_open;
-        let cam_header = egui::CollapsingHeader::new("📷 Cameras")
-            .id_salt("camera_library_header")
-            .open(Some(list_open))
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.sidebar_filter)
-                        .hint_text("Filter…")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(4.0);
+        let cam_header =
+            egui::CollapsingHeader::new(icons::labeled(icons::VIDEO_CAMERA, "Cameras"))
+                .id_salt(("camera_library_header", is_aux))
+                .open(Some(list_open))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.sidebar_filter)
+                            .hint_text("Filter…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(4.0);
 
-                let filter = self.sidebar_filter.to_ascii_lowercase();
-                let active_ids = self.view_camera_ids();
-                let selected_ptz = self.sidebar_ptz_cam.clone();
-                let cameras: Vec<(String, String, bool, bool)> = self
-                    .cameras
-                    .iter()
-                    .filter(|c| {
-                        filter.is_empty()
-                            || c.name.to_ascii_lowercase().contains(&filter)
-                            || c.id.to_ascii_lowercase().contains(&filter)
-                    })
-                    .map(|c| {
-                        (
-                            c.id.clone(),
-                            c.name.clone(),
-                            active_ids.contains(&c.id),
-                            c.ptz.is_some(),
-                        )
-                    })
-                    .collect();
+                    let filter = self.sidebar_filter.to_ascii_lowercase();
+                    let active_ids = self.view_camera_ids_at(view_idx);
+                    let selected_ptz = self.sidebar_ptz_cam.clone();
+                    let cameras: Vec<(String, String, bool, bool)> = self
+                        .cameras
+                        .iter()
+                        .filter(|c| {
+                            filter.is_empty()
+                                || c.name.to_ascii_lowercase().contains(&filter)
+                                || c.id.to_ascii_lowercase().contains(&filter)
+                        })
+                        .map(|c| {
+                            (
+                                c.id.clone(),
+                                c.name.clone(),
+                                active_ids.contains(&c.id),
+                                c.ptz.is_some(),
+                            )
+                        })
+                        .collect();
 
-                let available = ui.available_height();
-                let list_h = (available * 0.55).clamp(80.0, available.max(80.0));
+                    let available = ui.available_height();
+                    let list_h = (available * 0.55).clamp(80.0, available.max(80.0));
 
-                egui::ScrollArea::vertical()
-                    .id_salt("camera_library")
-                    .max_height(list_h)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (id, name, on_view, has_ptz) in cameras {
-                            let item_id = Id::new("lib_cam").with(&id);
-                            let payload = DragPayload::FromLibrary(id.clone());
-                            let is_ptz_sel = selected_ptz.as_deref() == Some(id.as_str());
-                            let accent = self.accent;
-                            let response = ui.dnd_drag_source(item_id, payload, |ui| {
-                                let mark = if on_view { "▶" } else { "■" };
-                                let label = if has_ptz {
-                                    format!("{mark}  {name}  ⌖")
-                                } else {
-                                    format!("{mark}  {name}")
-                                };
-                                let color = if is_ptz_sel {
-                                    selection_border(has_ptz)
-                                } else if on_view {
-                                    super::settings::mix_rgb(
-                                        accent,
-                                        Color32::from_rgb(200, 210, 220),
-                                        0.35,
+                    egui::ScrollArea::vertical()
+                        .id_salt(("camera_library", is_aux))
+                        .max_height(list_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (id, name, on_view, has_ptz) in cameras {
+                                let item_id = Id::new(("lib_cam", is_aux)).with(&id);
+                                let payload = DragPayload::FromLibrary(id.clone());
+                                let is_ptz_sel = selected_ptz.as_deref() == Some(id.as_str());
+                                let accent = self.accent;
+                                let response = ui.dnd_drag_source(item_id, payload.clone(), |ui| {
+                                    let mark = if on_view { icons::PLAY } else { icons::SQUARE };
+                                    let label = if has_ptz {
+                                        format!("{mark}  {name}  {}", icons::CROSSHAIR)
+                                    } else {
+                                        format!("{mark}  {name}")
+                                    };
+                                    let color = if is_ptz_sel {
+                                        selection_border(has_ptz)
+                                    } else if on_view {
+                                        super::settings::mix_rgb(
+                                            accent,
+                                            Color32::from_rgb(200, 210, 220),
+                                            0.35,
+                                        )
+                                    } else {
+                                        Color32::from_rgb(210, 210, 210)
+                                    };
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(label).color(color))
+                                            .sense(Sense::click_and_drag()),
                                     )
+                                });
+                                let can_replace = selected_ptz
+                                    .as_ref()
+                                    .is_some_and(|id| active_ids.contains(id));
+                                let hover = if can_replace {
+                                    "Click to replace the selected camera"
+                                } else if has_ptz {
+                                    "Drag onto a grid cell · click to select for PTZ"
                                 } else {
-                                    Color32::from_rgb(210, 210, 210)
+                                    "Drag onto a grid cell · click to select"
                                 };
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(label).color(color))
-                                        .sense(Sense::click_and_drag()),
-                                )
-                            });
-                            let can_replace = selected_ptz
-                                .as_ref()
-                                .is_some_and(|id| active_ids.contains(id));
-                            let hover = if can_replace {
-                                "Click to replace the selected camera"
-                            } else if has_ptz {
-                                "Drag onto a grid cell · click to select for PTZ"
-                            } else {
-                                "Drag onto a grid cell · click to select"
-                            };
-                            let clicked = response.inner.clicked();
-                            response.inner.on_hover_text(hover);
-                            if clicked {
-                                self.place_library_camera(&id);
+                                let clicked = response.inner.clicked();
+                                if response.inner.drag_started() {
+                                    self.cross_drag = Some(payload);
+                                }
+                                response.inner.on_hover_text(hover);
+                                if clicked {
+                                    self.place_library_camera(&id, view_idx);
+                                }
+                                ui.add_space(2.0);
                             }
-                            ui.add_space(2.0);
-                        }
-                    });
-            });
+                        });
+                });
         if cam_header.header_response.clicked() {
             list_open = !list_open;
         }
@@ -303,19 +402,13 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if ui
-                .selectable_label(
-                    self.sidebar_controls == SidebarControls::Ptz,
-                    "PTZ",
-                )
+                .selectable_label(self.sidebar_controls == SidebarControls::Ptz, "PTZ")
                 .clicked()
             {
                 self.sidebar_controls = SidebarControls::Ptz;
             }
             if ui
-                .selectable_label(
-                    self.sidebar_controls == SidebarControls::Presets,
-                    "Presets",
-                )
+                .selectable_label(self.sidebar_controls == SidebarControls::Presets, "Presets")
                 .clicked()
             {
                 self.sidebar_controls = SidebarControls::Presets;
@@ -374,6 +467,7 @@ impl ViewerApp {
         let mut pan = 0i32;
         let mut tilt = 0i32;
         let mut zoom = 0i32;
+        let mut focus = 0i32;
         let mut home = false;
 
         let gap = 4.0;
@@ -406,55 +500,54 @@ impl ViewerApp {
                 .max_col_width(cell)
                 .spacing([gap, gap])
                 .show(ui, |ui| {
-                    if hold(ui, "↖") {
+                    if hold(ui, icons::ARROW_UP_LEFT) {
                         pan = -PTZ_MOVE_SPEED;
                         tilt = PTZ_MOVE_SPEED;
                     }
-                    if hold(ui, "^") {
+                    if hold(ui, icons::ARROW_UP) {
                         tilt = PTZ_MOVE_SPEED;
                     }
-                    if hold(ui, "↗") {
+                    if hold(ui, icons::ARROW_UP_RIGHT) {
                         pan = PTZ_MOVE_SPEED;
                         tilt = PTZ_MOVE_SPEED;
                     }
                     ui.end_row();
 
-                    if hold(ui, "<") {
+                    if hold(ui, icons::ARROW_LEFT) {
                         pan = -PTZ_MOVE_SPEED;
                     }
                     if ui
                         .add_sized(
                             [cell, cell],
-                            egui::Button::new(egui::RichText::new("H").size(font)),
+                            egui::Button::new(egui::RichText::new(icons::HOUSE).size(font)),
                         )
                         .on_hover_text("Home")
                         .clicked()
                     {
                         home = true;
                     }
-                    if hold(ui, ">") {
+                    if hold(ui, icons::ARROW_RIGHT) {
                         pan = PTZ_MOVE_SPEED;
                     }
                     ui.end_row();
 
-                    if hold(ui, "↙") {
+                    if hold(ui, icons::ARROW_DOWN_LEFT) {
                         pan = -PTZ_MOVE_SPEED;
                         tilt = -PTZ_MOVE_SPEED;
                     }
-                    if hold(ui, "v") {
+                    if hold(ui, icons::ARROW_DOWN) {
                         tilt = -PTZ_MOVE_SPEED;
                     }
-                    if hold(ui, "↘") {
+                    if hold(ui, icons::ARROW_DOWN_RIGHT) {
                         pan = PTZ_MOVE_SPEED;
                         tilt = -PTZ_MOVE_SPEED;
                     }
                     ui.end_row();
 
-                    if hold(ui, "-") {
+                    if hold(ui, icons::MAGNIFYING_GLASS_MINUS) {
                         zoom = -PTZ_ZOOM_SPEED;
                     }
-                    let (zoom_rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(cell), Sense::hover());
+                    let (zoom_rect, _) = ui.allocate_exact_size(Vec2::splat(cell), Sense::hover());
                     ui.painter().text(
                         zoom_rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -462,8 +555,24 @@ impl ViewerApp {
                         egui::FontId::proportional(11.0),
                         Color32::from_rgb(150, 150, 150),
                     );
-                    if hold(ui, "+") {
+                    if hold(ui, icons::MAGNIFYING_GLASS_PLUS) {
                         zoom = PTZ_ZOOM_SPEED;
+                    }
+                    ui.end_row();
+
+                    if hold(ui, "F−") {
+                        focus = -PTZ_ZOOM_SPEED;
+                    }
+                    let (focus_rect, _) = ui.allocate_exact_size(Vec2::splat(cell), Sense::hover());
+                    ui.painter().text(
+                        focus_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Focus",
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(150, 150, 150),
+                    );
+                    if hold(ui, "F+") {
+                        focus = PTZ_ZOOM_SPEED;
                     }
                     ui.end_row();
                 });
@@ -480,7 +589,7 @@ impl ViewerApp {
             pan,
             tilt,
             zoom,
-            focus: 0,
+            focus,
         };
         let pad_id = ui.id().with("ptz_pad_hold");
         let was_holding = ui
@@ -508,7 +617,7 @@ impl ViewerApp {
 
         ui.horizontal(|ui| {
             if ui
-                .small_button("↻")
+                .small_button(icons::ARROW_CLOCKWISE)
                 .on_hover_text("Refresh park action from camera")
                 .clicked()
             {
@@ -588,7 +697,7 @@ impl ViewerApp {
 
         ui.horizontal(|ui| {
             if ui
-                .small_button("↻")
+                .small_button(icons::ARROW_CLOCKWISE)
                 .on_hover_text("Refresh intrusion detection from camera")
                 .clicked()
             {
@@ -668,7 +777,7 @@ impl ViewerApp {
 
         ui.horizontal(|ui| {
             if ui
-                .small_button("↻")
+                .small_button(icons::ARROW_CLOCKWISE)
                 .on_hover_text("Refresh presets from camera")
                 .clicked()
             {
@@ -731,8 +840,7 @@ impl ViewerApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new(label)
-                                    .color(Color32::from_rgb(220, 220, 220)),
+                                egui::RichText::new(label).color(Color32::from_rgb(220, 220, 220)),
                             )
                             .frame(false)
                             .min_size(Vec2::new(ui.available_width(), 0.0)),
@@ -803,27 +911,31 @@ impl ViewerApp {
         let sum_drop_delta: f32 = self.debug_rows.iter().map(|r| r.drop_delta_fps).sum();
         let sum_in: f32 = self.debug_rows.iter().map(|r| r.samples_in_fps).sum();
 
-        info!(
-            ui_fps = format!("{:.1}", self.ui_perf.ui_fps),
-            ui_dt_max_ms = self.ui_perf.reported_frame_dt_max_ms,
-            tex_fps = format!("{:.1}", self.ui_perf.upload_fps),
-            tex_skip_fps = format!("{:.1}", self.ui_perf.skip_fps),
-            tex_upload_us = format!("{:.0}", self.ui_perf.avg_upload_us),
-            tex_upload_us_max = self.ui_perf.reported_upload_us_max,
-            tex_pass_us_max = self.ui_perf.reported_tex_pass_us_max,
-            decode_fps = format!("{sum_fps:.1}"),
-            in_fps = format!("{sum_in:.1}"),
-            stale_fps = format!("{sum_stale:.1}"),
-            drop_rate_fps = format!("{sum_drop_rate:.1}"),
-            drop_delta_fps = format!("{sum_drop_delta:.1}"),
-            emit_gap_max_ms = gap_max,
-            layout = self.active_layout().as_str(),
-            hd = self.hd,
-            view = %self.views.active_view().name,
-            "stutter sample"
-        );
-        log_stream_debug_rows(&self.debug_rows);
-        self.append_stutter_stats_file();
+        if self.debug_overlay {
+            info!(
+                ui_fps = format!("{:.1}", self.ui_perf.ui_fps),
+                ui_dt_max_ms = self.ui_perf.reported_frame_dt_max_ms,
+                tex_fps = format!("{:.1}", self.ui_perf.upload_fps),
+                tex_skip_fps = format!("{:.1}", self.ui_perf.skip_fps),
+                tex_upload_us = format!("{:.0}", self.ui_perf.avg_upload_us),
+                tex_upload_us_max = self.ui_perf.reported_upload_us_max,
+                tex_pass_us_max = self.ui_perf.reported_tex_pass_us_max,
+                decode_fps = format!("{sum_fps:.1}"),
+                in_fps = format!("{sum_in:.1}"),
+                stale_fps = format!("{sum_stale:.1}"),
+                drop_rate_fps = format!("{sum_drop_rate:.1}"),
+                drop_delta_fps = format!("{sum_drop_delta:.1}"),
+                emit_gap_max_ms = gap_max,
+                layout = self.active_layout().as_str(),
+                hd = self.hd,
+                view = %self.views.active_view().name,
+                "stutter sample"
+            );
+            log_stream_debug_rows(&self.debug_rows);
+        }
+        if self.stutter_log_file {
+            self.append_stutter_stats_file();
+        }
         self.last_debug_log = Instant::now();
     }
 
@@ -1119,7 +1231,7 @@ impl ViewerApp {
             ui.painter()
                 .rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
             let label = if selected && cam.ptz.is_some() {
-                format!("{}  ⌖", cam.name)
+                format!("{}  {}", cam.name, icons::CROSSHAIR)
             } else {
                 cam.name.clone()
             };
@@ -1137,19 +1249,177 @@ impl ViewerApp {
         }
     }
 
-    pub(super) fn draw_grid(&mut self, ui: &mut egui::Ui, full: Rect) {
-        let layout = self.active_layout();
+    pub(super) fn paint_monitor(
+        &mut self,
+        ui: &mut egui::Ui,
+        full: Rect,
+        view_idx: usize,
+        fullscreen_slot: Option<usize>,
+        is_aux: bool,
+    ) {
+        if let Some(slot_idx) = fullscreen_slot {
+            let cam_id = self
+                .views
+                .view(view_idx)
+                .slots
+                .get(slot_idx)
+                .cloned()
+                .flatten();
+            if let Some(id) = cam_id {
+                if let Some(cam) = self.camera_by_id(&id).cloned() {
+                    let screen_focused = ui.ctx().input(|i| i.focused);
+                    let selected =
+                        screen_focused && self.sidebar_ptz_cam.as_deref() == Some(cam.id.as_str());
+                    let response =
+                        ui.interact(full, Id::new(("fs", view_idx, is_aux)), Sense::click());
+                    self.paint_cell_contents(ui, &cam, full, response.hovered(), selected);
+                    if response.clicked() {
+                        self.select_camera(&cam.id);
+                    }
+                    if response.double_clicked() || response.secondary_clicked() {
+                        if is_aux {
+                            self.exit_aux_fullscreen();
+                        } else {
+                            self.exit_fullscreen();
+                        }
+                    }
+                }
+            } else if is_aux {
+                self.exit_aux_fullscreen();
+            } else {
+                self.exit_fullscreen();
+            }
+            return;
+        }
+        self.draw_grid(ui, full, view_idx, is_aux);
+    }
+
+    pub(super) fn show_aux_window(&mut self, ctx: &egui::Context) {
+        if !self.aux_open {
+            self.aux_focused = false;
+            self.aux_pointer_down = false;
+            return;
+        }
+        self.clamp_aux_view();
+        let mut close = false;
+        let title = crate::config::app_screen_title(&self.app_name, 2);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("citadel_aux_screen"),
+            egui::ViewportBuilder::default()
+                .with_app_id(crate::config::LINUX_CONFIG_DIR)
+                .with_title(title.clone())
+                .with_inner_size([1280.0, 720.0])
+                .with_fullscreen(self.aux_window_fullscreen),
+            |ctx, _class| {
+                self.apply_accent_visuals(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+                self.aux_focused = ctx.input(|i| i.focused);
+                self.aux_pointer_down = ctx.input(|i| i.pointer.primary_down());
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if self.pending_gate_confirm {
+                        self.pending_gate_confirm = false;
+                    } else if self.aux_fullscreen_slot.is_some() {
+                        self.exit_aux_fullscreen();
+                    } else if self.aux_window_fullscreen {
+                        self.aux_window_fullscreen = false;
+                    }
+                }
+
+                let aux_view = self.aux_view;
+                if !self.aux_window_fullscreen {
+                    egui::TopBottomPanel::top("aux_toolbar")
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(PANEL_BG)
+                                .inner_margin(egui::Margin::symmetric(8, 4)),
+                        )
+                        .show(ctx, |ui| {
+                            self.toolbar(ui, aux_view, true);
+                        });
+
+                    if self.sidebar_open {
+                        egui::SidePanel::left("aux_cameras")
+                            .resizable(true)
+                            .default_width(220.0)
+                            .width_range(160.0..=360.0)
+                            .frame(
+                                egui::Frame::NONE
+                                    .fill(PANEL_BG)
+                                    .inner_margin(egui::Margin::symmetric(10, 8)),
+                            )
+                            .show(ctx, |ui| {
+                                self.camera_sidebar(ui, aux_view, true);
+                            });
+                    }
+                }
+
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(CANVAS_BG)
+                            .inner_margin(egui::Margin::ZERO),
+                    )
+                    .show(ctx, |ui| {
+                        let full = ui.max_rect();
+                        if self.paused {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Streams paused while in background")
+                                        .size(18.0)
+                                        .color(Color32::from_rgb(200, 200, 200)),
+                                );
+                            });
+                            return;
+                        }
+                        let aux_fs = self.aux_fullscreen_slot;
+                        self.paint_monitor(ui, full, aux_view, aux_fs, true);
+                    });
+
+                self.draw_clear_slot_dialog(ctx);
+                self.draw_gate_confirm_dialog(ctx);
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            },
+        );
+        if close {
+            self.aux_open = false;
+            self.aux_focused = false;
+        }
+    }
+
+    pub(super) fn draw_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        full: Rect,
+        view_idx: usize,
+        is_aux: bool,
+    ) {
+        let layout = self.views.view(view_idx).layout;
         let cols = layout.cols();
         let rows = layout.rows();
-        // In monitor fullscreen, use every pixel and let adjacent feeds meet.
-        let gap = if self.window_fullscreen { 0.0 } else { 2.0 };
+        let gap = if (!is_aux && self.window_fullscreen) || (is_aux && self.aux_window_fullscreen) {
+            0.0
+        } else {
+            2.0
+        };
         let cell_w = (full.width() - gap * (cols as f32 + 1.0)) / cols as f32;
         let cell_h = (full.height() - gap * (rows as f32 + 1.0)) / rows as f32;
 
-        let slots = self.views.active_view().slots.clone();
+        let slots = self.views.view(view_idx).slots.clone();
+        let screen_focused = ui.ctx().input(|i| i.focused);
         let selected_id = self.sidebar_ptz_cam.clone();
-        self.ensure_pad_focus();
-        let pad_focus = self.pad_focus_slot;
+        if !is_aux {
+            self.ensure_pad_focus();
+        } else {
+            self.ensure_aux_pad_focus();
+        }
+        let pad_focus = if is_aux {
+            self.aux_pad_focus_slot
+        } else {
+            self.pad_focus_slot
+        };
         let mut drop_action: Option<(usize, DragPayload)> = None;
         let mut fullscreen: Option<usize> = None;
         let mut clear: Option<usize> = None;
@@ -1163,20 +1433,23 @@ impl ViewerApp {
             let x = full.min.x + gap + col as f32 * (cell_w + gap);
             let y = full.min.y + gap + row as f32 * (cell_h + gap);
             let cell = Rect::from_min_size(egui::pos2(x, y), Vec2::new(cell_w, cell_h));
-            let id = Id::new("grid_slot").with(i);
+            let id = Id::new(("grid_slot", view_idx, i));
 
-            let sense = if slot.is_some() {
-                Sense::click_and_drag()
-            } else {
-                Sense::click()
-            };
+            let sense = Sense::click_and_drag();
             let response = ui.interact(cell, id, sense);
 
+            if response.drag_started() {
+                if slot.is_some() {
+                    self.cross_drag = Some(DragPayload::FromSlot {
+                        view: view_idx,
+                        slot: i,
+                    });
+                }
+            }
+
             if let Some(cam_id) = slot {
-                let selected = selected_id.as_deref() == Some(cam_id.as_str());
-                let has_ptz = self
-                    .camera_by_id(cam_id)
-                    .is_some_and(|c| c.ptz.is_some());
+                let selected = screen_focused && selected_id.as_deref() == Some(cam_id.as_str());
+                let has_ptz = self.camera_by_id(cam_id).is_some_and(|c| c.ptz.is_some());
                 if let Some(cam) = self.camera_by_id(cam_id) {
                     self.paint_cell_contents(ui, cam, cell, response.hovered(), selected);
                 } else {
@@ -1198,7 +1471,7 @@ impl ViewerApp {
                         egui::StrokeKind::Inside,
                     );
                 }
-                if pad_focus == Some(i) && !selected {
+                if screen_focused && pad_focus == Some(i) && !selected {
                     ui.painter().rect_stroke(
                         cell.shrink(1.0),
                         0.0,
@@ -1206,7 +1479,10 @@ impl ViewerApp {
                         egui::StrokeKind::Inside,
                     );
                 }
-                response.dnd_set_drag_payload(DragPayload::FromSlot(i));
+                response.dnd_set_drag_payload(DragPayload::FromSlot {
+                    view: view_idx,
+                    slot: i,
+                });
             } else {
                 ui.painter()
                     .rect_filled(cell, 0.0, Color32::from_rgb(12, 14, 18));
@@ -1217,7 +1493,7 @@ impl ViewerApp {
                     egui::FontId::proportional(13.0),
                     Color32::from_rgb(90, 95, 105),
                 );
-                if pad_focus == Some(i) {
+                if screen_focused && pad_focus == Some(i) {
                     ui.painter().rect_stroke(
                         cell.shrink(1.0),
                         0.0,
@@ -1227,7 +1503,9 @@ impl ViewerApp {
                 }
             }
 
-            if response.dnd_hover_payload::<DragPayload>().is_some() {
+            let hovering_drop = response.dnd_hover_payload::<DragPayload>().is_some()
+                || (response.contains_pointer() && self.cross_drag.is_some());
+            if hovering_drop {
                 ui.painter().rect_stroke(
                     cell.shrink(1.0),
                     0.0,
@@ -1238,6 +1516,12 @@ impl ViewerApp {
 
             if let Some(payload) = response.dnd_release_payload::<DragPayload>() {
                 drop_action = Some((i, (*payload).clone()));
+                self.cross_drag = None;
+            } else if response.contains_pointer() && ui.input(|inp| inp.pointer.primary_released())
+            {
+                if let Some(payload) = self.cross_drag.take() {
+                    drop_action = Some((i, payload));
+                }
             }
             if response.clicked() {
                 focus_slot = Some(i);
@@ -1249,7 +1533,12 @@ impl ViewerApp {
                 fullscreen = Some(i);
             }
             if response.secondary_clicked() {
-                if self.window_fullscreen {
+                let os_fs = if is_aux {
+                    self.aux_window_fullscreen
+                } else {
+                    self.window_fullscreen
+                };
+                if os_fs {
                     exit_os_fullscreen = true;
                 } else if slot.is_some() {
                     clear = Some(i);
@@ -1258,32 +1547,40 @@ impl ViewerApp {
         }
 
         if let Some((idx, payload)) = drop_action {
-            self.apply_drop(idx, payload);
+            self.apply_drop(view_idx, idx, payload);
         }
         if let Some(id) = select {
             self.select_camera(&id);
         }
         if let Some(idx) = focus_slot {
-            self.pad_focus_slot = Some(idx);
+            if is_aux {
+                self.aux_pad_focus_slot = Some(idx);
+            } else {
+                self.pad_focus_slot = Some(idx);
+            }
         }
         if let Some(idx) = fullscreen {
-            self.enter_fullscreen(idx);
+            self.enter_fullscreen_at(view_idx, idx, is_aux);
         }
         if exit_os_fullscreen {
-            self.set_window_fullscreen(ui.ctx(), false);
+            if is_aux {
+                self.aux_window_fullscreen = false;
+            } else {
+                self.set_window_fullscreen(ui.ctx(), false);
+            }
         }
         if let Some(idx) = clear {
-            self.pending_clear_slot = Some(idx);
+            self.pending_clear_slot = Some((view_idx, idx));
         }
     }
 
     pub(super) fn draw_clear_slot_dialog(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.pending_clear_slot else {
+        let Some((view_idx, idx)) = self.pending_clear_slot else {
             return;
         };
         let name = self
             .views
-            .active_view()
+            .view(view_idx)
             .slots
             .get(idx)
             .and_then(|s| s.as_deref())
@@ -1314,9 +1611,58 @@ impl ViewerApp {
 
         if confirmed {
             self.pending_clear_slot = None;
-            self.clear_slot(idx);
+            self.clear_slot(view_idx, idx);
         } else if cancelled || !open {
             self.pending_clear_slot = None;
+        }
+    }
+
+    pub(super) fn draw_gate_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.pending_gate_confirm {
+            return;
+        }
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let mut open = true;
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            confirmed = true;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancelled = true;
+        }
+
+        egui::Window::new("Open gates?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Open the gates?");
+                ui.label(
+                    egui::RichText::new(
+                        "Enter or ✕ / OK to open · any other button or Cancel to abort",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            self.pending_gate_confirm = false;
+            self.open_gates();
+        } else if cancelled || !open {
+            self.pending_gate_confirm = false;
         }
     }
 }
