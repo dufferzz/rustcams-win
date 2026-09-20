@@ -35,10 +35,12 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.2.1 \
+gh release create v0.2.2 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
+
+When you launch that AppImage, Citadel CCTV checks GitHub Releases in the background and offers an update if a newer matching AppImage (plus `.sha256`) exists. Confirm in the banner to download and replace the file; restart to run the new build. Turn this off in Settings → Display (`Check for AppImage updates on launch`). Cargo/`target/release` builds do not check.
 
 ### Raspberry Pi 4 (64-bit)
 

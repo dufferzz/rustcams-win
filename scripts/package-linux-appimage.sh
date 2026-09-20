@@ -42,7 +42,7 @@ esac
 OUT_DIR="$ROOT/dist"
 APPDIR="$OUT_DIR/Citadel_CCTV.AppDir"
 TOOLS="$ROOT/.deps"
-OUT_APPIMAGE="$OUT_DIR/Citadel_CCTV-linux-${ARCH}.AppImage"
+: "${OUT_APPIMAGE:=$OUT_DIR/Citadel_CCTV-linux-${ARCH}.AppImage}"
 if [[ -z "${CARGO_PROFILE:-}" ]]; then
   if [[ "$ARCH" == "aarch64" ]]; then
     CARGO_PROFILE=release
@@ -50,7 +50,8 @@ if [[ -z "${CARGO_PROFILE:-}" ]]; then
     CARGO_PROFILE=dist
   fi
 fi
-BIN="$ROOT/target/$CARGO_PROFILE/rustcams"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+BIN="$CARGO_TARGET_DIR/$CARGO_PROFILE/rustcams"
 
 export APPIMAGE_EXTRACT_AND_RUN=1
 
@@ -271,10 +272,16 @@ mkdir -p "$OUT_DIR"
 run_linuxdeploy "${LD_ARGS[@]}" --output appimage
 
 shopt -s nullglob
-BUILT=( "$OUT_DIR"/Citadel_CCTV*.AppImage "$ROOT"/Citadel_CCTV*.AppImage )
+# linuxdeploy names the image after the desktop file + arch, not the shipping
+# Citadel_CCTV-linux-<arch>.AppImage. Do not glob dist/ or we steal a previous
+# release sitting next to the new build.
+CANDIDATES=(
+  "$OUT_DIR/Citadel_CCTV-${ARCH}.AppImage"
+  "$ROOT/Citadel_CCTV-${ARCH}.AppImage"
+)
 shopt -u nullglob
 FOUND=""
-for f in "${BUILT[@]:-}"; do
+for f in "${CANDIDATES[@]}"; do
   if [[ -f "$f" && "$f" != "$OUT_APPIMAGE" ]]; then
     FOUND="$f"
     break

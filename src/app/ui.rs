@@ -1,5 +1,5 @@
 use super::icons;
-use super::{DragPayload, SidebarControls, ViewerApp};
+use super::{DragPayload, SidebarControls, UpdateBanner, ViewerApp};
 use crate::config::CameraConfig;
 use crate::layout::{FitMode, Layout};
 use crate::ptz::{
@@ -856,6 +856,59 @@ impl ViewerApp {
             });
     }
 
+    pub(super) fn update_banner_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| match self.update_banner.clone() {
+            UpdateBanner::Hidden => {}
+            UpdateBanner::Offer(offer) => {
+                ui.colored_label(
+                    Color32::from_rgb(220, 200, 120),
+                    format!("Update to {} available", offer.tag),
+                );
+                if ui.button("Update").clicked() {
+                    self.start_update_download();
+                }
+                if ui.button("Later").clicked() {
+                    self.update_later = true;
+                    self.update_banner = UpdateBanner::Hidden;
+                }
+                if ui.button("Skip this version").clicked() {
+                    self.skip_this_update();
+                }
+            }
+            UpdateBanner::Downloading { version } => {
+                let bytes = self
+                    .update_progress
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                ui.label(format!(
+                    "Downloading {version}… {}",
+                    format_download_bytes(bytes)
+                ));
+            }
+            UpdateBanner::Ready { version } => {
+                ui.colored_label(
+                    Color32::from_rgb(140, 220, 160),
+                    format!("Restart {} to use {version}", self.app_name),
+                );
+                if ui.button("Quit").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            UpdateBanner::Failed { message } => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 160, 120),
+                    format!("Update failed: {message}"),
+                );
+                if ui.button("Retry").clicked() {
+                    self.start_update_download();
+                }
+                if ui.button("Dismiss").clicked() {
+                    self.update_later = true;
+                    self.update_banner = UpdateBanner::Hidden;
+                }
+            }
+        });
+    }
+
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
         self.stats.refresh_if_due(false);
         let streams = if self.paused {
@@ -1709,5 +1762,15 @@ fn fitted_rect(cell: Rect, video_aspect: f32, fit: FitMode) -> Rect {
                 Rect::from_center_size(cell.center(), Vec2::new(cell.width(), h))
             }
         }
+    }
+}
+
+fn format_download_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
     }
 }

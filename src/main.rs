@@ -3,9 +3,9 @@
 mod app;
 mod config;
 mod gate;
-mod http_client;
 mod gst_env;
 mod gst_link;
+mod http_client;
 mod layout;
 mod log_buffer;
 mod nvr;
@@ -13,6 +13,7 @@ mod ptz;
 mod redact;
 mod stats;
 mod stream;
+mod update;
 mod views;
 
 use app::ViewerApp;

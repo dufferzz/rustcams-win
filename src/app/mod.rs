@@ -31,6 +31,15 @@ enum DragPayload {
     FromSlot { view: usize, slot: usize },
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum UpdateBanner {
+    Hidden,
+    Offer(crate::update::AvailableUpdate),
+    Downloading { version: String },
+    Ready { version: String },
+    Failed { message: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SidebarControls {
     #[default]
@@ -264,6 +273,16 @@ pub struct ViewerApp {
     log_auto_scroll: bool,
     log_view_generation: u64,
     log_view_lines: Vec<String>,
+    check_updates: bool,
+    skipped_update: Option<String>,
+    /// Hide the offer for this process only (Later / opt-out).
+    update_later: bool,
+    update_banner: UpdateBanner,
+    last_update_offer: Option<crate::update::AvailableUpdate>,
+    pending_update: Arc<Mutex<Option<crate::update::AvailableUpdate>>>,
+    update_apply: Arc<Mutex<Option<Result<String, String>>>>,
+    update_progress: Arc<AtomicU64>,
+    update_inflight: Arc<AtomicBool>,
 }
 
 impl ViewerApp {
@@ -439,11 +458,26 @@ impl ViewerApp {
             log_auto_scroll: true,
             log_view_generation: 0,
             log_view_lines: Vec::new(),
+            check_updates: ui_prefs.check_updates,
+            skipped_update: ui_prefs
+                .skipped_update
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            update_later: false,
+            update_banner: UpdateBanner::Hidden,
+            last_update_offer: None,
+            pending_update: Arc::new(Mutex::new(None)),
+            update_apply: Arc::new(Mutex::new(None)),
+            update_progress: Arc::new(AtomicU64::new(0)),
+            update_inflight: Arc::new(AtomicBool::new(false)),
         };
         app.save_ui_prefs();
         if app.nvr_retry {
             app.kick_nvr_resolve();
         }
+        app.kick_update_check();
         Ok(app)
     }
 
@@ -482,7 +516,8 @@ impl ViewerApp {
         let cameras_changed = self.cameras != resolved.cameras;
         self.app_config = raw;
         if !self.show_settings {
-            let (nvr_enabled, nvr_draft, nvr_protocols) = settings::nvr_edit_state(&self.app_config);
+            let (nvr_enabled, nvr_draft, nvr_protocols) =
+                settings::nvr_edit_state(&self.app_config);
             self.nvr_enabled = nvr_enabled;
             self.nvr_draft = nvr_draft;
             self.nvr_protocols = nvr_protocols;
@@ -532,10 +567,7 @@ impl ViewerApp {
                     (resolved, None, false)
                 }
                 Err(err) => {
-                    warn!(
-                        host = raw.nvr_host_label(),
-                        "NVR discovery failed: {err:#}"
-                    );
+                    warn!(host = raw.nvr_host_label(), "NVR discovery failed: {err:#}");
                     let fallback = raw.resolve_direct_fallback();
                     let warning = Some(raw.waiting_for_nvr_message(Some(&format!("{err:#}"))));
                     (fallback, warning, true)
@@ -601,8 +633,7 @@ impl ViewerApp {
                         self.nvr_protocols = nvr_protocols;
                         self.gate_draft = self.app_config.gate.clone().unwrap_or_default();
                     }
-                    self.app_name =
-                        crate::config::app_brand_name(&self.app_config.viewer.app_name);
+                    self.app_name = crate::config::app_brand_name(&self.app_config.viewer.app_name);
                     self.pause_when_unfocused = self.app_config.viewer.pause_when_unfocused;
                     if self.app_config.nvr_discovery_enabled() {
                         let fallback = self.app_config.resolve_direct_fallback();
@@ -1257,6 +1288,91 @@ impl ViewerApp {
     pub(super) fn gate_busy(&self) -> bool {
         self.gate_inflight.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn kick_update_check(&self) {
+        if !self.check_updates {
+            return;
+        }
+        let Some(path) = crate::update::appimage_path() else {
+            if std::env::var_os("APPDIR").is_some() {
+                warn!("AppImage update check skipped: $APPIMAGE missing or not a file");
+            }
+            return;
+        };
+        info!(
+            path = %path.display(),
+            "checking GitHub for AppImage updates"
+        );
+        let skipped = self.skipped_update.clone();
+        let slot = self.pending_update.clone();
+        std::thread::spawn(move || {
+            let offer = crate::update::check_latest(env!("CARGO_PKG_VERSION"), skipped.as_deref());
+            if let Some(offer) = offer {
+                info!(tag = %offer.tag, version = %offer.version, "AppImage update available");
+                *slot.lock() = Some(offer);
+            }
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        if let Some(res) = self.update_apply.lock().take() {
+            self.update_inflight.store(false, Ordering::SeqCst);
+            match res {
+                Ok(version) => self.update_banner = UpdateBanner::Ready { version },
+                Err(message) => self.update_banner = UpdateBanner::Failed { message },
+            }
+        }
+        if self.update_later {
+            return;
+        }
+        if !matches!(self.update_banner, UpdateBanner::Hidden) {
+            return;
+        }
+        let offer = self.pending_update.lock().clone();
+        if let Some(offer) = offer {
+            self.last_update_offer = Some(offer.clone());
+            self.update_banner = UpdateBanner::Offer(offer);
+        }
+    }
+
+    fn start_update_download(&mut self) {
+        let Some(dest) = crate::update::appimage_path() else {
+            self.update_banner = UpdateBanner::Failed {
+                message: "Not running from an AppImage.".into(),
+            };
+            return;
+        };
+        let Some(offer) = self.last_update_offer.clone() else {
+            return;
+        };
+        if self.update_inflight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.update_progress.store(0, Ordering::Relaxed);
+        self.update_banner = UpdateBanner::Downloading {
+            version: offer.tag.clone(),
+        };
+        let progress = self.update_progress.clone();
+        let apply = self.update_apply.clone();
+        std::thread::spawn(move || {
+            let result = crate::update::download_and_replace(&dest, &offer, &progress)
+                .map(|()| offer.tag.clone())
+                .map_err(|err| format!("{err:#}"));
+            if let Err(msg) = &result {
+                warn!("AppImage update failed: {msg}");
+            }
+            *apply.lock() = Some(result);
+        });
+    }
+
+    fn skip_this_update(&mut self) {
+        if let Some(offer) = &self.last_update_offer {
+            self.skipped_update = Some(offer.version.clone());
+            self.save_ui_prefs();
+        }
+        self.update_later = true;
+        self.update_banner = UpdateBanner::Hidden;
+    }
 }
 
 impl eframe::App for ViewerApp {
@@ -1264,6 +1380,10 @@ impl eframe::App for ViewerApp {
         self.ui_perf.tick_frame();
         self.ensure_maximized_on_launch(ctx);
         self.poll_config_reload();
+        self.poll_update_check();
+        if matches!(self.update_banner, UpdateBanner::Downloading { .. }) {
+            ctx.request_repaint();
+        }
         self.sync_window_fullscreen(ctx);
         self.apply_accent_visuals(ctx);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -1297,6 +1417,18 @@ impl eframe::App for ViewerApp {
                 .show(ctx, |ui| {
                     self.toolbar(ui, self.views.active, false);
                 });
+
+            if !matches!(self.update_banner, UpdateBanner::Hidden) {
+                egui::TopBottomPanel::top("update_banner")
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(STATUS_BG)
+                            .inner_margin(egui::Margin::symmetric(8, 4)),
+                    )
+                    .show(ctx, |ui| {
+                        self.update_banner_bar(ui, ctx);
+                    });
+            }
 
             if self.debug_overlay {
                 egui::TopBottomPanel::bottom("statusbar")

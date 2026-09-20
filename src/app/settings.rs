@@ -44,6 +44,12 @@ pub struct UiPrefs {
     /// Append `stutter-stats.log` next to cameras.toml (~2s). Off by default.
     #[serde(default)]
     pub stutter_log_file: bool,
+    /// Linux AppImage: query GitHub Releases on launch.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// Last skipped update version (`0.3.0`); stay quiet until a newer tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_update: Option<String>,
     #[serde(default = "default_w1")]
     pub decode_1: i32,
     #[serde(default = "default_w1_hd")]
@@ -124,6 +130,8 @@ impl Default for UiPrefs {
             last_aux_view: None,
             fit: None,
             stutter_log_file: false,
+            check_updates: true,
+            skipped_update: None,
             decode_1: default_w1(),
             decode_1_hd: default_w1_hd(),
             decode_2: default_w2(),
@@ -227,6 +235,8 @@ impl ViewerApp {
             last_aux_view: aux_name,
             fit: Some(self.fit.as_str().to_string()),
             stutter_log_file: self.stutter_log_file,
+            check_updates: self.check_updates,
+            skipped_update: self.skipped_update.clone(),
             decode_1: self.decode_1,
             decode_1_hd: self.decode_1_hd,
             decode_2: self.decode_2,
@@ -615,6 +625,29 @@ impl ViewerApp {
                         .weak(),
                 );
                 ui.add_space(8.0);
+                if crate::update::appimage_path().is_some() {
+                    if ui
+                        .checkbox(
+                            &mut self.check_updates,
+                            "Check for AppImage updates on launch",
+                        )
+                        .changed()
+                    {
+                        save_ui = true;
+                        if !self.check_updates {
+                            self.update_later = true;
+                            self.update_banner = super::UpdateBanner::Hidden;
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Looks up the latest GitHub release. You confirm before download.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                }
                 if ui
                     .add(
                         egui::Slider::new(&mut self.outline_width, 1.0..=16.0)
