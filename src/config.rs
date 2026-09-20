@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use url::Url;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvr: Option<NvrConfig>,
@@ -20,7 +20,7 @@ pub struct AppConfig {
 }
 
 /// Hikvision NVR used for ISAPI discovery and RTSP proxy streaming.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NvrConfig {
     /// When false, keep `[nvr]` credentials but stream from `[[cameras]]` URLs only.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -70,7 +70,7 @@ impl Default for NvrConfig {
 }
 
 /// Hikvision Access Control door / gate (`PUT …/RemoteControl/door/{id}`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateConfig {
     pub host: String,
     #[serde(default = "default_http_port")]
@@ -104,8 +104,12 @@ impl GateConfig {
     }
 
     pub fn request_path(&self) -> String {
-        let door = self.door_id.trim();
-        let door = if door.is_empty() { "1" } else { door };
+        let door: String = self
+            .door_id
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let door = if door.is_empty() { "1".into() } else { door };
         format!("/ISAPI/AccessControl/RemoteControl/door/{door}")
     }
 
@@ -191,7 +195,7 @@ impl StreamType {
 }
 
 /// Raw TOML camera entry under `[[cameras]]`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CameraEntry {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,14 +225,14 @@ pub struct PtzTarget {
     pub username: String,
     pub password: String,
     pub channel: u32,
-    /// NVR `ContentMgmt/PTZCtrl` (InputProxy channel) instead of camera `PTZCtrl`.
+    /// NVR `ContentMgmt/PTZCtrlProxy` (InputProxy channel) instead of camera `PTZCtrl`.
     pub via_nvr: bool,
-    /// If camera ISAPI fails, try this NVR route.
+    /// If the primary ISAPI host fails, try this route.
     pub fallback: Option<Box<PtzTarget>>,
 }
 
 /// Resolved camera ready for the viewer / GStreamer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraConfig {
     pub id: String,
     pub name: String,
@@ -240,11 +244,11 @@ pub struct CameraConfig {
     /// NVR InputProxy channel id when discovered via `[nvr]`.
     #[allow(dead_code)]
     pub channel_id: Option<u32>,
-    /// Camera ISAPI, or NVR `ContentMgmt/PTZCtrl` when `[nvr]` is set.
+    /// Camera ISAPI, or NVR `ContentMgmt/PTZCtrlProxy` when `[nvr]` is set.
     pub ptz: Option<PtzTarget>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewerConfig {
     /// Window title and toolbar brand.
     #[serde(default = "default_app_name")]
@@ -286,6 +290,94 @@ pub fn app_screen_title(name: &str, screen: u32) -> String {
 /// Also the Wayland/X11 app id so the window is not named `AppRun.wrapped`.
 pub const LINUX_CONFIG_DIR: &str = "citadel-cctv";
 
+/// Hostname, DNS name, or IPv4. IPv6 must be written as `[2001:db8::1]` (no port).
+pub fn validate_host(host: &str) -> Result<()> {
+    let h = host.trim();
+    if h.is_empty() {
+        bail!("host is empty");
+    }
+    if h.contains("://") || h.contains(['/', '@', ' ', '#', '?', '\\', '%']) {
+        bail!("host must be a hostname or IP, not a URL: {h:?}");
+    }
+    if h.starts_with('[') {
+        if !h.ends_with(']') || h.len() < 4 {
+            bail!("invalid IPv6 host {h:?}");
+        }
+        return Ok(());
+    }
+    if !h
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        bail!("host contains invalid characters: {h:?}");
+    }
+    Ok(())
+}
+
+pub fn validate_rtsp_url(raw: &str) -> Result<()> {
+    let u = Url::parse(raw.trim()).context("parse stream URL")?;
+    match u.scheme() {
+        "rtsp" | "rtsps" => {}
+        other => bail!("stream URL must be rtsp:// or rtsps://, not {other}://"),
+    }
+    if u.host_str().is_none() {
+        bail!("stream URL missing host");
+    }
+    Ok(())
+}
+
+fn validate_gate_fields(gate: &GateConfig) -> Result<()> {
+    let door = gate.door_id.trim();
+    if !door.is_empty() && !door.chars().all(|c| c.is_ascii_digit()) {
+        bail!("door_id must be digits, got {door:?}");
+    }
+    let action = gate.action.trim();
+    if !action.is_empty() && !action.eq_ignore_ascii_case("open") {
+        bail!("action must be \"open\", got {action:?}");
+    }
+    Ok(())
+}
+
+/// Write `cameras.toml` / `views.toml` / `ui.toml` with owner-only mode on Unix.
+pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+            restrict_config_dir(parent);
+        }
+    }
+    fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    restrict_secret_file(path);
+    Ok(())
+}
+
+fn restrict_secret_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+}
+
+fn restrict_config_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if dir.file_name().and_then(|n| n.to_str()) != Some(LINUX_CONFIG_DIR) {
+            return;
+        }
+        if let Ok(meta) = fs::metadata(dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = fs::set_permissions(dir, perms);
+        }
+    }
+}
+
 fn appimage_dir() -> Option<PathBuf> {
     let p = std::env::var_os("APPIMAGE").filter(|v| !v.is_empty())?;
     PathBuf::from(p).parent().map(Path::to_path_buf)
@@ -304,10 +396,46 @@ fn xdg_config_cameras_toml() -> PathBuf {
     base.join(LINUX_CONFIG_DIR).join("cameras.toml")
 }
 
-/// Prefer a writable `cameras.toml`:
+/// Turn a CLI or discovered path into an absolute path so session autostart
+/// (`cwd` often `$HOME`) cannot change which file we read later.
+pub fn absolute_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
+/// Real directory of this process's binary (`/proc/self/exe` is not usable).
+fn exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    exe.parent().map(Path::to_path_buf)
+}
+
+/// `cameras.toml` in `dir` or a few parent folders (portable exe, `target/release`).
+pub fn cameras_toml_in_ancestors(dir: &Path, max_up: usize) -> Option<PathBuf> {
+    let mut dir = dir.to_path_buf();
+    for _ in 0..=max_up {
+        let candidate = dir.join("cameras.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Prefer a writable `cameras.toml` without depending on the process working directory:
 /// 1. Next to the AppImage file, else `~/.config/citadel-cctv/` (AppImage)
-/// 2. Next to the executable if that file exists (Windows portable)
-/// 3. `cameras.toml` in the working directory
+/// 2. Next to the real executable, or a few directories above (cargo `target/…`)
+/// 3. `~/.config/citadel-cctv/cameras.toml` if that file exists
+/// 4. `cameras.toml` in the current working directory if that file exists
+/// 5. Otherwise: XDG on Unix, next to the exe on Windows
 pub fn default_cameras_toml() -> PathBuf {
     if let Some(dir) = appimage_dir() {
         let beside = dir.join("cameras.toml");
@@ -316,15 +444,28 @@ pub fn default_cameras_toml() -> PathBuf {
         }
         return xdg_config_cameras_toml();
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let next_to_exe = dir.join("cameras.toml");
-            if next_to_exe.is_file() {
-                return next_to_exe;
-            }
+    if let Some(dir) = exe_dir() {
+        if let Some(found) = cameras_toml_in_ancestors(&dir, 4) {
+            return found;
         }
     }
-    PathBuf::from("cameras.toml")
+    let xdg = xdg_config_cameras_toml();
+    if xdg.is_file() {
+        return xdg;
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_file = cwd.join("cameras.toml");
+        if cwd_file.is_file() {
+            return cwd_file;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(dir) = exe_dir() {
+            return dir.join("cameras.toml");
+        }
+    }
+    xdg
 }
 
 fn default_layout() -> String {
@@ -362,7 +503,119 @@ impl AppConfig {
         let path = path.as_ref();
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("failed to parse config {}", path.display()))
+        let cfg: Self = toml::from_str(&text)
+            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        cfg.validate()
+            .with_context(|| format!("invalid config {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Some(nvr) = &self.nvr {
+            if !nvr.host.trim().is_empty() {
+                validate_host(&nvr.host).context("[nvr] host")?;
+            }
+        }
+        if let Some(gate) = &self.gate {
+            if !gate.host.trim().is_empty() {
+                validate_host(&gate.host).context("[gate] host")?;
+            }
+            validate_gate_fields(gate).context("[gate]")?;
+        }
+        for cam in &self.cameras {
+            let url = cam.url.trim();
+            if !url.is_empty() {
+                validate_rtsp_url(url).with_context(|| format!("camera '{}' url", cam.id))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn nvr_discovery_enabled(&self) -> bool {
+        self.nvr
+            .as_ref()
+            .is_some_and(|nvr| nvr.enabled && !nvr.host.trim().is_empty())
+    }
+
+    pub fn nvr_host_label(&self) -> &str {
+        self.nvr
+            .as_ref()
+            .map(|nvr| nvr.host.as_str())
+            .filter(|h| !h.is_empty())
+            .unwrap_or("NVR")
+    }
+
+    /// Direct `[[cameras]]` URLs only (skip blanks). Used until NVR ISAPI is reachable.
+    pub fn resolve_direct_fallback(&self) -> ResolvedConfig {
+        ResolvedConfig {
+            cameras: resolve_direct_available(&self.cameras),
+            viewer: self.viewer.clone(),
+        }
+    }
+
+    pub fn waiting_for_nvr_message(&self, err: Option<&str>) -> String {
+        let host = self.nvr_host_label();
+        match err {
+            Some(e) => format!("Waiting for NVR at {host} — {e}\nRetrying every 5s."),
+            None => format!("Connecting to NVR at {host}…"),
+        }
+    }
+
+    /// Load for the GUI: missing/invalid config still starts, with a warning.
+    /// NVR ISAPI is not contacted here (session autostart often races the LAN).
+    pub fn read_for_app(path: &Path) -> (Self, ResolvedConfig, Option<String>) {
+        match Self::read(path) {
+            Ok(raw) => {
+                if raw.nvr_discovery_enabled() {
+                    let resolved = raw.resolve_direct_fallback();
+                    let warning = if resolved.cameras.is_empty() {
+                        Some(raw.waiting_for_nvr_message(None))
+                    } else {
+                        None
+                    };
+                    (raw, resolved, warning)
+                } else {
+                    match raw.clone().resolve() {
+                        Ok(resolved) => {
+                            let warning = if resolved.cameras.is_empty() {
+                                Some(format!(
+                                    "No cameras in {} — edit cameras.toml or Settings → NVR.",
+                                    path.display()
+                                ))
+                            } else {
+                                None
+                            };
+                            (raw, resolved, warning)
+                        }
+                        Err(err) => {
+                            warn!("failed to resolve {}: {err:#}", path.display());
+                            (
+                                raw,
+                                ResolvedConfig::default(),
+                                Some(format!(
+                                    "Config needs setup ({}): {err:#}\nFix cameras.toml or Settings → NVR.",
+                                    path.display()
+                                )),
+                            )
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "failed to load {}: {err:#} — starting without cameras",
+                    path.display()
+                );
+                (
+                    AppConfig::default(),
+                    ResolvedConfig::default(),
+                    Some(format!(
+                        "Config needs setup ({}): {err:#}\nEdit cameras.toml to configure cameras.",
+                        path.display()
+                    )),
+                )
+            }
+        }
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<ResolvedConfig> {
@@ -370,16 +623,10 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.validate().context("refuse to save invalid config")?;
         let path = path.as_ref();
         let text = toml::to_string_pretty(self).context("serialize config")?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
-        }
-        fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
-        Ok(())
+        write_secret_file(path, text.as_bytes())
     }
 
     pub fn resolve(self) -> Result<ResolvedConfig> {
@@ -403,6 +650,20 @@ impl AppConfig {
     }
 }
 
+fn camera_from_direct_url(e: &CameraEntry, url: &str) -> CameraConfig {
+    let ptz = resolve_ptz_target(e, None, None);
+    let direct_url = Some(nvr::rewrite_stream_digit(url, StreamType::Main));
+    CameraConfig {
+        id: e.id.clone(),
+        name: e.name.clone().unwrap_or_else(|| e.id.clone()),
+        url: url.to_string(),
+        direct_url,
+        protocols: e.protocols.clone(),
+        channel_id: None,
+        ptz,
+    }
+}
+
 fn resolve_direct(entries: &[CameraEntry]) -> Result<Vec<CameraConfig>> {
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
@@ -410,19 +671,23 @@ fn resolve_direct(entries: &[CameraEntry]) -> Result<Vec<CameraConfig>> {
         if url.is_empty() {
             bail!("camera '{}' needs a url when [nvr] is not configured", e.id);
         }
-        let ptz = resolve_ptz_target(e, None, None);
-        let direct_url = Some(nvr::rewrite_stream_digit(url, StreamType::Main));
-        out.push(CameraConfig {
-            id: e.id.clone(),
-            name: e.name.clone().unwrap_or_else(|| e.id.clone()),
-            url: url.to_string(),
-            direct_url,
-            protocols: e.protocols.clone(),
-            channel_id: None,
-            ptz,
-        });
+        out.push(camera_from_direct_url(e, url));
     }
     Ok(out)
+}
+
+fn resolve_direct_available(entries: &[CameraEntry]) -> Vec<CameraConfig> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let url = e.url.trim();
+            if url.is_empty() {
+                None
+            } else {
+                Some(camera_from_direct_url(e, url))
+            }
+        })
+        .collect()
 }
 
 fn resolve_from_nvr(nvr: &NvrConfig, overrides: &[CameraEntry]) -> Result<Vec<CameraConfig>> {
@@ -565,7 +830,7 @@ fn nvr_ptz_target(nvr: &NvrConfig, channel: u32) -> PtzTarget {
     }
 }
 
-/// Camera-direct ISAPI when `url` is a camera; NVR ISAPI as fallback in `[nvr]` mode.
+/// NVR `PTZCtrlProxy` in `[nvr]` mode; camera-direct ISAPI otherwise (and as fallback).
 fn resolve_ptz_target(
     entry: &CameraEntry,
     nvr: Option<&NvrConfig>,
@@ -610,9 +875,9 @@ fn resolve_ptz_target(
     };
 
     match (camera_target, nvr_target) {
-        (Some(mut cam), Some(nvr_t)) => {
-            cam.fallback = Some(Box::new(nvr_t));
-            Some(cam)
+        (Some(cam), Some(mut nvr_t)) => {
+            nvr_t.fallback = Some(Box::new(cam));
+            Some(nvr_t)
         }
         (Some(cam), None) => Some(cam),
         (None, Some(nvr_t)) => Some(nvr_t),
@@ -797,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn ptz_nvr_mode_uses_camera_then_nvr_fallback() {
+    fn ptz_nvr_mode_uses_nvr_proxy_then_camera_fallback() {
         let entry = CameraEntry {
             id: "front_ptz".into(),
             name: Some("Front PTZ".into()),
@@ -812,18 +1077,19 @@ mod tests {
             ..Default::default()
         };
         let t = resolve_ptz_target(&entry, Some(&nvr), Some(17)).unwrap();
-        assert_eq!(t.host, "192.0.2.10:80");
-        assert!(!t.via_nvr);
-        assert_eq!(t.channel, 1);
-        let fb = t.fallback.expect("nvr fallback");
+        assert_eq!(t.host, "198.51.100.20:49000");
+        assert!(t.via_nvr);
+        assert_eq!(t.channel, 17);
+        assert_eq!(t.username, "nvr");
+        let fb = t.fallback.expect("camera fallback");
         assert_eq!(
             *fb,
             PtzTarget {
-                host: "198.51.100.20:49000".into(),
-                username: "nvr".into(),
-                password: "nvpass".into(),
-                channel: 17,
-                via_nvr: true,
+                host: "192.0.2.10:80".into(),
+                username: "admin".into(),
+                password: "secret".into(),
+                channel: 1,
+                via_nvr: false,
                 fallback: None,
             }
         );
@@ -866,6 +1132,30 @@ mod tests {
         let cfg = AppConfig::default();
         let resolved = cfg.resolve().unwrap();
         assert!(resolved.cameras.is_empty());
+    }
+
+    #[test]
+    fn rejects_injected_host_and_non_rtsp() {
+        assert!(validate_host("192.0.2.10").is_ok());
+        assert!(validate_host("nvr.example").is_ok());
+        assert!(validate_host("evil.com/steal").is_err());
+        assert!(validate_host("user@host").is_err());
+        assert!(validate_host("http://192.0.2.10").is_err());
+        assert!(validate_rtsp_url("rtsp://admin:x@192.0.2.10/Streaming/Channels/101").is_ok());
+        assert!(validate_rtsp_url("http://192.0.2.10/stream").is_err());
+        let mut cfg = AppConfig::default();
+        cfg.gate = Some(GateConfig {
+            host: "192.0.2.80".into(),
+            door_id: "1/../2".into(),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_err());
+        cfg.gate = Some(GateConfig {
+            host: "192.0.2.80".into(),
+            action: "open".into(),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_ok());
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -930,6 +1220,27 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         assert_eq!(got, xdg.join(LINUX_CONFIG_DIR).join("cameras.toml"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cameras_toml_walks_ancestors() {
+        let root = std::env::temp_dir().join(format!(
+            "rustcams-toml-walk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("target").join("release");
+        fs::create_dir_all(&nested).unwrap();
+        let toml_path = root.join("cameras.toml");
+        fs::write(&toml_path, "[]\n").unwrap();
+        assert_eq!(
+            cameras_toml_in_ancestors(&nested, 4).as_ref(),
+            Some(&toml_path)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

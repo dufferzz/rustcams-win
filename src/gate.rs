@@ -3,13 +3,13 @@ use anyhow::{bail, Context, Result};
 use digest_auth::{AuthContext, HttpMethod};
 use std::time::Duration;
 use tracing::info;
-use ureq::Agent;
 
 /// `PUT /ISAPI/AccessControl/RemoteControl/door/{id}` with HTTP digest (same as curl `--digest`).
 pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
     if !cfg.is_configured() {
         bail!("gate host/username is empty");
     }
+    crate::config::validate_host(&cfg.host)?;
     let path = cfg.request_path();
     let url = cfg.request_url();
     let action = cfg.action.trim();
@@ -17,11 +17,7 @@ pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
 
     info!(host = %cfg.host.trim(), door = %cfg.door_id.trim(), action, "opening gate");
 
-    let agent: Agent = Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let agent = crate::http_client::agent(Duration::from_secs(10));
 
     let challenge = agent
         .put(&url)

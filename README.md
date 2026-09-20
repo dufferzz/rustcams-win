@@ -35,7 +35,7 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.2.0 \
+gh release create v0.2.1 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
@@ -163,10 +163,17 @@ GStreamer / codecs have LGPL/GPL obligations when redistributing — keep the co
 
 ```bash
 cp cameras.example.toml cameras.toml
-# edit — cameras.toml is gitignored
+# edit — cameras.toml is gitignored; never commit it
 ```
 
 Launch without a file: rustcams starts with a warning; add cameras by editing `cameras.toml`.
+The file is resolved as an **absolute** path (session autostart such as XFCE
+often uses `$HOME` as the working directory, which is not the app folder).
+Search order: next to the AppImage; next to the real executable or a few
+directories above it (so `target/release/rustcams` still finds a repo
+`cameras.toml`); `~/.config/citadel-cctv/cameras.toml`; then the current
+directory if a file is there. Native Linux falls back to the XDG path. The
+config is re-read every 5 seconds if the file appears or changes.
 
 Views are auto-saved next to the config as `views.toml` whenever you change
 layout, drag cameras, or click a library camera into a selected cell. The last
@@ -193,7 +200,7 @@ name = "Front PTZ"
 url = "rtsp://admin:pass@192.0.2.10:554/Streaming/Channels/102"
 
 [[cameras]]
-id = "barracks"
+id = "front"
 name = "Front"
 url = "rtsp://admin:pass@192.0.2.10:554/Streaming/Channels/201"
 
@@ -228,8 +235,8 @@ rtsp://user:pass@NVR:{rtsp_port}/Streaming/Channels/{channelNo * 100 + streamTyp
 Listed cameras keep stable ids (for `views.toml`) by matching the host and lens
 in `url` (`/Streaming/Channels/101` → lens 1, `…/201` → lens 2), or an explicit
 `channel = N`. Unmatched discovered channels get slug ids from the NVR name.
-Fullscreen uses the camera `url` (rewritten to main stream). PTZ prefers the
-camera’s own ISAPI and falls back to the NVR if that fails.
+Fullscreen uses the camera `url` (rewritten to main stream). PTZ uses the NVR
+`PTZCtrlProxy` channel and falls back to the camera’s ISAPI if that fails.
 
 ## Run
 
@@ -247,7 +254,7 @@ cargo run --release
 | `RUSTCAMS_DECODE=sw` | Explicit software decode (same as default) |
 | Settings → **Write stutter-stats.log** | Optional hitch log next to `cameras.toml` (~2s). Off by default. |
 | `RUST_LOG=rustcams=debug` | Verbose module logs (links, stops, …) |
-| `GST_DEBUG=2` or `GST_DEBUG=rtsp*:3,videodecoder:3` | GStreamer-side RTSP/decode traces |
+| `GST_DEBUG` | GStreamer traces — **dev only**; can log RTSP userinfo. Leave unset in production. |
 
 ```bash
 RUSTCAMS_DEBUG=1 RUST_LOG=rustcams=info cargo run --release
@@ -277,16 +284,17 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | PTZ zoom | Sidebar `−` / `+`, or `=` / `+` / PageUp in; `-` / PageDown out |
 | PTZ focus | Sidebar **F−** / **F+**, DualShock L1/R1, or `,` / `.` |
 | PTZ home | Sidebar `H` |
-| PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol; click to toggle |
+| PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol (NVR `PTZCtrlProxy` `parkaction`); click to toggle |
 | PTZ tracking | Hidden for now (FieldDetection query slews some PTZs) |
 | PTZ (DualShock 4) | Left stick pan/tilt (D-pad too in camera fullscreen); L2/R2 or right-stick Y zoom; L1/R1 focus; D-pad on grid moves selection; Cross/X = select (camera fullscreen); Triangle = back from camera FS, or toggle OS fullscreen on the grid; Square = patrol 1 |
 
-With **`[nvr]`**, video still comes from the NVR. PTZ prefers each camera’s
-ISAPI (`http://{camera}:80/ISAPI/PTZCtrl/…`) and falls back to the NVR
-(`PTZCtrlProxy` / `PTZCtrl` / `ContentMgmt/PTZCtrl` + InputProxy channel).
-Digest is warmed when you **select** a PTZ camera. Speeds default to move 30 /
-zoom 25. Cameras whose id/name contain `ptz`, or that set `ptz = true`, get a
-PTZ target.
+With **`[nvr]`**, video still comes from the NVR. PTZ uses the NVR
+(`PUT /ISAPI/ContentMgmt/PTZCtrlProxy/channels/{channel}/continuous`) and
+falls back to camera ISAPI (`http://{camera}:80/ISAPI/PTZCtrl/…`) if the NVR
+route fails. While a stick or pad is held, the same pan/tilt/zoom XML is
+re-sent about every 400 ms so the dome keeps moving. Digest is warmed when
+you **select** a PTZ camera. Speeds default to move 30 / zoom 25. Cameras
+whose id/name contain `ptz`, or that set `ptz = true`, get a PTZ target.
 
 **Fullscreen** switches that camera to its **direct main-stream** URL (same `url`
 rewritten to `…01`) at higher decode width (1280). Pipelines always use
@@ -304,3 +312,15 @@ grid panes cap size/fps by layout. Exit fullscreen returns to the NVR substream 
 - In NVR mode, concurrent viewers hit **one** NVR. Prefer substreams and fewer slots; the NVR’s own session limits still apply.
 
 Pipeline details: [docs/streaming.md](docs/streaming.md).
+
+## Production (LAN kiosk)
+
+This is a local viewer, not a network service. Treat the workstation as part of the camera system.
+
+- Dedicated OS account; auto-lock the screen; do not run as Administrator/root.
+- Copy `cameras.example.toml` to `cameras.toml` (gitignored). On Linux the app writes that file as mode `600`; keep `~/.config/citadel-cctv/` at `700`. On Windows, restrict the folder to your user (`icacls`).
+- Autostart with an explicit path (`rustcams /path/to/cameras.toml`) so a `cameras.toml` a few directories above the binary cannot be picked up by accident.
+- Isolate cameras on their own VLAN. Pin `protocols = "tcp"` in `cameras.toml` if that L2 is not fully trusted (default UDP is sniffable).
+- Leave Debug overlay, stutter-stats.log, and `GST_DEBUG` off on the kiosk.
+- Before a release: `cargo audit`. GitHub Releases must not include a real `cameras.toml`.
+

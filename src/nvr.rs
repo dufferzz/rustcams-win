@@ -6,7 +6,6 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::time::Duration;
 use tracing::{debug, warn};
-use ureq::Agent;
 
 /// One digital (IP proxy) channel discovered on the NVR.
 #[derive(Debug, Clone)]
@@ -49,14 +48,11 @@ pub fn proxy_channel_has_ptz(name: &str, model: Option<&str>, src_input_port: Op
 
 /// Fetch InputProxy channels via ISAPI (HTTP digest auth).
 pub fn list_input_proxy_channels(nvr: &NvrConfig) -> Result<Vec<DiscoveredChannel>> {
+    crate::config::validate_host(&nvr.host)?;
     let path = "/ISAPI/ContentMgmt/InputProxy/channels";
     let url = format!("http://{}:{}{}", nvr.host, nvr.http_port, path);
 
-    let agent: Agent = Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let agent = crate::http_client::agent(Duration::from_secs(15));
 
     let challenge = agent
         .get(&url)

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::redact::{redact_secrets, redact_url};
+
 #[derive(Clone)]
 pub struct VideoFrame {
     pub width: u32,
@@ -235,7 +237,7 @@ impl StreamManager {
                     slot.counters = Arc::new(SlotCounters::default());
                     slot.rate_window = SlotRateWindow::fresh();
                     if let Err(err) = start_pipeline(slot, &self.seq) {
-                        *slot.error.lock() = Some(err.to_string());
+                        *slot.error.lock() = Some(redact_secrets(&err.to_string()));
                         schedule_reconnect(slot);
                     }
                 }
@@ -259,7 +261,7 @@ impl StreamManager {
                     failures: 0,
                 };
                 if let Err(err) = start_pipeline(&mut slot, &self.seq) {
-                    *slot.error.lock() = Some(err.to_string());
+                    *slot.error.lock() = Some(redact_secrets(&err.to_string()));
                     schedule_reconnect(&mut slot);
                 }
                 self.slots.insert(req.id.clone(), slot);
@@ -282,7 +284,7 @@ impl StreamManager {
                         "reconnecting stream"
                     );
                     if let Err(err) = start_pipeline(slot, &self.seq) {
-                        *slot.error.lock() = Some(err.to_string());
+                        *slot.error.lock() = Some(redact_secrets(&err.to_string()));
                         schedule_reconnect(slot);
                     }
                 }
@@ -297,11 +299,11 @@ impl StreamManager {
                         use gst::MessageView;
                         match msg.view() {
                             MessageView::Error(err) => {
-                                let text = format!(
+                                let text = redact_secrets(&format!(
                                     "{} ({})",
                                     err.error(),
                                     err.debug().unwrap_or_default()
-                                );
+                                ));
                                 // Log once per camera per cascade
                                 if !failed.contains(id) {
                                     warn!(camera = %id, error = %text, "pipeline error");
@@ -535,16 +537,6 @@ pub fn log_stream_debug_rows(rows: &[StreamDebugRow]) {
             "perf stream"
         );
     }
-}
-
-fn redact_url(url: &str) -> String {
-    // Hide credentials if present: rtsp://user:pass@host/...
-    if let Some(at) = url.find('@') {
-        if let Some(scheme) = url.find("://") {
-            return format!("{}://***@{}", &url[..scheme], &url[at + 1..]);
-        }
-    }
-    url.chars().take(96).collect()
 }
 
 fn short_error(text: &str) -> String {

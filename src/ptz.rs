@@ -17,6 +17,8 @@ use ureq::Agent;
 /// Match typical Hikvision PTZ defaults (move 30 / zoom 25).
 pub const PTZ_MOVE_SPEED: i32 = 30;
 pub const PTZ_ZOOM_SPEED: i32 = 25;
+/// Continuous PTZ expires in ~1s on Hikvision; re-PUT while stick/pad is held.
+const PTZ_HOLD_INTERVAL: Duration = Duration::from_millis(400);
 
 /// Continuous PTZ speeds for Hikvision ISAPI (`-100..=100`, 0 = stop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -206,13 +208,7 @@ pub struct PtzWorker {
 
 impl PtzWorker {
     pub fn spawn() -> Self {
-        let agent: Agent = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(3)))
-            .http_status_as_error(false)
-            .max_idle_connections_per_host(4)
-            .max_idle_age(Duration::from_secs(90))
-            .build()
-            .into();
+        let agent = crate::http_client::ptz_agent();
 
         let shared = Arc::new(Shared {
             state: Mutex::new(SharedState::default()),
@@ -295,7 +291,7 @@ impl PtzWorker {
         }
     }
 
-    /// Fetch `GET /ISAPI/PTZCtrl/channels/{ch}/parkaction` in the background.
+    /// Fetch `GET …/PTZCtrlProxy/channels/{ch}/parkaction` (NVR) in the background.
     pub fn fetch_park_action(&self, target: PtzTarget) {
         let key = Self::preset_key(&target);
         let gen = {
@@ -697,7 +693,8 @@ fn send(
             if !content_type.is_empty() {
                 req = req.header("Content-Type", content_type);
             }
-            req = req.header("Expect", "");
+            // Do not send Expect. An empty `Expect:` (or 100-continue) makes
+            // Hikvision NVRs answer HTTP 417. Curl omits it for small PUTs.
             if let Some(b) = body {
                 req.send(b)
             } else {
@@ -733,7 +730,16 @@ fn worker_loop(shared: Arc<Shared>) {
         let (desired, oneshot, gen) = {
             let mut g = shared.state.lock();
             while g.gen == seen_gen {
-                shared.cv.wait(&mut g);
+                let holding = g.desired.as_ref().is_some_and(|(_, v)| !v.is_stop());
+                if holding {
+                    if shared.cv.wait_for(&mut g, PTZ_HOLD_INTERVAL).timed_out()
+                        && g.gen == seen_gen
+                    {
+                        break;
+                    }
+                } else {
+                    shared.cv.wait(&mut g);
+                }
             }
             seen_gen = g.gen;
             let oneshot = g.oneshot.take();
@@ -767,9 +773,10 @@ fn worker_loop(shared: Arc<Shared>) {
             continue;
         };
 
-        if last_sent
-            .as_ref()
-            .is_some_and(|(t, v)| t == &target && *v == vec)
+        if vec.is_stop()
+            && last_sent
+                .as_ref()
+                .is_some_and(|(t, v)| t == &target && *v == vec)
         {
             continue;
         }
@@ -791,7 +798,9 @@ fn worker_loop(shared: Arc<Shared>) {
 
 fn ptz_roots(target: &PtzTarget) -> &'static [&'static str] {
     if target.via_nvr {
-        &["ContentMgmt/PTZCtrlProxy", "PTZCtrl", "ContentMgmt/PTZCtrl"]
+        // Exact path that moves a dome through the NVR. Other ISAPI roots can
+        // return HTTP 200 without slewing and would poison the shared route cache.
+        &["ContentMgmt/PTZCtrlProxy"]
     } else {
         &["PTZCtrl"]
     }
@@ -839,7 +848,19 @@ fn digest_ptz(
             body,
             content_type,
         ) {
-            Ok(v) => return Ok(v),
+            Ok(v) => {
+                if let Some(err) = isapi_status_error(&v.1) {
+                    shared.route.lock().remove(&key);
+                    warn!(
+                        host = %t.host,
+                        channel = t.channel,
+                        path,
+                        "PTZ route failed, trying alternatives: {err}"
+                    );
+                } else {
+                    return Ok(v);
+                }
+            }
             Err(err) => {
                 shared.route.lock().remove(&key);
                 warn!(
@@ -865,6 +886,10 @@ fn digest_ptz(
             content_type,
         ) {
             Ok(v) => {
+                if let Some(err) = isapi_status_error(&v.1) {
+                    last_err = Some(anyhow::anyhow!("{path}: {err}"));
+                    continue;
+                }
                 if shared.route_logged.lock().insert(key.clone()) {
                     info!(
                         host = %t.host,
@@ -897,9 +922,12 @@ fn stop_axes(shared: &Shared, target: &PtzTarget) {
 }
 
 fn send_vector(shared: &Shared, target: &PtzTarget, vec: PtzVector, last: Option<PtzVector>) {
-    let move_changed = last.map(|v| (v.pan, v.tilt, v.zoom)) != Some((vec.pan, vec.tilt, vec.zoom));
+    let move_now = (vec.pan, vec.tilt, vec.zoom);
+    let move_changed = last.map(|v| (v.pan, v.tilt, v.zoom)) != Some(move_now);
+    let holding_move = move_now != (0, 0, 0);
     let focus_changed = last.map(|v| v.focus) != Some(vec.focus);
-    if move_changed {
+    let holding_focus = vec.focus != 0;
+    if move_changed || holding_move {
         if let Err(err) = continuous_put(shared, target, vec) {
             warn!(
                 host = %target.host,
@@ -908,7 +936,7 @@ fn send_vector(shared: &Shared, target: &PtzTarget, vec: PtzVector, last: Option
             );
         }
     }
-    if focus_changed {
+    if focus_changed || holding_focus {
         if let Err(err) = focus_put(shared, target, vec.focus) {
             warn!(
                 host = %target.host,
@@ -920,25 +948,68 @@ fn send_vector(shared: &Shared, target: &PtzTarget, vec: PtzVector, last: Option
     }
 }
 
+fn continuous_body(vec: PtzVector) -> String {
+    // Hikvision web UI: compact PTZData, pan/tilt always, zoom only when used.
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><PTZData><pan>{}</pan><tilt>{}</tilt>",
+        vec.pan, vec.tilt
+    );
+    if vec.zoom != 0 {
+        xml.push_str(&format!("<zoom>{}</zoom>", vec.zoom));
+    }
+    xml.push_str("</PTZData>");
+    xml
+}
+
+/// Same Content-Type as the NVR web UI XHR for PTZ PUTs.
+const NVR_PTZ_PUT_TYPE: &str = "application/x-www-form-urlencoded; charset=UTF-8";
+
+fn ptz_proxy_request(
+    shared: &Shared,
+    target: &PtzTarget,
+    method: &str,
+    rel: &str,
+    body: Option<&[u8]>,
+    content_type: &str,
+) -> anyhow::Result<String> {
+    let mut last_err = None;
+    for t in std::iter::once(target).chain(target.fallback.as_deref()) {
+        for root in ptz_roots(t) {
+            let path = ptz_path(root, t.channel, rel);
+            match digest_request(
+                &shared.agent,
+                &shared.sessions,
+                method,
+                t,
+                &path,
+                body,
+                content_type,
+            ) {
+                Ok((_, resp)) => {
+                    if let Some(err) = isapi_status_error(&resp) {
+                        last_err = Some(anyhow::anyhow!("{path}: {err}"));
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{method} {rel} failed")))
+}
+
 fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow::Result<()> {
     // Official ISAPI continuous PTZ is pan/tilt/zoom only. Focus is a separate
     // `/System/Video/inputs/channels/{ch}/focus` FocusData PUT.
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <PTZData>\
-           <pan>{}</pan>\
-           <tilt>{}</tilt>\
-           <zoom>{}</zoom>\
-         </PTZData>",
-        vec.pan, vec.tilt, vec.zoom
-    );
-    digest_ptz(
+    let body = continuous_body(vec);
+    ptz_proxy_request(
         shared,
-        "PUT",
         target,
+        "PUT",
         "continuous",
         Some(body.as_bytes()),
-        "application/xml",
+        NVR_PTZ_PUT_TYPE,
     )?;
     Ok(())
 }
@@ -1070,8 +1141,24 @@ fn oneshot_put(shared: &Shared, target: &PtzTarget, suffix: &str) -> anyhow::Res
     Ok(())
 }
 
+const PARK_RELS: &[&str] = &["parkaction", "parkAction"];
+
+fn get_park_xml(shared: &Shared, target: &PtzTarget) -> anyhow::Result<(String, String)> {
+    let mut last_err = None;
+    for rel in PARK_RELS {
+        match ptz_proxy_request(shared, target, "GET", rel, None, "") {
+            Ok(body) => match parse_park_action(&body) {
+                Ok(_) => return Ok(((*rel).to_string(), body)),
+                Err(err) => last_err = Some(err),
+            },
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("parkaction not available")))
+}
+
 fn get_park_action(shared: &Shared, target: &PtzTarget) -> anyhow::Result<ParkAction> {
-    let (_status, body) = digest_ptz(shared, "GET", target, "parkaction", None, "")?;
+    let (_rel, body) = get_park_xml(shared, target)?;
     parse_park_action(&body)
 }
 
@@ -1080,17 +1167,18 @@ fn set_park_enabled(
     target: &PtzTarget,
     enabled: bool,
 ) -> anyhow::Result<ParkAction> {
-    let (_status, body) = digest_ptz(shared, "GET", target, "parkaction", None, "")?;
+    let (rel, body) = get_park_xml(shared, target)?;
     let xml = rewrite_park_enabled(&body, enabled)?;
-    digest_ptz(
+    ptz_proxy_request(
         shared,
-        "PUT",
         target,
-        "parkaction",
+        "PUT",
+        &rel,
         Some(xml.as_bytes()),
-        "application/xml",
+        NVR_PTZ_PUT_TYPE,
     )?;
-    get_park_action(shared, target)
+    let body = ptz_proxy_request(shared, target, "GET", &rel, None, "")?;
+    parse_park_action(&body)
 }
 
 fn parse_park_action(xml: &str) -> anyhow::Result<ParkAction> {
@@ -1570,12 +1658,13 @@ fn md5_hex(s: &str) -> String {
 }
 
 fn random_cnonce() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos:x}")
+    let mut buf = [0u8; 16];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter().fold(String::with_capacity(32), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]
@@ -1616,6 +1705,48 @@ mod tests {
         assert!(xml.contains("<FocusData>"));
         assert!(xml.contains("<focus>-25</focus>"));
         assert!(!xml.contains("PTZData"));
+    }
+
+    #[test]
+    fn continuous_xml_matches_webui_pan_tilt() {
+        let xml = continuous_body(PtzVector {
+            pan: -60,
+            tilt: 0,
+            zoom: 0,
+            focus: 0,
+        });
+        assert_eq!(
+            xml,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><PTZData><pan>-60</pan><tilt>0</tilt></PTZData>"
+        );
+        assert_eq!(xml.len(), 85);
+    }
+
+    #[test]
+    fn continuous_xml_includes_zoom_when_nonzero() {
+        let xml = continuous_body(PtzVector {
+            pan: 0,
+            tilt: 0,
+            zoom: 25,
+            focus: 0,
+        });
+        assert!(xml.contains("<zoom>25</zoom>"));
+    }
+
+    #[test]
+    fn nvr_park_path_matches_isapi_proxy() {
+        assert_eq!(
+            ptz_path("ContentMgmt/PTZCtrlProxy", 3, "parkaction"),
+            "/ISAPI/ContentMgmt/PTZCtrlProxy/channels/3/parkaction"
+        );
+    }
+
+    #[test]
+    fn nvr_continuous_path_matches_isapi_proxy() {
+        assert_eq!(
+            ptz_path("ContentMgmt/PTZCtrlProxy", 17, "continuous"),
+            "/ISAPI/ContentMgmt/PTZCtrlProxy/channels/17/continuous"
+        );
     }
 
     #[test]

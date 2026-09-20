@@ -79,7 +79,7 @@ Each `[[cameras]]` entry supplies `url = "rtsp://..."`. Resolve produces a `Came
    Stream digits: `1` = main, `2` = sub, `3` = third (`nvr::build_rtsp_url`).
 
 4. Fullscreen may switch to `direct_url` (camera LAN main stream) when available.
-5. PTZ prefers camera `http://{cam}:80/ISAPI/PTZCtrl/…`, then NVR `PTZCtrlProxy` / `PTZCtrl` / `ContentMgmt/PTZCtrl` with the InputProxy channel id. Manual focus is `PUT /ISAPI/System/Video/inputs/channels/{ch}/focus` (`FocusData`), not the continuous PTZ XML.
+5. PTZ in NVR mode `PUT`s `/ISAPI/ContentMgmt/PTZCtrlProxy/channels/{InputProxy id}/continuous` (same as Hikvision’s NVR proxy). Park On/Off uses `GET`/`PUT` `…/parkaction` on that same proxy (camera `PTZCtrl` only if the proxy call fails). Direct mode uses camera `http://{cam}:80/ISAPI/PTZCtrl/…`. The worker re-sends the continuous XML about every 400 ms while the stick/pad is held (Hikvision expires a move in ~1 s). Manual focus is `PUT /ISAPI/System/Video/inputs/channels/{ch}/focus` (`FocusData`), not the continuous PTZ XML.
 
 ### Stream digit rewriting
 
@@ -289,7 +289,7 @@ start_pipeline fails
 
 **Pause:** optional `stop_all` + clear textures when unfocused/minimized; restart on focus.
 
-Errors are shortened for the UI (`short_error` maps common RTSP/auth failures). Credentials are stripped from logs via `redact_url`.
+Errors are shortened for the UI (`short_error` maps common RTSP/auth failures). Credentials are stripped from logs via `redact_url` / `redact_secrets`.
 
 ---
 
@@ -354,7 +354,7 @@ ViewerApp (UI thread)
 |----------|--------|
 | `RUSTCAMS_DECODE` | `hw` = force D3D11/MF/NV/V4L2; default / `sw` = libav |
 | `RUSTCAMS_DEBUG` | Perf overlay on at start; periodic `perf *` logs |
-| `RUST_LOG`, `GST_DEBUG` | Module / GStreamer traces |
+| `RUST_LOG`, `GST_DEBUG` | Module / GStreamer traces. `GST_DEBUG` can include RTSP userinfo — do not enable on a kiosk. |
 | Bundled GStreamer | Exe-relative tree on Windows packages |
 
 ---

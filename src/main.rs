@@ -3,18 +3,20 @@
 mod app;
 mod config;
 mod gate;
+mod http_client;
 mod gst_env;
 mod gst_link;
 mod layout;
 mod log_buffer;
 mod nvr;
 mod ptz;
+mod redact;
 mod stats;
 mod stream;
 mod views;
 
 use app::ViewerApp;
-use config::{app_screen_title, default_cameras_toml, AppConfig, ResolvedConfig, LINUX_CONFIG_DIR};
+use config::{app_screen_title, default_cameras_toml, AppConfig, LINUX_CONFIG_DIR};
 use eframe::egui;
 use log_buffer::LogBuffer;
 use std::path::PathBuf;
@@ -62,56 +64,33 @@ fn main() -> eframe::Result<()> {
 
     if std::env::var_os("RUSTCAMS_DEBUG").is_some() {
         tracing::info!(
-            "RUSTCAMS_DEBUG set — perf overlay on; summaries every 5s. Tip: RUST_LOG=rustcams=debug GST_DEBUG=2"
+            "RUSTCAMS_DEBUG set — perf overlay on; summaries every 5s. Tip: RUST_LOG=rustcams=debug (avoid GST_DEBUG; it can log RTSP credentials)"
         );
     }
 
+    let config_from_cli = std::env::args().nth(1).is_some();
     let config_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(default_cameras_toml);
-    tracing::info!(path = %config_path.display(), "config path");
+    let config_path = config::absolute_path(config_path);
+    match std::env::current_dir() {
+        Ok(cwd) => tracing::info!(
+            cwd = %cwd.display(),
+            path = %config_path.display(),
+            from_cli = config_from_cli,
+            exists = config_path.is_file(),
+            "config path"
+        ),
+        Err(err) => tracing::info!(
+            path = %config_path.display(),
+            from_cli = config_from_cli,
+            exists = config_path.is_file(),
+            "config path (cwd unavailable: {err})"
+        ),
+    }
 
-    let (raw_cfg, cfg, config_warning) = match AppConfig::read(&config_path) {
-        Ok(raw) => match raw.clone().resolve() {
-            Ok(resolved) => {
-                let warning = if resolved.cameras.is_empty() {
-                    Some(format!(
-                        "No cameras in {} — edit cameras.toml or Settings → NVR.",
-                        config_path.display()
-                    ))
-                } else {
-                    None
-                };
-                (raw, resolved, warning)
-            }
-            Err(err) => {
-                tracing::warn!("failed to resolve {}: {err:#}", config_path.display());
-                (
-                    raw,
-                    ResolvedConfig::default(),
-                    Some(format!(
-                        "Config needs setup ({}): {err:#}\nFix cameras.toml or Settings → NVR.",
-                        config_path.display()
-                    )),
-                )
-            }
-        },
-        Err(err) => {
-            tracing::warn!(
-                "failed to load {}: {err:#} — starting without cameras",
-                config_path.display()
-            );
-            (
-                AppConfig::default(),
-                ResolvedConfig::default(),
-                Some(format!(
-                    "Config needs setup ({}): {err:#}\nEdit cameras.toml to configure cameras.",
-                    config_path.display()
-                )),
-            )
-        }
-    };
+    let (raw_cfg, cfg, config_warning) = AppConfig::read_for_app(&config_path);
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
@@ -124,6 +103,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        persist_window: false,
         ..Default::default()
     };
 
@@ -132,7 +112,14 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             app::icons::install(&cc.egui_ctx);
-            match ViewerApp::new(raw_cfg, cfg, config_path, config_warning, log_buffer) {
+            match ViewerApp::new(
+                raw_cfg,
+                cfg,
+                config_path,
+                config_from_cli,
+                config_warning,
+                log_buffer,
+            ) {
                 Ok(app) => Ok(Box::new(app)),
                 Err(err) => Err(err.into()),
             }

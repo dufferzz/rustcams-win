@@ -4,7 +4,9 @@ mod settings;
 mod ui;
 
 use self::settings::{CANVAS_BG, PANEL_BG, STATUS_BG};
-use crate::config::{AppConfig, CameraConfig, ResolvedConfig, StreamType};
+use crate::config::{
+    absolute_path, default_cameras_toml, AppConfig, CameraConfig, ResolvedConfig, StreamType,
+};
 use crate::layout::{FitMode, Layout};
 use crate::log_buffer::LogBuffer;
 use crate::nvr::rewrite_stream_digit;
@@ -18,9 +20,9 @@ use gilrs::Gilrs;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, warn};
 
 #[derive(Clone, Debug)]
@@ -144,10 +146,29 @@ impl UiPerf {
     }
 }
 
+struct NvrDiscoverJob {
+    gen: u64,
+    resolved: ResolvedConfig,
+    warning: Option<String>,
+    retry: bool,
+}
+
 pub struct ViewerApp {
+    /// Shown when config is missing / empty / failed to load.
     /// Shown when config is missing / empty / failed to load.
     config_warning: Option<String>,
     config_path: PathBuf,
+    /// True when the user passed `cameras.toml` as argv[1] (do not rediscover).
+    config_from_cli: bool,
+    last_config_poll: Instant,
+    config_mtime: Option<SystemTime>,
+    /// Keep probing ISAPI until the NVR is reachable (login vs LAN race).
+    nvr_retry: bool,
+    nvr_job_gen: Arc<AtomicU64>,
+    nvr_inflight: Arc<AtomicBool>,
+    pending_nvr: Arc<Mutex<Option<NvrDiscoverJob>>>,
+    /// Keep sending Maximized after map — XFCE session restore can undo the create hint.
+    maximize_until: Instant,
     app_config: AppConfig,
     nvr_enabled: bool,
     nvr_draft: crate::config::NvrConfig,
@@ -250,6 +271,7 @@ impl ViewerApp {
         app_config: AppConfig,
         cfg: ResolvedConfig,
         config_path: PathBuf,
+        config_from_cli: bool,
         config_warning: Option<String>,
         log_buffer: LogBuffer,
     ) -> anyhow::Result<Self> {
@@ -326,9 +348,20 @@ impl ViewerApp {
         }
 
         let gate_draft = app_config.gate.clone().unwrap_or_default();
-        let app = Self {
+        let config_mtime = std::fs::metadata(&config_path)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut app = Self {
             config_warning,
             config_path: config_path.clone(),
+            config_from_cli,
+            last_config_poll: Instant::now(),
+            config_mtime,
+            nvr_retry: app_config.nvr_discovery_enabled(),
+            nvr_job_gen: Arc::new(AtomicU64::new(0)),
+            nvr_inflight: Arc::new(AtomicBool::new(false)),
+            pending_nvr: Arc::new(Mutex::new(None)),
+            maximize_until: Instant::now() + Duration::from_secs(3),
             app_config,
             nvr_enabled,
             nvr_draft,
@@ -408,7 +441,229 @@ impl ViewerApp {
             log_view_lines: Vec::new(),
         };
         app.save_ui_prefs();
+        if app.nvr_retry {
+            app.kick_nvr_resolve();
+        }
         Ok(app)
+    }
+
+    fn note_config_mtime(&mut self) {
+        self.config_mtime = std::fs::metadata(&self.config_path)
+            .and_then(|m| m.modified())
+            .ok();
+    }
+
+    fn retarget_config_path(&mut self, path: PathBuf) {
+        if path == self.config_path {
+            return;
+        }
+        info!(
+            from = %self.config_path.display(),
+            to = %path.display(),
+            "using cameras.toml"
+        );
+        self.config_path = path;
+        let parent = self
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.stutter_log_path = parent.join("stutter-stats.log");
+        self.ui_prefs_path = settings::UiPrefs::path_next_to(&self.config_path);
+        self.views.path = parent.join("views.toml");
+    }
+
+    fn apply_loaded_config(
+        &mut self,
+        raw: AppConfig,
+        resolved: ResolvedConfig,
+        warning: Option<String>,
+    ) {
+        let cameras_changed = self.cameras != resolved.cameras;
+        self.app_config = raw;
+        if !self.show_settings {
+            let (nvr_enabled, nvr_draft, nvr_protocols) = settings::nvr_edit_state(&self.app_config);
+            self.nvr_enabled = nvr_enabled;
+            self.nvr_draft = nvr_draft;
+            self.nvr_protocols = nvr_protocols;
+            self.gate_draft = self.app_config.gate.clone().unwrap_or_default();
+        }
+        self.app_name = crate::config::app_brand_name(&resolved.viewer.app_name);
+        self.pause_when_unfocused = resolved.viewer.pause_when_unfocused;
+        if cameras_changed {
+            self.apply_resolved_cameras(resolved.cameras);
+            let ids: Vec<String> = self.cameras.iter().map(|c| c.id.clone()).collect();
+            let all_empty = self
+                .views
+                .views
+                .iter()
+                .all(|v| v.slots.iter().all(Option::is_none));
+            if all_empty && !ids.is_empty() {
+                if let Some(view) = self.views.views.first_mut() {
+                    view.fill_from_cameras(&ids);
+                }
+                self.persist_views();
+            }
+        }
+        self.config_warning = warning;
+        self.note_config_mtime();
+    }
+
+    pub(super) fn kick_nvr_resolve(&mut self) {
+        if !self.app_config.nvr_discovery_enabled() {
+            self.nvr_retry = false;
+            return;
+        }
+        if self.nvr_inflight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let gen = self.nvr_job_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let raw = self.app_config.clone();
+        let slot = self.pending_nvr.clone();
+        let inflight = self.nvr_inflight.clone();
+        std::thread::spawn(move || {
+            let (resolved, warning, retry) = match raw.clone().resolve() {
+                Ok(resolved) => {
+                    info!(
+                        cameras = resolved.cameras.len(),
+                        host = raw.nvr_host_label(),
+                        "NVR camera list ready"
+                    );
+                    (resolved, None, false)
+                }
+                Err(err) => {
+                    warn!(
+                        host = raw.nvr_host_label(),
+                        "NVR discovery failed: {err:#}"
+                    );
+                    let fallback = raw.resolve_direct_fallback();
+                    let warning = Some(raw.waiting_for_nvr_message(Some(&format!("{err:#}"))));
+                    (fallback, warning, true)
+                }
+            };
+            *slot.lock() = Some(NvrDiscoverJob {
+                gen,
+                resolved,
+                warning,
+                retry,
+            });
+            inflight.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn apply_pending_nvr(&mut self) {
+        let job = self.pending_nvr.lock().take();
+        let Some(job) = job else {
+            return;
+        };
+        if job.gen != self.nvr_job_gen.load(Ordering::SeqCst) {
+            return;
+        }
+        self.nvr_retry = job.retry;
+        self.apply_loaded_config(self.app_config.clone(), job.resolved, job.warning);
+    }
+
+    fn poll_config_reload(&mut self) {
+        self.apply_pending_nvr();
+
+        if self.last_config_poll.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_config_poll = Instant::now();
+        if self.show_settings {
+            return;
+        }
+
+        if !self.config_from_cli && !self.config_path.is_file() {
+            let discovered = absolute_path(default_cameras_toml());
+            if discovered != self.config_path {
+                self.retarget_config_path(discovered);
+            }
+        }
+
+        let mtime = std::fs::metadata(&self.config_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime != self.config_mtime {
+            if mtime.is_none() {
+                self.config_mtime = None;
+                return;
+            }
+            match AppConfig::read(&self.config_path) {
+                Ok(raw) => {
+                    self.app_config = raw;
+                    self.note_config_mtime();
+                    if !self.show_settings {
+                        let (nvr_enabled, nvr_draft, nvr_protocols) =
+                            settings::nvr_edit_state(&self.app_config);
+                        self.nvr_enabled = nvr_enabled;
+                        self.nvr_draft = nvr_draft;
+                        self.nvr_protocols = nvr_protocols;
+                        self.gate_draft = self.app_config.gate.clone().unwrap_or_default();
+                    }
+                    self.app_name =
+                        crate::config::app_brand_name(&self.app_config.viewer.app_name);
+                    self.pause_when_unfocused = self.app_config.viewer.pause_when_unfocused;
+                    if self.app_config.nvr_discovery_enabled() {
+                        let fallback = self.app_config.resolve_direct_fallback();
+                        if self.cameras != fallback.cameras {
+                            self.apply_resolved_cameras(fallback.cameras);
+                        }
+                        if self.cameras.is_empty() {
+                            self.config_warning =
+                                Some(self.app_config.waiting_for_nvr_message(None));
+                        }
+                        self.nvr_job_gen.fetch_add(1, Ordering::SeqCst);
+                        self.nvr_retry = true;
+                        self.kick_nvr_resolve();
+                    } else {
+                        self.nvr_retry = false;
+                        match self.app_config.clone().resolve() {
+                            Ok(resolved) => {
+                                let warning = if resolved.cameras.is_empty() {
+                                    Some(format!(
+                                        "No cameras in {} — edit cameras.toml or Settings → NVR.",
+                                        self.config_path.display()
+                                    ))
+                                } else {
+                                    None
+                                };
+                                self.apply_loaded_config(
+                                    self.app_config.clone(),
+                                    resolved,
+                                    warning,
+                                );
+                            }
+                            Err(err) => {
+                                self.config_warning = Some(format!(
+                                    "Config needs setup ({}): {err:#}\nFix cameras.toml or Settings → NVR.",
+                                    self.config_path.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.config_mtime = mtime;
+                    self.config_warning = Some(format!(
+                        "Config needs setup ({}): {err:#}\nEdit cameras.toml to configure cameras.",
+                        self.config_path.display()
+                    ));
+                }
+            }
+            return;
+        }
+
+        if self.nvr_retry {
+            self.kick_nvr_resolve();
+        }
+    }
+
+    fn ensure_maximized_on_launch(&mut self, ctx: &egui::Context) {
+        if self.window_fullscreen || Instant::now() >= self.maximize_until {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
     }
 
     pub(super) fn apply_resolved_cameras(&mut self, cameras: Vec<CameraConfig>) {
@@ -1007,6 +1262,8 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui_perf.tick_frame();
+        self.ensure_maximized_on_launch(ctx);
+        self.poll_config_reload();
         self.sync_window_fullscreen(ctx);
         self.apply_accent_visuals(ctx);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(

@@ -1,6 +1,6 @@
 [package]
 name = "rustcams"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Performant multi-camera RTSP CCTV viewer"
 license = "MIT"
@@ -12,6 +12,7 @@ FileDescription = "Citadel CCTV — multi-camera RTSP viewer"
 [dependencies]
 anyhow = "1"
 digest_auth = "0.3"
+getrandom = "0.2"
 eframe = { version = "0.31", default-features = true, features = ["default_fonts", "glow"] }
 egui = "0.31"
 egui-phosphor = { version = "0.9", default-features = false, features = ["regular"] }

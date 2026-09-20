@@ -174,10 +174,7 @@ impl ViewStore {
             views: self.views.iter().map(View::to_saved).collect(),
         };
         let text = toml::to_string_pretty(&file).context("serialize views")?;
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        fs::write(&self.path, text).with_context(|| format!("write {}", self.path.display()))?;
+        crate::config::write_secret_file(&self.path, text.as_bytes())?;
         self.dirty = false;
         Ok(())
     }

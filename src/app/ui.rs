@@ -618,7 +618,7 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             if ui
                 .small_button(icons::ARROW_CLOCKWISE)
-                .on_hover_text("Refresh park action from camera")
+                .on_hover_text("Refresh park action")
                 .clicked()
             {
                 self.ptz.refresh_park_action(target.clone());

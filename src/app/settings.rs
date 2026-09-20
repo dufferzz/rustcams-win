@@ -155,10 +155,7 @@ impl UiPrefs {
 
     pub fn save(&self, path: &Path) {
         if let Ok(text) = toml::to_string_pretty(self) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(path, text);
+            let _ = crate::config::write_secret_file(path, text.as_bytes());
         }
     }
 
@@ -254,6 +251,10 @@ impl ViewerApp {
             }
             self.app_config.nvr = None;
         } else {
+            if let Err(err) = crate::config::validate_host(&nvr.host) {
+                self.nvr_status = Some(format!("Invalid NVR host: {err:#}"));
+                return;
+            }
             let proto = self.nvr_protocols.trim();
             nvr.protocols = if proto.is_empty() || proto == "default" {
                 None
@@ -269,6 +270,7 @@ impl ViewerApp {
             warn!("failed to save cameras.toml: {err:#}");
             return;
         }
+        self.note_config_mtime();
 
         match self.app_config.clone().resolve() {
             Ok(resolved) => {
@@ -284,6 +286,9 @@ impl ViewerApp {
                     self.config_warning = None;
                 }
                 self.nvr_status = Some(format!("Saved. {n} camera(s) resolved."));
+                self.nvr_retry = false;
+                self.nvr_job_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 info!(
                     cameras = n,
                     nvr = self.nvr_enabled,
@@ -293,6 +298,8 @@ impl ViewerApp {
             Err(err) => {
                 self.nvr_status = Some(format!("Saved file, but resolve failed: {err:#}"));
                 warn!("resolve after NVR save failed: {err:#}");
+                self.nvr_retry = true;
+                self.kick_nvr_resolve();
             }
         }
     }
@@ -314,6 +321,10 @@ impl ViewerApp {
             *self.gate_status.lock() = Some("Gate username is empty — not saved.".into());
             return;
         }
+        if let Err(err) = crate::config::validate_host(&self.gate_draft.host) {
+            *self.gate_status.lock() = Some(format!("Invalid gate host: {err:#}"));
+            return;
+        }
         self.gate_draft.door_id = "1".into();
         self.gate_draft.action = "open".into();
         self.sync_gate_into_app_config();
@@ -322,6 +333,7 @@ impl ViewerApp {
             warn!("failed to save cameras.toml: {err:#}");
             return;
         }
+        self.note_config_mtime();
         *self.gate_status.lock() = Some("Gate settings saved.".into());
         info!(host = %self.gate_draft.host, "saved gate settings");
     }

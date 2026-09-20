@@ -3031,13 +3031,14 @@ dependencies = [
 
 [[package]]
 name = "rustcams"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "digest_auth",
  "eframe",
  "egui",
  "egui-phosphor",
+ "getrandom 0.2.17",
  "gilrs",
  "gstreamer",
  "gstreamer-app",

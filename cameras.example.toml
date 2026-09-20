@@ -1,8 +1,9 @@
+# Copy to cameras.toml and edit. cameras.toml is gitignored — do not commit it.
 # Direct RTSP (no NVR) — leave [nvr] out.
 [[cameras]]
 id = "example_cam"
 name = "Example Camera"
-url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
+url = "rtsp://user:password@192.0.2.10:554/Streaming/Channels/102"
 
 # --- OR discover / stream via Hikvision NVR ---
 # [nvr]
@@ -20,10 +21,10 @@ url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
 #
 # Listed cameras keep stable ids for views.toml. Match by host + lens in url
 # (/Streaming/Channels/101 → lens 1, …/201 → lens 2), or set channel = N.
-# Grid panes use the NVR; url is for fullscreen direct + PTZ credentials.
+# Grid panes use the NVR; url is for fullscreen direct. PTZ uses NVR ISAPI.
 #
 # [[cameras]]
-# id = "barracks"
+# id = "front"
 # name = "Front"
 # url = "rtsp://admin:camera-password@192.0.2.10:554/Streaming/Channels/201"
 #
@@ -32,9 +33,9 @@ url = "rtsp://user:password@192.168.x.x:554/Streaming/Channels/102"
 # name = "Front PTZ"
 # url = "rtsp://admin:camera-password@192.0.2.10:554/Streaming/Channels/102"
 #
-# PTZ is on when id/name contains "ptz", or set ptz = true (e.g. Yard).
+# PTZ is on when id/name contains "ptz", or set ptz = true.
 # [[cameras]]
-# id = "moat_corner"
+# id = "yard"
 # name = "Yard"
 # url = "rtsp://admin:camera-password@203.0.113.50:554/Streaming/Channels/102"
 # ptz = true
@@ -47,7 +48,7 @@ pause_when_unfocused = true
 
 # Hikvision Access Control (toolbar Gates / DualShock L1, then confirm).
 # [gate]
-# host = "192.0.2.80"
+# host = "203.0.113.80"
 # http_port = 80
 # username = "admin"
 # password = "changeme"
