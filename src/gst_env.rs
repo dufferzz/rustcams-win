@@ -191,8 +191,14 @@ pub(crate) fn log_decoder_availability() {
         "d3d11convert",
         "d3d11scale",
         "d3d11download",
+        "nvcudah264dec",
+        "nvcudah265dec",
+        "cudaconvert",
+        "cudascale",
+        "cudadownload",
     ];
     let mut d3d11_dec = false;
+    let mut nv_dec = false;
     let mut v4l2_dec = false;
     for name in NAMES {
         match gst::ElementFactory::find(name) {
@@ -200,6 +206,9 @@ pub(crate) fn log_decoder_availability() {
                 debug!(element = name, rank = ?f.rank(), "decoder available");
                 if *name == "d3d11h264dec" || *name == "d3d11h265dec" {
                     d3d11_dec = true;
+                }
+                if *name == "nvh264dec" || *name == "nvh265dec" {
+                    nv_dec = true;
                 }
                 if name.starts_with("v4l2") {
                     v4l2_dec = true;
@@ -211,9 +220,21 @@ pub(crate) fn log_decoder_availability() {
     if d3d11_dec {
         info!("D3D11/DXVA hardware decoders present (Intel/AMD/NVIDIA via Direct3D11)");
     }
+    if nv_dec {
+        info!("NVIDIA NVDEC decoders present (nvh264dec / nvh265dec)");
+    }
     if v4l2_dec {
         info!("V4L2 hardware decoders present (Raspberry Pi / Linux stateless or stateful)");
     }
+}
+
+pub(crate) fn nvdec_available() -> bool {
+    gst::ElementFactory::find("nvh264dec").is_some()
+        || gst::ElementFactory::find("nvcudah264dec").is_some()
+}
+
+pub(crate) fn cuda_postproc_available() -> bool {
+    gst::ElementFactory::find("cudadownload").is_some()
 }
 
 pub(crate) fn d3d11_postproc_available() -> bool {

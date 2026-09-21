@@ -3,8 +3,7 @@ use super::{DragPayload, SidebarControls, UpdateBanner, ViewerApp};
 use crate::config::CameraConfig;
 use crate::layout::{FitMode, Layout};
 use crate::ptz::{
-    ParkAction, ParkActionStatus, PresetListStatus, PtzVector, TrackingStatus, PTZ_MOVE_SPEED,
-    PTZ_ZOOM_SPEED,
+    ParkAction, ParkActionStatus, PresetListStatus, PtzVector, PTZ_MOVE_SPEED, PTZ_ZOOM_SPEED,
 };
 use crate::stream::log_stream_debug_rows;
 use crate::views::View;
@@ -18,11 +17,14 @@ use super::settings::{CANVAS_BG, PANEL_BG};
 impl ViewerApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
         ui.horizontal(|ui| {
-            if is_aux {
-                ui.heading("Screen 2");
-            } else {
-                ui.heading(&self.app_name);
-            }
+            ui.heading(crate::config::app_screen_title(
+                &self.app_name,
+                if is_aux {
+                    Some(2)
+                } else {
+                    self.aux_open.then_some(1)
+                },
+            ));
             ui.separator();
 
             let view_names: Vec<String> = self.views.views.iter().map(|v| v.name.clone()).collect();
@@ -606,8 +608,6 @@ impl ViewerApp {
 
         ui.add_space(8.0);
         self.sidebar_park_action(ui);
-        // Tracking (FieldDetection) — hidden for now; querying it slews some PTZs.
-        // self.sidebar_tracking(ui);
     }
 
     fn sidebar_park_action(&mut self, ui: &mut egui::Ui) {
@@ -687,87 +687,6 @@ impl ViewerApp {
                     .color(Color32::from_rgb(140, 150, 160)),
             );
         }
-    }
-
-    #[allow(dead_code)]
-    fn sidebar_tracking(&mut self, ui: &mut egui::Ui) {
-        let Some(target) = self.active_ptz_target() else {
-            return;
-        };
-
-        ui.horizontal(|ui| {
-            if ui
-                .small_button(icons::ARROW_CLOCKWISE)
-                .on_hover_text("Refresh intrusion detection from camera")
-                .clicked()
-            {
-                self.ptz.refresh_tracking(target.clone());
-            }
-
-            match self.ptz.tracking_status(&target) {
-                TrackingStatus::Idle => {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Tracking ?")
-                                    .color(Color32::from_rgb(180, 180, 180)),
-                            )
-                            .min_size(Vec2::new(ui.available_width(), 0.0)),
-                        )
-                        .on_hover_text(
-                            "Click to read intrusion detection from the camera.\nSome PTZs slew when this is queried.",
-                        )
-                        .clicked()
-                    {
-                        self.ptz.fetch_tracking(target.clone());
-                    }
-                }
-                TrackingStatus::Loading => {
-                    ui.ctx().request_repaint();
-                    ui.label(
-                        egui::RichText::new("Tracking…")
-                            .small()
-                            .color(Color32::from_rgb(160, 160, 160)),
-                    );
-                }
-                TrackingStatus::Error(err) => {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Tracking ?")
-                                    .color(Color32::from_rgb(255, 160, 120)),
-                            )
-                            .min_size(Vec2::new(ui.available_width(), 0.0)),
-                        )
-                        .on_hover_text(err)
-                        .clicked()
-                    {
-                        self.ptz.refresh_tracking(target.clone());
-                    }
-                }
-                TrackingStatus::Ready(tracking) => {
-                    let (label, color) = if tracking.enabled {
-                        ("Tracking On", Color32::from_rgb(140, 210, 150))
-                    } else {
-                        ("Tracking Off", Color32::from_rgb(180, 180, 180))
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new(label).color(color))
-                                .min_size(Vec2::new(ui.available_width(), 0.0)),
-                        )
-                        .on_hover_text(format!(
-                            "Intrusion detection\nClick to {}",
-                            if tracking.enabled { "disable" } else { "enable" }
-                        ))
-                        .clicked()
-                    {
-                        self.ptz
-                            .set_tracking_enabled(target.clone(), !tracking.enabled);
-                    }
-                }
-            }
-        });
     }
 
     fn sidebar_presets_list(&mut self, ui: &mut egui::Ui) {
@@ -1321,8 +1240,8 @@ impl ViewerApp {
             if let Some(id) = cam_id {
                 if let Some(cam) = self.camera_by_id(&id).cloned() {
                     let screen_focused = ui.ctx().input(|i| i.focused);
-                    let selected =
-                        screen_focused && self.sidebar_ptz_cam.as_deref() == Some(cam.id.as_str());
+                    let selected = self.show_ptz_selection_here(is_aux, screen_focused)
+                        && self.sidebar_ptz_cam.as_deref() == Some(cam.id.as_str());
                     let response =
                         ui.interact(full, Id::new(("fs", view_idx, is_aux)), Sense::click());
                     self.paint_cell_contents(ui, &cam, full, response.hovered(), selected);
@@ -1350,12 +1269,13 @@ impl ViewerApp {
     pub(super) fn show_aux_window(&mut self, ctx: &egui::Context) {
         if !self.aux_open {
             self.aux_focused = false;
+            self.last_ptz_screen_aux = false;
             self.aux_pointer_down = false;
             return;
         }
         self.clamp_aux_view();
         let mut close = false;
-        let title = crate::config::app_screen_title(&self.app_name, 2);
+        let title = crate::config::app_screen_title(&self.app_name, Some(2));
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("citadel_aux_screen"),
             egui::ViewportBuilder::default()
@@ -1367,6 +1287,9 @@ impl ViewerApp {
                 self.apply_accent_visuals(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
                 self.aux_focused = ctx.input(|i| i.focused);
+                if self.aux_focused {
+                    self.last_ptz_screen_aux = true;
+                }
                 self.aux_pointer_down = ctx.input(|i| i.pointer.primary_down());
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close = true;
@@ -1439,6 +1362,7 @@ impl ViewerApp {
         if close {
             self.aux_open = false;
             self.aux_focused = false;
+            self.last_ptz_screen_aux = false;
         }
     }
 
@@ -1501,7 +1425,8 @@ impl ViewerApp {
             }
 
             if let Some(cam_id) = slot {
-                let selected = screen_focused && selected_id.as_deref() == Some(cam_id.as_str());
+                let selected = self.show_ptz_selection_here(is_aux, screen_focused)
+                    && selected_id.as_deref() == Some(cam_id.as_str());
                 let has_ptz = self.camera_by_id(cam_id).is_some_and(|c| c.ptz.is_some());
                 if let Some(cam) = self.camera_by_id(cam_id) {
                     self.paint_cell_contents(ui, cam, cell, response.hovered(), selected);

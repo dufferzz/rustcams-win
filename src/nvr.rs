@@ -15,35 +15,6 @@ pub struct DiscoveredChannel {
     pub source_ip: Option<String>,
     /// Camera-side input port when present (multi-lens devices).
     pub src_input_port: Option<u32>,
-    /// Hikvision model from InputProxy (e.g. DS-2DE5425IW-AE).
-    pub model: Option<String>,
-}
-
-impl DiscoveredChannel {
-    /// IP PTZ on this NVR channel (speed-dome / TandemVu lens 1 / name contains ptz).
-    pub fn has_ptz(&self) -> bool {
-        proxy_channel_has_ptz(&self.name, self.model.as_deref(), self.src_input_port)
-    }
-}
-
-/// Hikvision IP PTZ models: DS-2DE / DS-2DF / DS-2DY / DS-2SE (TandemVu, lens 1).
-pub fn proxy_channel_has_ptz(name: &str, model: Option<&str>, src_input_port: Option<u32>) -> bool {
-    let name_l = name.to_ascii_lowercase();
-    if name_l.contains("ptz") {
-        return src_input_port != Some(2);
-    }
-    let Some(model) = model.filter(|m| !m.is_empty()) else {
-        return false;
-    };
-    let m = model.to_ascii_uppercase();
-    let ptz_model = m.contains("DS-2DE")
-        || m.contains("DS-2DF")
-        || m.contains("DS-2DY")
-        || m.contains("DS-2SE");
-    if !ptz_model {
-        return false;
-    }
-    src_input_port.unwrap_or(1) == 1
 }
 
 /// Fetch InputProxy channels via ISAPI (HTTP digest auth).
@@ -138,7 +109,8 @@ pub fn build_rtsp_url(nvr: &NvrConfig, channel_id: u32, stream: StreamType) -> S
 }
 
 /// Direct-to-camera RTSP URL (LAN host, typically port 554).
-pub fn build_camera_rtsp_url(
+#[cfg(test)]
+fn build_camera_rtsp_url(
     host: &str,
     username: &str,
     password: &str,
@@ -190,7 +162,6 @@ pub fn parse_input_proxy_channels(xml: &str) -> Result<Vec<DiscoveredChannel>> {
     let mut cur_name: Option<String> = None;
     let mut cur_ip: Option<String> = None;
     let mut cur_port: Option<u32> = None;
-    let mut cur_model: Option<String> = None;
     let mut disabled = false;
 
     loop {
@@ -203,7 +174,6 @@ pub fn parse_input_proxy_channels(xml: &str) -> Result<Vec<DiscoveredChannel>> {
                     cur_name = None;
                     cur_ip = None;
                     cur_port = None;
-                    cur_model = None;
                     disabled = false;
                 }
                 path.push(local);
@@ -221,7 +191,6 @@ pub fn parse_input_proxy_channels(xml: &str) -> Result<Vec<DiscoveredChannel>> {
                                 name: cur_name.clone().unwrap_or_else(|| format!("Channel {id}")),
                                 source_ip: cur_ip.clone(),
                                 src_input_port: cur_port,
-                                model: cur_model.clone(),
                             });
                         }
                         None => warn!("InputProxyChannel missing <id>; skipped"),
@@ -259,9 +228,6 @@ pub fn parse_input_proxy_channels(xml: &str) -> Result<Vec<DiscoveredChannel>> {
                     }
                     (_, "srcInputPort") => {
                         cur_port = text.parse().ok();
-                    }
-                    (_, "model") => {
-                        cur_model = Some(text);
                     }
                     (_, "enableVideo" | "adminEnable") => {
                         if matches!(text.as_str(), "false" | "0") {
@@ -330,32 +296,6 @@ mod tests {
         assert_eq!(chans[0].name, "Front");
         assert_eq!(chans[0].source_ip.as_deref(), Some("192.0.2.10"));
         assert_eq!(chans[0].src_input_port, Some(1));
-        assert_eq!(chans[0].model.as_deref(), Some("DS-2SE7C144IW-AE"));
-        assert!(chans[0].has_ptz());
-    }
-
-    #[test]
-    fn tandemvu_lens2_is_not_ptz() {
-        assert!(!proxy_channel_has_ptz(
-            "Front",
-            Some("DS-2SE7C144IW-AE"),
-            Some(2)
-        ));
-        assert!(proxy_channel_has_ptz(
-            "Front PTZ",
-            Some("DS-2SE7C144IW-AE"),
-            Some(1)
-        ));
-        assert!(proxy_channel_has_ptz(
-            "Yard",
-            Some("DS-2DE5425IW-AE"),
-            Some(1)
-        ));
-        assert!(!proxy_channel_has_ptz(
-            "ANPR",
-            Some("DS-2CD7A26G0/P-IZS"),
-            Some(1)
-        ));
     }
 
     #[test]

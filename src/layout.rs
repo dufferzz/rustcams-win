@@ -121,12 +121,4 @@ impl FitMode {
     pub fn all() -> &'static [Self] {
         &[Self::Contain, Self::Cover, Self::Fill]
     }
-
-    pub fn cycle(self) -> Self {
-        match self {
-            Self::Contain => Self::Cover,
-            Self::Cover => Self::Fill,
-            Self::Fill => Self::Contain,
-        }
-    }
 }

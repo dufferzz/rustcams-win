@@ -54,29 +54,6 @@ pub enum ParkActionStatus {
     Error(String),
 }
 
-/// Intrusion detection (`GET …/Smart/FieldDetection/{ch}`) shown as Tracking.
-#[derive(Debug, Clone)]
-pub struct Tracking {
-    pub enabled: bool,
-}
-
-/// Hikvision `AbsoluteHigh` pose from `GET …/PTZCtrl/channels/{ch}/status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AbsolutePtz {
-    elevation: i32,
-    azimuth: i32,
-    zoom: i32,
-}
-
-/// Async snapshot of the last intrusion-detection fetch for a PTZ target.
-#[derive(Debug, Clone)]
-pub enum TrackingStatus {
-    Idle,
-    Loading,
-    Ready(Tracking),
-    Error(String),
-}
-
 /// Async snapshot of the last preset-list fetch for a PTZ target.
 #[derive(Debug, Clone)]
 pub enum PresetListStatus {
@@ -130,27 +107,6 @@ impl Default for ParkStatusInner {
     }
 }
 
-#[derive(Default)]
-struct TrackingFetchState {
-    key: String,
-    status: TrackingStatusInner,
-    gen: u64,
-}
-
-#[derive(Clone)]
-enum TrackingStatusInner {
-    Idle,
-    Loading,
-    Ready(Tracking),
-    Error(String),
-}
-
-impl Default for TrackingStatusInner {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
 impl PtzVector {
     pub const STOP: Self = Self {
         pan: 0,
@@ -193,7 +149,6 @@ struct Shared {
     sessions: Mutex<HashMap<String, Arc<Mutex<DigestSession>>>>,
     presets: Mutex<PresetFetchState>,
     park: Mutex<ParkFetchState>,
-    tracking: Mutex<TrackingFetchState>,
     /// Working (host, ISAPI root) after the first successful PTZ call.
     route: Mutex<HashMap<String, (PtzTarget, String)>>,
     /// Working `PUT …/focus` path after the first successful FocusData call.
@@ -216,7 +171,6 @@ impl PtzWorker {
             sessions: Mutex::new(HashMap::new()),
             presets: Mutex::new(PresetFetchState::default()),
             park: Mutex::new(ParkFetchState::default()),
-            tracking: Mutex::new(TrackingFetchState::default()),
             route: Mutex::new(HashMap::new()),
             focus_route: Mutex::new(HashMap::new()),
             route_logged: Mutex::new(HashSet::new()),
@@ -368,88 +322,6 @@ impl PtzWorker {
                 g.status = match result {
                     Ok(action) => ParkStatusInner::Ready(action),
                     Err(err) => ParkStatusInner::Error(err.to_string()),
-                };
-            })
-            .ok();
-    }
-
-    /// Fetch `GET /ISAPI/Smart/FieldDetection/{ch}` in the background.
-    pub fn fetch_tracking(&self, target: PtzTarget) {
-        let key = Self::preset_key(&target);
-        let gen = {
-            let mut g = self.shared.tracking.lock();
-            if g.key == key && matches!(g.status, TrackingStatusInner::Loading) {
-                return;
-            }
-            g.key = key.clone();
-            g.status = TrackingStatusInner::Loading;
-            g.gen = g.gen.wrapping_add(1);
-            g.gen
-        };
-
-        let shared = Arc::clone(&self.shared);
-        thread::Builder::new()
-            .name("ptz-tracking".into())
-            .spawn(move || {
-                let result = get_tracking(&shared, &target);
-                let mut g = shared.tracking.lock();
-                if g.gen != gen || g.key != key {
-                    return;
-                }
-                g.status = match result {
-                    Ok(tracking) => TrackingStatusInner::Ready(tracking),
-                    Err(err) => TrackingStatusInner::Error(err.to_string()),
-                };
-            })
-            .ok();
-    }
-
-    pub fn refresh_tracking(&self, target: PtzTarget) {
-        {
-            let mut g = self.shared.tracking.lock();
-            g.key.clear();
-            g.status = TrackingStatusInner::Idle;
-        }
-        self.fetch_tracking(target);
-    }
-
-    pub fn tracking_status(&self, target: &PtzTarget) -> TrackingStatus {
-        let key = Self::preset_key(target);
-        let g = self.shared.tracking.lock();
-        if g.key != key {
-            return TrackingStatus::Idle;
-        }
-        match &g.status {
-            TrackingStatusInner::Idle => TrackingStatus::Idle,
-            TrackingStatusInner::Loading => TrackingStatus::Loading,
-            TrackingStatusInner::Ready(tracking) => TrackingStatus::Ready(tracking.clone()),
-            TrackingStatusInner::Error(err) => TrackingStatus::Error(err.clone()),
-        }
-    }
-
-    /// GET current FieldDetection XML, flip `<enabled>`, PUT it back, then re-GET.
-    pub fn set_tracking_enabled(&self, target: PtzTarget, enabled: bool) {
-        let key = Self::preset_key(&target);
-        let gen = {
-            let mut g = self.shared.tracking.lock();
-            g.key = key.clone();
-            g.status = TrackingStatusInner::Loading;
-            g.gen = g.gen.wrapping_add(1);
-            g.gen
-        };
-
-        let shared = Arc::clone(&self.shared);
-        thread::Builder::new()
-            .name("ptz-tracking-set".into())
-            .spawn(move || {
-                let result = set_tracking_enabled(&shared, &target, enabled);
-                let mut g = shared.tracking.lock();
-                if g.gen != gen || g.key != key {
-                    return;
-                }
-                g.status = match result {
-                    Ok(tracking) => TrackingStatusInner::Ready(tracking),
-                    Err(err) => TrackingStatusInner::Error(err.to_string()),
                 };
             })
             .ok();
@@ -1224,7 +1096,7 @@ fn parse_park_action(xml: &str) -> anyhow::Result<ParkAction> {
                     (Some("parkaction"), "parktime" | "returntime" | "time") => {
                         park_time_sec = text.parse().ok();
                     }
-                    (Some("parkaction") | Some("action"), "actiontype" | "action") => {
+                    (Some("parkaction") | Some("action"), "actiontype" | "action" | "actionname") => {
                         action_type = Some(text);
                     }
                     (Some("parkaction") | Some("action"), "actionnum" | "actionid") => {
@@ -1257,262 +1129,6 @@ fn rewrite_park_enabled(xml: &str, enabled: bool) -> anyhow::Result<String> {
         return Ok(out);
     }
     anyhow::bail!("ParkAction XML has no <enabled> element")
-}
-
-fn field_detection_paths(target: &PtzTarget) -> [String; 2] {
-    [
-        format!("/ISAPI/Smart/FieldDetection/{}", target.channel),
-        format!("/ISAPI/Smart/channels/{}/fieldDetection", target.channel),
-    ]
-}
-
-fn get_field_detection_xml(
-    shared: &Shared,
-    target: &PtzTarget,
-) -> anyhow::Result<(String, String)> {
-    let mut last_err = None;
-    for path in field_detection_paths(target) {
-        match digest_request(
-            &shared.agent,
-            &shared.sessions,
-            "GET",
-            target,
-            &path,
-            None,
-            "",
-        ) {
-            Ok((_, body)) => {
-                if parse_tracking(&body).is_ok() {
-                    return Ok((path, body));
-                }
-                last_err = Some(anyhow::anyhow!("GET {path}: not a FieldDetection response"));
-            }
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("FieldDetection not available")))
-}
-
-fn snapshot_restore<T>(
-    shared: &Shared,
-    target: &PtzTarget,
-    op: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let saved = match get_absolute_ptz(shared, target) {
-        Ok(pos) => Some(pos),
-        Err(err) => {
-            warn!(
-                host = %target.host,
-                channel = target.channel,
-                "PTZ status unavailable before tracking check: {err:#}"
-            );
-            None
-        }
-    };
-    let result = op();
-    if let Some(pos) = saved {
-        // FieldDetection can start a slew after the HTTP response returns.
-        thread::sleep(Duration::from_millis(250));
-        if let Err(err) = put_absolute_ptz(shared, target, pos) {
-            warn!(
-                host = %target.host,
-                channel = target.channel,
-                "restore PTZ after tracking failed: {err:#}"
-            );
-        } else {
-            thread::sleep(Duration::from_millis(400));
-            let _ = put_absolute_ptz(shared, target, pos);
-        }
-    }
-    result
-}
-
-fn get_absolute_ptz(shared: &Shared, target: &PtzTarget) -> anyhow::Result<AbsolutePtz> {
-    let mut last_err = None;
-    for rel in ["status", "absolute"] {
-        match digest_ptz(shared, "GET", target, rel, None, "") {
-            Ok((_, body)) => match parse_absolute_ptz(&body) {
-                Ok(pos) => return Ok(pos),
-                Err(err) => last_err = Some(err),
-            },
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PTZ status not available")))
-}
-
-fn put_absolute_ptz(
-    shared: &Shared,
-    target: &PtzTarget,
-    pos: AbsolutePtz,
-) -> anyhow::Result<()> {
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<PTZData>\
-<AbsoluteHigh>\
-<elevation>{}</elevation>\
-<azimuth>{}</azimuth>\
-<absoluteZoom>{}</absoluteZoom>\
-</AbsoluteHigh>\
-</PTZData>",
-        pos.elevation, pos.azimuth, pos.zoom
-    );
-    digest_ptz(
-        shared,
-        "PUT",
-        target,
-        "absolute",
-        Some(body.as_bytes()),
-        "application/xml",
-    )?;
-    Ok(())
-}
-
-fn parse_absolute_ptz(xml: &str) -> anyhow::Result<AbsolutePtz> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut path: Vec<String> = Vec::new();
-    let mut elevation = None;
-    let mut azimuth = None;
-    let mut zoom = None;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                path.push(xml_local_name(e.name().as_ref()));
-            }
-            Ok(Event::End(_)) => {
-                path.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if path.is_empty() {
-                    continue;
-                }
-                let text = t.unescape().unwrap_or_default().into_owned();
-                if text.is_empty() {
-                    continue;
-                }
-                let leaf = path[path.len() - 1].to_ascii_lowercase();
-                let val = text.parse::<i32>().ok();
-                match leaf.as_str() {
-                    "elevation" | "tilt" => elevation = val.or(elevation),
-                    "azimuth" | "pan" => azimuth = val.or(azimuth),
-                    "absolutezoom" | "zoom" => zoom = val.or(zoom),
-                    _ => {}
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => anyhow::bail!("PTZ status XML parse error at {}: {e}", reader.buffer_position()),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    match (elevation, azimuth, zoom) {
-        (Some(elevation), Some(azimuth), Some(zoom)) => Ok(AbsolutePtz {
-            elevation,
-            azimuth,
-            zoom,
-        }),
-        _ => anyhow::bail!("PTZ status XML missing elevation/azimuth/zoom"),
-    }
-}
-
-fn get_tracking(shared: &Shared, target: &PtzTarget) -> anyhow::Result<Tracking> {
-    snapshot_restore(shared, target, || {
-        let (_path, body) = get_field_detection_xml(shared, target)?;
-        parse_tracking(&body)
-    })
-}
-
-fn set_tracking_enabled(
-    shared: &Shared,
-    target: &PtzTarget,
-    enabled: bool,
-) -> anyhow::Result<Tracking> {
-    snapshot_restore(shared, target, || {
-        let (path, body) = get_field_detection_xml(shared, target)?;
-        let xml = rewrite_tracking_enabled(&body, enabled)?;
-        digest_request(
-            &shared.agent,
-            &shared.sessions,
-            "PUT",
-            target,
-            &path,
-            Some(xml.as_bytes()),
-            "application/xml",
-        )?;
-        let (_path, body) = get_field_detection_xml(shared, target)?;
-        parse_tracking(&body)
-    })
-}
-
-fn parse_tracking(xml: &str) -> anyhow::Result<Tracking> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut buf = Vec::new();
-    let mut path: Vec<String> = Vec::new();
-    let mut enabled = false;
-    let mut saw_enabled = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                path.push(xml_local_name(e.name().as_ref()));
-            }
-            Ok(Event::End(_)) => {
-                path.pop();
-            }
-            Ok(Event::Text(t)) => {
-                if path.is_empty() {
-                    continue;
-                }
-                let text = t.unescape().unwrap_or_default().into_owned();
-                if text.is_empty() {
-                    continue;
-                }
-                let leaf = path[path.len() - 1].as_str();
-                let parent = path
-                    .len()
-                    .checked_sub(2)
-                    .and_then(|i| path.get(i))
-                    .map(|s| s.to_ascii_lowercase());
-                let leaf_l = leaf.to_ascii_lowercase();
-                if !saw_enabled
-                    && leaf_l == "enabled"
-                    && matches!(
-                        parent.as_deref(),
-                        Some("fielddetection" | "intrusiondetection")
-                    )
-                {
-                    saw_enabled = true;
-                    enabled = matches!(text.to_ascii_lowercase().as_str(), "true" | "1");
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => anyhow::bail!(
-                "FieldDetection XML parse error at {}: {e}",
-                reader.buffer_position()
-            ),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    if !saw_enabled {
-        anyhow::bail!("not a FieldDetection response");
-    }
-    Ok(Tracking { enabled })
-}
-
-fn rewrite_tracking_enabled(xml: &str, enabled: bool) -> anyhow::Result<String> {
-    let value = if enabled { "true" } else { "false" };
-    if let Some(out) = replace_first_tag_text(xml, "enabled", value) {
-        return Ok(out);
-    }
-    anyhow::bail!("FieldDetection XML has no <enabled> element")
 }
 
 /// Replace the text of the first `<tag>…</tag>` (case-insensitive local name).
@@ -1613,7 +1229,10 @@ fn parse_ptz_presets(xml: &str) -> anyhow::Result<Vec<PtzPreset>> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => anyhow::bail!("preset XML parse error at {}: {e}", reader.buffer_position()),
+            Err(e) => anyhow::bail!(
+                "preset XML parse error at {}: {e}",
+                reader.buffer_position()
+            ),
             _ => {}
         }
         buf.clear();
@@ -1646,9 +1265,7 @@ fn extract_auth_param(header: &str, key: &str) -> Option<String> {
         let end = rest.find('"')?;
         Some(rest[..end].to_string())
     } else {
-        let end = rest
-            .find([',', ' '])
-            .unwrap_or(rest.len());
+        let end = rest.find([',', ' ']).unwrap_or(rest.len());
         Some(rest[..end].trim().to_string())
     }
 }
@@ -1790,6 +1407,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_action_name_park_xml() {
+        let xml = r#"<ParkAction>
+  <enabled>true</enabled>
+  <Parktime>15</Parktime>
+  <Action>
+    <ActionName>preset</ActionName>
+    <ActionNum>1</ActionNum>
+  </Action>
+</ParkAction>"#;
+        let park = parse_park_action(xml).unwrap();
+        assert_eq!(park.action_type.as_deref(), Some("preset"));
+        assert_eq!(park.action_num, Some(1));
+    }
+
+    #[test]
     fn parses_disabled_flat_park_action() {
         let xml = r#"<ParkAction>
   <enabled>false</enabled>
@@ -1813,53 +1445,5 @@ mod tests {
         let park = parse_park_action(&out).unwrap();
         assert!(!park.enabled);
         assert_eq!(park.park_time_sec, Some(30));
-    }
-
-    #[test]
-    fn parses_field_detection_ignoring_region_enabled() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<FieldDetection version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
-  <id>1</id>
-  <enabled>false</enabled>
-  <FieldDetectionRegionList>
-    <FieldDetectionRegion>
-      <id>1</id>
-      <enabled>true</enabled>
-    </FieldDetectionRegion>
-  </FieldDetectionRegionList>
-</FieldDetection>"#;
-        let tracking = parse_tracking(xml).unwrap();
-        assert!(!tracking.enabled);
-    }
-
-    #[test]
-    fn rewrites_field_detection_top_enabled_only() {
-        let xml = "<FieldDetection><enabled>true</enabled><FieldDetectionRegion><enabled>true</enabled></FieldDetectionRegion></FieldDetection>";
-        let out = rewrite_tracking_enabled(xml, false).unwrap();
-        assert!(out.starts_with("<FieldDetection><enabled>false</enabled>"));
-        assert!(out.contains("<FieldDetectionRegion><enabled>true</enabled>"));
-        let tracking = parse_tracking(&out).unwrap();
-        assert!(!tracking.enabled);
-    }
-
-    #[test]
-    fn parses_absolute_high_status() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<PTZStatus version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
-  <AbsoluteHigh>
-    <elevation>450</elevation>
-    <azimuth>1350</azimuth>
-    <absoluteZoom>10</absoluteZoom>
-  </AbsoluteHigh>
-</PTZStatus>"#;
-        let pos = parse_absolute_ptz(xml).unwrap();
-        assert_eq!(
-            pos,
-            AbsolutePtz {
-                elevation: 450,
-                azimuth: 1350,
-                zoom: 10
-            }
-        );
     }
 }

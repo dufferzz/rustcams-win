@@ -251,11 +251,16 @@ pub struct ViewerApp {
     decode_4x4: i32,
     decode_5x5: i32,
     decode_6x6: i32,
+    decode_backend: crate::gst_link::DecodeBackend,
     /// Second monitor window (same process, shared selection / PTZ).
     aux_open: bool,
     aux_view: usize,
     aux_fullscreen_slot: Option<usize>,
     aux_focused: bool,
+    /// Main viewport focused this frame (aux focus is sampled in its viewport).
+    main_focused: bool,
+    /// Last rustcams screen that had focus (`true` = Screen 2). PTZ outline stays here when both are in the background.
+    last_ptz_screen_aux: bool,
     aux_window_fullscreen: bool,
     /// In-flight drag so drops work across the auxiliary viewport.
     cross_drag: Option<DragPayload>,
@@ -440,10 +445,13 @@ impl ViewerApp {
             decode_4x4: settings::clamp_decode_width(ui_prefs.decode_4x4),
             decode_5x5: settings::clamp_decode_width(ui_prefs.decode_5x5),
             decode_6x6: settings::clamp_decode_width(ui_prefs.decode_6x6),
+            decode_backend: ui_prefs.decode_backend,
             aux_open: false,
             aux_view,
             aux_fullscreen_slot: None,
             aux_focused: false,
+            main_focused: false,
+            last_ptz_screen_aux: false,
             aux_window_fullscreen: false,
             cross_drag: None,
             aux_pointer_down: false,
@@ -901,6 +909,7 @@ impl ViewerApp {
                     protocols,
                     max_width,
                     max_fps,
+                    decode: crate::gst_link::DecodeBackend::resolve(self.decode_backend),
                 },
             );
         }
@@ -1099,6 +1108,27 @@ impl ViewerApp {
         self.camera_by_id(cam_id)?.ptz.clone()
     }
 
+    /// PTZ outline on this screen when it is focused, or when no rustcams window is focused and this was last used.
+    pub(super) fn show_ptz_selection_here(&self, is_aux: bool, screen_focused: bool) -> bool {
+        if screen_focused {
+            return true;
+        }
+        let other_focused = if is_aux {
+            self.main_focused
+        } else {
+            self.aux_focused
+        };
+        if other_focused {
+            return false;
+        }
+        self.last_ptz_screen_aux == is_aux
+    }
+
+    /// Gamepad grid nav / fullscreen follows the focused screen, else the last used one.
+    pub(super) fn gamepad_targets_aux(&self) -> bool {
+        self.aux_open && (self.aux_focused || (!self.main_focused && self.last_ptz_screen_aux))
+    }
+
     fn select_camera(&mut self, cam_id: &str) {
         let Some(cam) = self.camera_by_id(cam_id) else {
             return;
@@ -1162,10 +1192,6 @@ impl ViewerApp {
             );
         }
         self.select_camera(cam_id);
-    }
-
-    fn enter_fullscreen(&mut self, slot: usize) {
-        self.enter_fullscreen_at(self.views.active, slot, false);
     }
 
     fn enter_fullscreen_at(&mut self, view_idx: usize, slot: usize, is_aux: bool) {
@@ -1387,11 +1413,15 @@ impl eframe::App for ViewerApp {
         self.sync_window_fullscreen(ctx);
         self.apply_accent_visuals(ctx);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-            crate::config::app_screen_title(&self.app_name, 1),
+            crate::config::app_screen_title(&self.app_name, self.aux_open.then_some(1)),
         ));
         self.handle_keys(ctx);
 
-        let focused = ctx.input(|i| i.focused) || self.aux_focused;
+        self.main_focused = ctx.input(|i| i.focused);
+        if self.main_focused {
+            self.last_ptz_screen_aux = false;
+        }
+        let focused = self.main_focused || self.aux_focused;
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         let active = if self.pause_when_unfocused {
             focused && !minimized

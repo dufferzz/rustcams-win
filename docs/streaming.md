@@ -49,7 +49,7 @@ On startup (`main.rs` → `ViewerApp::new` → `StreamManager::new`):
 
 See `gst_env.rs`.
 
-**Default decode path is software (`avdec_h264` / `avdec_h265`).** DXVA/`d3d11h264dec` caused ~300–900 ms emit gaps around GOP boundaries on this workload; libav is smoother. Set `RUSTCAMS_DECODE=hw` to force hardware (D3D11/MF/NV, or V4L2 on Linux/Pi).
+**Default decode path is software (`avdec_h264` / `avdec_h265`).** DXVA/`d3d11h264dec` caused ~300–900 ms emit gaps around GOP boundaries on this workload; libav is smoother. Settings → **Display → Decoder** can select **NVDEC** (NVIDIA) or **Auto hardware**. `RUSTCAMS_DECODE=nvdec` / `hw` / `sw` overrides the saved setting.
 
 ---
 
@@ -151,8 +151,10 @@ Built in `start_pipeline` (`stream.rs`). One pipeline per active camera.
       → h264parse / h265parse
       → decoder
            default: avdec_h264 / avdec_h265
-           RUSTCAMS_DECODE=hw: d3d11h264dec / … (MF / NV / V4L2 fallbacks)
+           Settings NVDEC / RUSTCAMS_DECODE=nvdec: nvh264dec / nvcudah264dec
+           Settings Auto hardware / RUSTCAMS_DECODE=hw: d3d11h264dec / … (MF / NV / V4L2 fallbacks)
       │
+      ├── NVDEC + CUDA plugins: [cudaconvert → cudascale → caps(RGBA)] → cudadownload
       ├── HW + D3D11 plugins: d3d11convert → d3d11scale → caps(RGBA) → d3d11download
       └── else: direct link from decoder
       ▼
@@ -180,18 +182,21 @@ Built in `start_pipeline` (`stream.rs`). One pipeline per active camera.
 - **Keyframe gate:** after connect/reconnect, delta/corrupt buffers are dropped until the first keyframe (queue probe + appsink). Upstream `ForceKeyUnit` is sent to request an IDR ASAP.
 - **Audio:** non-video RTP pads are ignored (`gst_link::is_audio_caps`).
 
-### Decoder selection (`gst_link.rs` / env)
+### Decoder selection (`gst_link.rs` / Settings / env)
 
-| `RUSTCAMS_DECODE` | Behavior |
-|-------------------|----------|
-| unset / `sw` / `software` / `avdec` | Software (`avdec_*`) — **default** |
-| `hw` / `hardware` / `d3d11` | Prefer `d3d11h264dec` / `d3d11h265dec`, then MF/NV, then V4L2 (`v4l2sl*` / `v4l2h*`), else SW |
+Settings → Display → **Decoder** is saved in `ui.toml` as `decode_backend`. `RUSTCAMS_DECODE` overrides that when set.
 
-When HW decode is used and `d3d11convert` / `d3d11scale` / `d3d11download` exist, frames go through GPU convert/scale to RGBA in `D3D11Memory`, then download into the leaky queue. On link failure (or Linux V4L2), decoder links straight to the queue (CPU convert/scale).
+| Setting / `RUSTCAMS_DECODE` | Behavior |
+|-----------------------------|----------|
+| Software / unset / `sw` / `software` / `avdec` | Software (`avdec_*`) — **default** |
+| NVDEC / `nvdec` / `nv` / `nvidia` | Prefer `nvh264dec` / `nvh265dec` (then `nvcudah264dec` / `nvcudah265dec`), else SW |
+| Auto hardware / `hw` / `hardware` / `d3d11` | Prefer `d3d11h264dec` / `d3d11h265dec`, then MF/NV, then V4L2 (`v4l2sl*` / `v4l2h*`), else SW |
 
-On a **Raspberry Pi 4**, build natively (`scripts/build-on-pi.sh` / `scripts/setup-pi-deps.sh`) and run `RUSTCAMS_DECODE=hw` so the explicit chain can pick VideoCore V4L2 decoders. The UI still needs host Mesa OpenGL/EGL; if the window fails to create, try an X11 session.
+When NVDEC is used and `cudadownload` exists, frames go through optional `cudaconvert` / `cudascale` to RGBA in `CUDAMemory`, then download into the leaky queue. When D3D11 decode is used and `d3d11convert` / `d3d11scale` / `d3d11download` exist, the same pattern uses `D3D11Memory`. On link failure (or Linux V4L2 without CUDA download), decoder links straight to the queue (CPU convert/scale).
 
-`prefer_hardware_decoders` still ranks HW factories above SW for any path that uses ranks; the explicit graph ignores rank when `RUSTCAMS_DECODE` forces SW.
+On a **Raspberry Pi 4**, build natively (`scripts/build-on-pi.sh` / `scripts/setup-pi-deps.sh`) and pick **Auto hardware** (or `RUSTCAMS_DECODE=hw`) so the explicit chain can pick VideoCore V4L2 decoders. The UI still needs host Mesa OpenGL/EGL; if the window fails to create, try an X11 session.
+
+`prefer_hardware_decoders` still ranks HW factories above SW for any path that uses ranks; the explicit graph uses Settings / env, not factory rank.
 
 The selected decoder name is stored on the slot and shown in the debug overlay / stutter log (`dec=`).
 
@@ -352,7 +357,7 @@ ViewerApp (UI thread)
 
 | Variable | Effect |
 |----------|--------|
-| `RUSTCAMS_DECODE` | `hw` = force D3D11/MF/NV/V4L2; default / `sw` = libav |
+| `RUSTCAMS_DECODE` | `nvdec` / `hw` / `sw` override Settings → Decoder |
 | `RUSTCAMS_DEBUG` | Perf overlay on at start; periodic `perf *` logs |
 | `RUST_LOG`, `GST_DEBUG` | Module / GStreamer traces. `GST_DEBUG` can include RTSP userinfo — do not enable on a kiosk. |
 | Bundled GStreamer | Exe-relative tree on Windows packages |

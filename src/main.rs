@@ -97,7 +97,7 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([1440.0, 900.0])
         .with_maximized(true)
         .with_app_id(LINUX_CONFIG_DIR)
-        .with_title(app_screen_title(&cfg.viewer.app_name, 1));
+        .with_title(app_screen_title(&cfg.viewer.app_name, None));
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }

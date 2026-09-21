@@ -56,7 +56,7 @@ Crate/binary/dist folder names stay `rustcams` (packaging identity, not branding
 
 ## Streaming / decode (keep docs in sync)
 
-Default decode is **software** (`avdec_*`) via an **explicit** depay/parse chain — not `decodebin`, and not `videorate`. `RUSTCAMS_DECODE=hw` forces D3D11/MF/NV or Linux V4L2. Dense-grid tiers are sized for readable OSD (e.g. 5×5 → 352 px).
+Default decode is **software** (`avdec_*`) via an **explicit** depay/parse chain — not `decodebin`, and not `videorate`. Settings → Decoder can select **NVDEC** or **Auto hardware**; `RUSTCAMS_DECODE=nvdec` / `hw` / `sw` overrides that. Dense-grid tiers are sized for readable OSD (e.g. 5×5 → 352 px).
 
 When changing the pipeline, update:
 

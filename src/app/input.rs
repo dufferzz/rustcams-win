@@ -70,7 +70,8 @@ impl ViewerApp {
         let mut extra_cancel = false;
         let mut dpad = (0i8, 0i8);
 
-        let cam_fs = if self.aux_open && self.aux_focused {
+        let on_aux = self.gamepad_targets_aux();
+        let cam_fs = if on_aux {
             self.aux_fullscreen_slot.is_some()
         } else {
             self.fullscreen_slot.is_some()
@@ -155,7 +156,6 @@ impl ViewerApp {
             return;
         }
 
-        let on_aux = self.aux_open && self.aux_focused;
         let on_grid = !cam_fs;
         if on_grid && dpad != (0, 0) && dpad != self.last_dpad {
             self.move_pad_focus(dpad.0 as i32, dpad.1 as i32, on_aux);

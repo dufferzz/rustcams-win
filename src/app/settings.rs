@@ -70,6 +70,9 @@ pub struct UiPrefs {
     pub decode_5x5: i32,
     #[serde(default = "default_w6")]
     pub decode_6x6: i32,
+    /// software | nvdec | hardware. `RUSTCAMS_DECODE` overrides when set.
+    #[serde(default)]
+    pub decode_backend: crate::gst_link::DecodeBackend,
 }
 
 fn default_accent_hex() -> String {
@@ -142,6 +145,7 @@ impl Default for UiPrefs {
             decode_4x4: default_w4(),
             decode_5x5: default_w5(),
             decode_6x6: default_w6(),
+            decode_backend: crate::gst_link::DecodeBackend::Software,
         }
     }
 }
@@ -247,6 +251,7 @@ impl ViewerApp {
             decode_4x4: self.decode_4x4,
             decode_5x5: self.decode_5x5,
             decode_6x6: self.decode_6x6,
+            decode_backend: self.decode_backend,
         }
         .save(&self.ui_prefs_path);
     }
@@ -558,6 +563,52 @@ impl ViewerApp {
                 }
                     }
                     SettingsTab::Display => {
+                ui.heading("Decoder");
+                ui.label(
+                    egui::RichText::new(
+                        "How video is decoded. Changing this restarts live streams.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for mode in [
+                        crate::gst_link::DecodeBackend::Software,
+                        crate::gst_link::DecodeBackend::Nvdec,
+                        crate::gst_link::DecodeBackend::Hardware,
+                    ] {
+                        if ui
+                            .selectable_label(self.decode_backend == mode, mode.label())
+                            .on_hover_text(mode.hint())
+                            .clicked()
+                        {
+                            if self.decode_backend != mode {
+                                self.decode_backend = mode;
+                                save_ui = true;
+                            }
+                        }
+                    }
+                });
+                let nv_ok = crate::gst_env::nvdec_available();
+                let env_override = crate::gst_link::DecodeBackend::from_env();
+                let status = if let Some(env) = env_override {
+                    format!(
+                        "RUSTCAMS_DECODE={} overrides Settings (effective: {}).",
+                        env.as_str(),
+                        env.label()
+                    )
+                } else if self.decode_backend == crate::gst_link::DecodeBackend::Nvdec && !nv_ok {
+                    "NVDEC plugin not found — install gst-plugin-nvcodec (falls back to software)."
+                        .to_string()
+                } else if nv_ok {
+                    "NVIDIA NVDEC plugin found (nvh264dec).".to_string()
+                } else {
+                    "NVIDIA NVDEC plugin not found on this machine.".to_string()
+                };
+                ui.label(egui::RichText::new(status).small().weak());
+                ui.add_space(12.0);
+                ui.separator();
                 ui.heading("Grid decode width");
                 ui.label(
                     egui::RichText::new(

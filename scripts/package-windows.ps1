@@ -123,6 +123,7 @@ function Collect-RuntimeDllClosure {
 }
 
 # Plugins required for rustcams RTSP → depay/parse/decode → RGBA appsink path.
+# Include nvcodec when present so Settings → NVDEC works on NVIDIA GPUs.
 $PluginAllowList = @(
     'gstcoreelements.dll',      # queue, capsfilter, ...
     'gstapp.dll',               # appsink
@@ -140,6 +141,7 @@ $PluginAllowList = @(
     'gstd3d11.dll',             # DXVA decode + convert/scale/download
     'gstlibav.dll',             # avdec_* software fallback
     'gstmediafoundation.dll',   # mfh264/h265 fallback
+    'gstnvcodec.dll',           # NVIDIA NVDEC (optional; skipped if missing)
     'gstjpeg.dll'
 )
 

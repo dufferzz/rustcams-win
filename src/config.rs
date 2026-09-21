@@ -184,14 +184,6 @@ impl StreamType {
             StreamType::Third => 3,
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StreamType::Main => "main",
-            StreamType::Sub => "sub",
-            StreamType::Third => "third",
-        }
-    }
 }
 
 /// Raw TOML camera entry under `[[cameras]]`.
@@ -241,9 +233,6 @@ pub struct CameraConfig {
     /// Direct camera RTSP for fullscreen (main stream when possible).
     pub direct_url: Option<String>,
     pub protocols: Option<String>,
-    /// NVR InputProxy channel id when discovered via `[nvr]`.
-    #[allow(dead_code)]
-    pub channel_id: Option<u32>,
     /// Camera ISAPI, or NVR `ContentMgmt/PTZCtrlProxy` when `[nvr]` is set.
     pub ptz: Option<PtzTarget>,
 }
@@ -275,15 +264,16 @@ pub fn app_brand_name(name: &str) -> String {
     }
 }
 
-/// OS window title: `Citadel CCTV [Screen 1] v0.2.0`.
+/// Toolbar / OS title: `Citadel CCTV v0.2.3`, plus `[Screen N]` when dual-monitor.
 ///
 /// AppImage otherwise falls back to the wrapper binary name (`AppRun.wrapped`).
-pub fn app_screen_title(name: &str, screen: u32) -> String {
-    format!(
-        "{} [Screen {screen}] v{}",
-        app_brand_name(name),
-        env!("CARGO_PKG_VERSION")
-    )
+pub fn app_screen_title(name: &str, screen: Option<u32>) -> String {
+    let brand = app_brand_name(name);
+    let ver = env!("CARGO_PKG_VERSION");
+    match screen {
+        Some(n) => format!("{brand} v{ver} [Screen {n}]"),
+        None => format!("{brand} v{ver}"),
+    }
 }
 
 /// XDG / AppImage config directory name (`~/.config/citadel-cctv`).
@@ -618,10 +608,6 @@ impl AppConfig {
         }
     }
 
-    pub fn load(path: impl AsRef<Path>) -> Result<ResolvedConfig> {
-        Self::read(path)?.resolve()
-    }
-
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         self.validate().context("refuse to save invalid config")?;
         let path = path.as_ref();
@@ -659,7 +645,6 @@ fn camera_from_direct_url(e: &CameraEntry, url: &str) -> CameraConfig {
         url: url.to_string(),
         direct_url,
         protocols: e.protocols.clone(),
-        channel_id: None,
         ptz,
     }
 }
@@ -738,7 +723,6 @@ fn resolve_from_nvr(nvr: &NvrConfig, overrides: &[CameraEntry]) -> Result<Vec<Ca
             url,
             direct_url: None,
             protocols: nvr.protocols.clone(),
-            channel_id: Some(disc.channel_id),
             ptz,
         });
     }
@@ -797,7 +781,6 @@ fn camera_from_discovery(
         url: grid_url,
         direct_url,
         protocols: ovr.protocols.clone().or_else(|| nvr.protocols.clone()),
-        channel_id: Some(disc.channel_id),
         ptz,
     }
 }
@@ -1003,14 +986,19 @@ mod tests {
     }
 
     #[test]
-    fn screen_title_includes_brand_screen_and_version() {
+    fn screen_title_includes_brand_and_version() {
+        let ver = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            app_screen_title("Citadel CCTV", 1),
-            format!("Citadel CCTV [Screen 1] v{}", env!("CARGO_PKG_VERSION"))
+            app_screen_title("Citadel CCTV", None),
+            format!("Citadel CCTV v{ver}")
         );
         assert_eq!(
-            app_screen_title("  ", 2),
-            format!("Citadel CCTV [Screen 2] v{}", env!("CARGO_PKG_VERSION"))
+            app_screen_title("Citadel CCTV", Some(1)),
+            format!("Citadel CCTV v{ver} [Screen 1]")
+        );
+        assert_eq!(
+            app_screen_title("  ", Some(2)),
+            format!("Citadel CCTV v{ver} [Screen 2]")
         );
     }
 

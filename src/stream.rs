@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::gst_link::DecodeBackend;
 use crate::redact::{redact_secrets, redact_url};
 
 #[derive(Clone)]
@@ -32,6 +33,7 @@ pub struct StreamRequest {
     pub max_width: i32,
     /// Cap appsink delivery rate for multipane CPU (videorate).
     pub max_fps: i32,
+    pub decode: DecodeBackend,
 }
 
 /// Live counters written on the appsink thread; cheap atomics for optimising.
@@ -92,7 +94,6 @@ pub struct StreamDebugRow {
     pub drop_rate_fps: f32,
     pub drop_delta_fps: f32,
     pub drop_key_fps: f32,
-    pub drop_corrupt_fps: f32,
     /// Worst emit-to-emit gap in the last sample window (ms).
     pub emit_gap_max_ms: u64,
     pub decoder: String,
@@ -110,7 +111,6 @@ struct SlotRateWindow {
     drop_rate: u64,
     drop_delta: u64,
     drop_key: u64,
-    drop_corrupt: u64,
     at: Instant,
 }
 
@@ -154,6 +154,7 @@ struct SlotState {
     protocols_override: Option<String>,
     max_width: i32,
     max_fps: i32,
+    decode: DecodeBackend,
     transport: TransportMode,
     frame: Arc<Mutex<Option<Arc<VideoFrame>>>>,
     latest_seq: Arc<AtomicU64>,
@@ -224,12 +225,14 @@ impl StreamManager {
                 let url_changed = slot.url != req.url;
                 let proto_changed = slot.protocols_override != req.protocols;
                 let res_changed = slot.max_width != req.max_width || slot.max_fps != req.max_fps;
-                if url_changed || proto_changed || res_changed {
+                let dec_changed = slot.decode != req.decode;
+                if url_changed || proto_changed || res_changed || dec_changed {
                     stop_slot_inner(slot);
                     slot.url = req.url.clone();
                     slot.protocols_override = req.protocols.clone();
                     slot.max_width = req.max_width;
                     slot.max_fps = req.max_fps;
+                    slot.decode = req.decode;
                     slot.camera_id = req.id.clone();
                     slot.transport = initial_transport;
                     slot.failures = 0;
@@ -248,6 +251,7 @@ impl StreamManager {
                     protocols_override: req.protocols.clone(),
                     max_width: req.max_width,
                     max_fps: req.max_fps,
+                    decode: req.decode,
                     transport: initial_transport,
                     frame: Arc::new(Mutex::new(None)),
                     latest_seq: Arc::new(AtomicU64::new(0)),
@@ -407,7 +411,6 @@ impl StreamManager {
             let drop_rate = slot.counters.drop_rate.load(Ordering::Relaxed);
             let drop_delta = slot.counters.drop_delta.load(Ordering::Relaxed);
             let drop_key = slot.counters.drop_key.load(Ordering::Relaxed);
-            let drop_corrupt = slot.counters.drop_corrupt.load(Ordering::Relaxed);
             let emit_gap_max_ms = slot.counters.emit_gap_max_ms.swap(0, Ordering::Relaxed);
             let dt = now
                 .saturating_duration_since(slot.rate_window.at)
@@ -421,7 +424,6 @@ impl StreamManager {
             let d_drop_rate = drop_rate.saturating_sub(slot.rate_window.drop_rate) as f32;
             let d_drop_delta = drop_delta.saturating_sub(slot.rate_window.drop_delta) as f32;
             let d_drop_key = drop_key.saturating_sub(slot.rate_window.drop_key) as f32;
-            let d_drop_corrupt = drop_corrupt.saturating_sub(slot.rate_window.drop_corrupt) as f32;
             let d_frame_i = d_frames.max(1.0);
             slot.rate_window = SlotRateWindow {
                 frames,
@@ -432,7 +434,6 @@ impl StreamManager {
                 drop_rate,
                 drop_delta,
                 drop_key,
-                drop_corrupt,
                 at: now,
             };
 
@@ -452,7 +453,6 @@ impl StreamManager {
                 drop_rate_fps: d_drop_rate / dt,
                 drop_delta_fps: d_drop_delta / dt,
                 drop_key_fps: d_drop_key / dt,
-                drop_corrupt_fps: d_drop_corrupt / dt,
                 emit_gap_max_ms,
                 decoder: slot.counters.decoder.lock().clone(),
                 failures: slot.failures,
@@ -488,7 +488,6 @@ impl SlotRateWindow {
             drop_rate: 0,
             drop_delta: 0,
             drop_key: 0,
-            drop_corrupt: 0,
             at: Instant::now(),
         }
     }
@@ -588,6 +587,7 @@ fn try_explicit_link(
     decoder_name_out: &Arc<Mutex<String>>,
     camera_id: &str,
     link_once: &Arc<AtomicBool>,
+    decode: DecodeBackend,
 ) {
     if link_once.swap(true, Ordering::AcqRel) {
         return;
@@ -607,6 +607,7 @@ fn try_explicit_link(
         max_width,
         max_height,
         decoder_name_out,
+        decode,
     ) {
         warn!(
             camera = %camera_id,
@@ -667,6 +668,7 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
         drop_on_latency = false,
         max_width,
         max_fps,
+        decode = slot.decode.as_str(),
         sync = clock_sync,
         "starting pipeline"
     );
@@ -761,8 +763,8 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
         });
     }
 
-    // Explicit depay/parse/decode (no decodebin). Default SW via
-    // prefer_software_decode(); set RUSTCAMS_DECODE=hw for D3D11/MF/NV/V4L2.
+    // Explicit depay/parse/decode (no decodebin). Decoder from Settings or
+    // RUSTCAMS_DECODE (sw / nvdec / hw).
     let pipeline_weak = pipeline.downgrade();
     let queue_weak = queue.downgrade();
     let max_width_link = max_width;
@@ -770,6 +772,7 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
     let decoder_name_out = Arc::clone(&slot.counters.decoder);
     let cam_for_link = slot.camera_id.clone();
     let link_once = Arc::new(AtomicBool::new(false));
+    let decode_link = slot.decode;
     src.connect_pad_added(move |_src, pad| {
         if let Some(caps) = pad.current_caps() {
             if crate::gst_link::is_audio_caps(&caps) {
@@ -794,6 +797,7 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
                     &decoder_name_out,
                     &cam_for_link,
                     &link_once,
+                    decode_link,
                 );
             });
             return;
@@ -807,6 +811,7 @@ fn start_pipeline(slot: &mut SlotState, seq: &Arc<AtomicU64>) -> Result<()> {
             &decoder_name_out,
             &cam_for_link,
             &link_once,
+            decode_link,
         );
     });
 

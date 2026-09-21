@@ -60,10 +60,6 @@ pub fn appimage_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-pub fn should_check(check_updates: bool) -> bool {
-    check_updates && appimage_path().is_some()
-}
-
 pub fn appimage_asset_name(arch: &str) -> Option<&'static str> {
     match arch {
         "x86_64" => Some("Citadel_CCTV-linux-x86_64.AppImage"),
@@ -96,6 +92,7 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 pub fn available_from_release(
     json: &str,
     current: &str,

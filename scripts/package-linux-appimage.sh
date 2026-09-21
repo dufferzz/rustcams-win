@@ -156,6 +156,7 @@ OPTIONAL_PLUGINS=(
   libgstvideofilter.so
   libgstjpeg.so
   libgstvideo4linux2.so
+  libgstnvcodec.so
 )
 
 echo "GStreamer plugins: $PLUGINS_SRC"

@@ -35,7 +35,7 @@ Portable **AppImage** (for GitHub releases; build on Ubuntu 22.04 when possible)
 Publish a GitHub release from this machine (tag must already exist):
 
 ```bash
-gh release create v0.2.2 \
+gh release create v0.2.3 \
   dist/Citadel_CCTV-linux-x86_64.AppImage \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
@@ -159,7 +159,7 @@ licenses\gstreamer\
 
 GStreamer / codecs have LGPL/GPL obligations when redistributing — keep the copied license files with the package.
 
-**Decode (default = software):** rustcams uses an **explicit** pipeline (`rtph264depay` → `h264parse` → decoder), not `decodebin`. By default it selects **libav** (`avdec_h264` / `avdec_h265`), which measured smoother than DXVA on multi-cam grids (lower emit gaps around keyframes). Set `RUSTCAMS_DECODE=hw` to prefer Direct3D11/DXVA (`d3d11h264dec` / `d3d11h265dec`) with GPU scale/download when `gstd3d11.dll` is present, or **V4L2** (`v4l2slh264dec` / `v4l2h264dec` and H.265 equivalents) on Raspberry Pi / Linux. In **Debug** (Settings → Diagnostics, or `RUSTCAMS_DEBUG=1`), per-stream `dec=` shows the factory in use.
+**Decode (default = software):** rustcams uses an **explicit** pipeline (`rtph264depay` → `h264parse` → decoder), not `decodebin`. By default it selects **libav** (`avdec_h264` / `avdec_h265`), which measured smoother than DXVA on multi-cam grids (lower emit gaps around keyframes). In **Settings → Display → Decoder**, choose **NVDEC** for NVIDIA GPUs (`nvh264dec` / `nvh265dec`; install `gst-plugin-nvcodec` on Arch/Manjaro), or **Auto hardware** for D3D11/MF/NV/V4L2. `RUSTCAMS_DECODE=nvdec` / `hw` / `sw` overrides the saved setting. In **Debug** (Settings → Diagnostics, or `RUSTCAMS_DEBUG=1`), per-stream `dec=` shows the factory in use.
 
 ## Config
 
@@ -252,7 +252,8 @@ cargo run --release
 |------|--------|
 | Toolbar **Debug** | On-screen per-stream fps, size, decoder, stale frames, RGBA copy cost, emit `gap_ms`; status-bar UI/tex rates |
 | `RUSTCAMS_DEBUG=1` | Starts with Debug on; logs `perf summary` / `perf stream` / `perf ui` every 5s |
-| `RUSTCAMS_DECODE=hw` | Force hardware decode (D3D11/MF/NV, or V4L2 on Pi/Linux); default is software `avdec_*` |
+| `RUSTCAMS_DECODE=nvdec` | Force NVIDIA NVDEC (`nvh264dec` / `nvh265dec`); same as Settings → NVDEC |
+| `RUSTCAMS_DECODE=hw` | Force auto hardware (D3D11/MF/NV, or V4L2 on Pi/Linux) |
 | `RUSTCAMS_DECODE=sw` | Explicit software decode (same as default) |
 | Settings → **Write stutter-stats.log** | Optional hitch log next to `cameras.toml` (~2s). Off by default. |
 | `RUST_LOG=rustcams=debug` | Verbose module logs (links, stops, …) |
@@ -287,7 +288,6 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | PTZ focus | Sidebar **F−** / **F+**, DualShock L1/R1, or `,` / `.` |
 | PTZ home | Sidebar `H` |
 | PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol (NVR `PTZCtrlProxy` `parkaction`); click to toggle |
-| PTZ tracking | Hidden for now (FieldDetection query slews some PTZs) |
 | PTZ (DualShock 4) | Left stick pan/tilt (D-pad too in camera fullscreen); L2/R2 or right-stick Y zoom; L1/R1 focus; D-pad on grid moves selection; Cross/X = select (camera fullscreen); Triangle = back from camera FS, or toggle OS fullscreen on the grid; Square = patrol 1 |
 
 With **`[nvr]`**, video still comes from the NVR. PTZ uses the NVR
