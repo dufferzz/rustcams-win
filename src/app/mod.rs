@@ -40,6 +40,19 @@ pub(super) enum UpdateBanner {
     Failed { message: String },
 }
 
+/// Status line for Settings → About (manual / auto check feedback).
+#[derive(Debug, Clone, Default)]
+pub(super) enum UpdateCheckStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available { version: String },
+    Failed { message: String },
+}
+
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SidebarControls {
     #[default]
@@ -302,10 +315,16 @@ pub struct ViewerApp {
     update_later: bool,
     update_banner: UpdateBanner,
     last_update_offer: Option<crate::update::AvailableUpdate>,
-    pending_update: Arc<Mutex<Option<crate::update::AvailableUpdate>>>,
+    /// Result of a background GitHub check (`None` while idle / in flight).
+    pending_update: Arc<Mutex<Option<crate::update::CheckOutcome>>>,
     update_apply: Arc<Mutex<Option<Result<String, String>>>>,
     update_progress: Arc<AtomicU64>,
     update_inflight: Arc<AtomicBool>,
+    update_check_inflight: Arc<AtomicBool>,
+    last_update_check: Instant,
+    update_check_status: UpdateCheckStatus,
+    /// When true, the next offer from `pending_update` starts download immediately.
+    update_auto_apply: Arc<AtomicBool>,
 }
 
 impl ViewerApp {
@@ -512,12 +531,16 @@ impl ViewerApp {
             update_apply: Arc::new(Mutex::new(None)),
             update_progress: Arc::new(AtomicU64::new(0)),
             update_inflight: Arc::new(AtomicBool::new(false)),
+            update_check_inflight: Arc::new(AtomicBool::new(false)),
+            last_update_check: Instant::now(),
+            update_check_status: UpdateCheckStatus::Idle,
+            update_auto_apply: Arc::new(AtomicBool::new(false)),
         };
         app.save_ui_prefs();
         if app.nvr_retry {
             app.kick_nvr_resolve();
         }
-        app.kick_update_check();
+        app.kick_update_check(false);
         Ok(app)
     }
 
@@ -1517,50 +1540,145 @@ impl ViewerApp {
         });
     }
 
-    fn kick_update_check(&self) {
-        if !self.check_updates {
+    /// Start a GitHub release check.
+    ///
+    /// - `manual`: from Settings → About; ignores the auto-updates toggle and
+    ///   `update_later`, and does not treat a skipped version as quiet.
+    /// - automatic: requires `check_updates`, skips if a check/download is already
+    ///   running; offers auto-download + relaunch when an update is found.
+    fn kick_update_check(&mut self, manual: bool) {
+        if !manual && !self.check_updates {
             return;
         }
         let Some(path) = crate::update::appimage_path() else {
-            if std::env::var_os("APPDIR").is_some() {
+            if manual {
+                self.update_check_status = UpdateCheckStatus::Failed {
+                    message: "Updates are only available for the Linux AppImage.".into(),
+                };
+            } else if std::env::var_os("APPDIR").is_some() {
                 warn!("AppImage update check skipped: $APPIMAGE missing or not a file");
             }
             return;
         };
+        if self.update_inflight.load(Ordering::SeqCst) {
+            if manual {
+                self.update_check_status = UpdateCheckStatus::Checking;
+            }
+            return;
+        }
+        if self.update_check_inflight.swap(true, Ordering::SeqCst) {
+            if manual {
+                self.update_check_status = UpdateCheckStatus::Checking;
+            }
+            return;
+        }
+
+        self.last_update_check = Instant::now();
+        self.update_check_status = UpdateCheckStatus::Checking;
+        // Automatic checks auto-apply; manual checks only auto-apply when the toggle is on.
+        let auto_apply = self.check_updates;
+        self.update_auto_apply
+            .store(auto_apply, Ordering::SeqCst);
+        if manual {
+            self.update_later = false;
+        }
+
         info!(
             path = %path.display(),
+            manual,
+            auto_apply,
             "checking GitHub for AppImage updates"
         );
-        let skipped = self.skipped_update.clone();
+        let skipped = if manual {
+            None
+        } else {
+            self.skipped_update.clone()
+        };
         let slot = self.pending_update.clone();
+        let inflight = self.update_check_inflight.clone();
         std::thread::spawn(move || {
-            let offer = crate::update::check_latest(env!("CARGO_PKG_VERSION"), skipped.as_deref());
-            if let Some(offer) = offer {
+            let outcome =
+                crate::update::check_status(env!("CARGO_PKG_VERSION"), skipped.as_deref());
+            if let crate::update::CheckOutcome::Available(ref offer) = outcome {
                 info!(tag = %offer.tag, version = %offer.version, "AppImage update available");
-                *slot.lock() = Some(offer);
             }
+            *slot.lock() = Some(outcome);
+            inflight.store(false, Ordering::SeqCst);
         });
     }
 
     fn poll_update_check(&mut self) {
-        if let Some(res) = self.update_apply.lock().take() {
+        let apply_res = self.update_apply.lock().take();
+        if let Some(res) = apply_res {
             self.update_inflight.store(false, Ordering::SeqCst);
             match res {
-                Ok(version) => self.update_banner = UpdateBanner::Ready { version },
-                Err(message) => self.update_banner = UpdateBanner::Failed { message },
+                Ok(version) => {
+                    self.update_banner = UpdateBanner::Ready {
+                        version: version.clone(),
+                    };
+                    self.update_check_status = UpdateCheckStatus::Available {
+                        version: version.clone(),
+                    };
+                    if self.check_updates {
+                        self.relaunch_after_update();
+                    }
+                }
+                Err(message) => {
+                    self.update_banner = UpdateBanner::Failed {
+                        message: message.clone(),
+                    };
+                    self.update_check_status = UpdateCheckStatus::Failed { message };
+                }
             }
         }
-        if self.update_later {
+
+        let outcome = self.pending_update.lock().take();
+        if let Some(outcome) = outcome {
+            match outcome {
+                crate::update::CheckOutcome::UpToDate => {
+                    self.update_check_status = UpdateCheckStatus::UpToDate;
+                }
+                crate::update::CheckOutcome::Failed(message) => {
+                    self.update_check_status = UpdateCheckStatus::Failed { message };
+                }
+                crate::update::CheckOutcome::Available(offer) => {
+                    self.update_check_status = UpdateCheckStatus::Available {
+                        version: offer.tag.clone(),
+                    };
+                    self.last_update_offer = Some(offer.clone());
+                    let auto = self.update_auto_apply.swap(false, Ordering::SeqCst);
+                    if auto {
+                        self.update_later = false;
+                        self.start_update_download();
+                    } else if !self.update_later
+                        && matches!(self.update_banner, UpdateBanner::Hidden)
+                    {
+                        self.update_banner = UpdateBanner::Offer(offer);
+                    }
+                }
+            }
+        }
+    }
+
+    fn maybe_periodic_update_check(&mut self) {
+        if !self.check_updates {
             return;
         }
-        if !matches!(self.update_banner, UpdateBanner::Hidden) {
+        if crate::update::appimage_path().is_none() {
             return;
         }
-        let offer = self.pending_update.lock().clone();
-        if let Some(offer) = offer {
-            self.last_update_offer = Some(offer.clone());
-            self.update_banner = UpdateBanner::Offer(offer);
+        if self.update_check_inflight.load(Ordering::SeqCst)
+            || self.update_inflight.load(Ordering::SeqCst)
+        {
+            return;
         }
+        if !matches!(self.update_banner, UpdateBanner::Hidden | UpdateBanner::Failed { .. }) {
+            return;
+        }
+        if self.last_update_check.elapsed() < UPDATE_CHECK_INTERVAL {
+            return;
+        }
+        self.kick_update_check(false);
     }
 
     fn start_update_download(&mut self) {
@@ -1580,6 +1698,7 @@ impl ViewerApp {
         self.update_banner = UpdateBanner::Downloading {
             version: offer.tag.clone(),
         };
+        self.update_check_status = UpdateCheckStatus::Checking;
         let progress = self.update_progress.clone();
         let apply = self.update_apply.clone();
         std::thread::spawn(move || {
@@ -1591,6 +1710,15 @@ impl ViewerApp {
             }
             *apply.lock() = Some(result);
         });
+    }
+
+    fn relaunch_after_update(&mut self) {
+        if let Err(err) = crate::update::relaunch_self() {
+            warn!("failed to relaunch updated AppImage: {err:#}");
+            self.update_banner = UpdateBanner::Failed {
+                message: format!("Updated, but relaunch failed: {err:#}"),
+            };
+        }
     }
 
     fn skip_this_update(&mut self) {
@@ -1614,7 +1742,12 @@ impl eframe::App for ViewerApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.poll_update_check();
-        if matches!(self.update_banner, UpdateBanner::Downloading { .. }) {
+        self.maybe_periodic_update_check();
+        if matches!(
+            self.update_banner,
+            UpdateBanner::Downloading { .. } | UpdateBanner::Ready { .. }
+        ) || matches!(self.update_check_status, UpdateCheckStatus::Checking)
+        {
             ctx.request_repaint();
         }
         self.sync_window_fullscreen(ctx);

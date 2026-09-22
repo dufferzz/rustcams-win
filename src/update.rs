@@ -103,16 +103,37 @@ pub fn available_from_release(
     offer_from_release(&release, current, skipped, arch)
 }
 
-/// Query GitHub `/releases/latest`. Errors and “no update” are both `None`
-/// after logging — the UI only shows a banner when an offer is returned.
-pub fn check_latest(current: &str, skipped: Option<&str>) -> Option<AvailableUpdate> {
+#[derive(Debug, Clone)]
+pub enum CheckOutcome {
+    /// Running build is current (or no matching asset / skipped tag).
+    UpToDate,
+    Available(AvailableUpdate),
+    Failed(String),
+}
+
+/// Query GitHub `/releases/latest`. Distinguishes up-to-date from network/API failure.
+pub fn check_status(current: &str, skipped: Option<&str>) -> CheckOutcome {
     match check_latest_inner(current, skipped) {
-        Ok(offer) => offer,
+        Ok(Some(offer)) => CheckOutcome::Available(offer),
+        Ok(None) => CheckOutcome::UpToDate,
         Err(err) => {
             warn!("AppImage update check failed: {err:#}");
-            None
+            CheckOutcome::Failed(format!("{err:#}"))
         }
     }
+}
+
+/// Spawn a new process of this AppImage (same CLI args), then exit.
+/// Call after a successful in-place replace so the new binary is launched.
+pub fn relaunch_self() -> Result<()> {
+    let path = appimage_path().ok_or_else(|| anyhow!("not running from an AppImage"))?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    info!(path = %path.display(), "relaunching updated AppImage");
+    std::process::Command::new(&path)
+        .args(args)
+        .spawn()
+        .with_context(|| format!("spawn {}", path.display()))?;
+    std::process::exit(0);
 }
 
 fn check_latest_inner(current: &str, skipped: Option<&str>) -> Result<Option<AvailableUpdate>> {
@@ -137,12 +158,10 @@ fn check_latest_inner(current: &str, skipped: Option<&str>) -> Result<Option<Ava
         return Ok(None);
     }
     if status.as_u16() == 403 || status.as_u16() == 429 {
-        warn!(status = status.as_u16(), "GitHub update check rate limited");
-        return Ok(None);
+        bail!("GitHub update check rate limited (HTTP {})", status.as_u16());
     }
     if !status.is_success() {
-        warn!(status = status.as_u16(), "GitHub update check HTTP error");
-        return Ok(None);
+        bail!("GitHub update check HTTP {}", status.as_u16());
     }
     let release: GhRelease = resp
         .body_mut()
@@ -266,7 +285,7 @@ pub fn download_and_replace(
     info!(
         path = %dest.display(),
         version = %update.version,
-        "AppImage updated; restart to run the new build"
+        "AppImage updated"
     );
     Ok(())
 }

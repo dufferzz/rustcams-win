@@ -40,7 +40,7 @@ gh release create v0.2.3 \
   dist/Citadel_CCTV-linux-x86_64.AppImage.sha256
 ```
 
-When you launch that AppImage, Citadel CCTV checks GitHub Releases in the background and offers an update if a newer matching AppImage (plus `.sha256`) exists. Confirm in the banner to download and replace the file; restart to run the new build. Turn this off in Settings → Display (`Check for AppImage updates on launch`). Cargo/`target/release` builds do not check.
+When you launch that AppImage (or every 5 minutes while it runs), Citadel CCTV checks GitHub Releases in the background. With **Auto updates** on (Settings → About, default), a newer matching AppImage (plus `.sha256`) is downloaded and the app relaunches into the new build. Use **Check for update** in About for a one-shot check; when auto updates are off, confirm the banner before download. Cargo/`target/release` builds do not check.
 
 ### Raspberry Pi 4 (64-bit)
 

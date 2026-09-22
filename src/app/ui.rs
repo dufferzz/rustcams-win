@@ -830,8 +830,11 @@ impl ViewerApp {
             UpdateBanner::Ready { version } => {
                 ui.colored_label(
                     Color32::from_rgb(140, 220, 160),
-                    format!("Restart {} to use {version}", self.app_name),
+                    format!("Update {version} installed"),
                 );
+                if ui.button("Restart now").clicked() {
+                    self.relaunch_after_update();
+                }
                 if ui.button("Quit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }

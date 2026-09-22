@@ -16,6 +16,7 @@ pub(super) enum SettingsTab {
     Anpr,
     Display,
     Diagnostics,
+    About,
 }
 
 /// Default selection / outline blue (`rgb(140, 200, 255)`).
@@ -45,7 +46,8 @@ pub struct UiPrefs {
     /// Append `stutter-stats.log` next to cameras.toml (~2s). Off by default.
     #[serde(default)]
     pub stutter_log_file: bool,
-    /// Linux AppImage: query GitHub Releases on launch.
+    /// Linux AppImage: check GitHub Releases on launch and every 5 minutes;
+    /// when an update is found, download and relaunch automatically.
     #[serde(default = "default_true")]
     pub check_updates: bool,
     /// Last skipped update version (`0.3.0`); stay quiet until a newer tag.
@@ -437,6 +439,7 @@ impl ViewerApp {
                         SettingsTab::Diagnostics,
                         "Diagnostics",
                     );
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::About, "About");
                 });
                 ui.separator();
                 ui.add_space(6.0);
@@ -890,29 +893,6 @@ impl ViewerApp {
                         .weak(),
                 );
                 ui.add_space(8.0);
-                if crate::update::appimage_path().is_some() {
-                    if ui
-                        .checkbox(
-                            &mut self.check_updates,
-                            "Check for AppImage updates on launch",
-                        )
-                        .changed()
-                    {
-                        save_ui = true;
-                        if !self.check_updates {
-                            self.update_later = true;
-                            self.update_banner = super::UpdateBanner::Hidden;
-                        }
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Looks up the latest GitHub release. You confirm before download.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.add_space(8.0);
-                }
                 if ui
                     .add(
                         egui::Slider::new(&mut self.outline_width, 1.0..=16.0)
@@ -940,6 +920,97 @@ impl ViewerApp {
                     self.decode_5x5 = default_w5();
                     self.decode_6x6 = default_w6();
                     save_ui = true;
+                }
+                    }
+                    SettingsTab::About => {
+                ui.heading("About");
+                ui.add_space(4.0);
+                ui.label("Made by Sam Duff");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(12.0);
+
+                let is_appimage = crate::update::appimage_path().is_some();
+                if is_appimage {
+                    if ui
+                        .checkbox(&mut self.check_updates, "Auto updates")
+                        .changed()
+                    {
+                        save_ui = true;
+                        if self.check_updates {
+                            self.update_later = false;
+                            self.kick_update_check(false);
+                        } else {
+                            self.update_later = true;
+                            if !matches!(
+                                self.update_banner,
+                                super::UpdateBanner::Downloading { .. }
+                            ) {
+                                self.update_banner = super::UpdateBanner::Hidden;
+                            }
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "On launch and every 5 minutes: download a newer AppImage and relaunch.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Automatic updates are available when running the Linux AppImage.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                }
+
+                let checking =
+                    matches!(self.update_check_status, super::UpdateCheckStatus::Checking)
+                        || self
+                            .update_check_inflight
+                            .load(std::sync::atomic::Ordering::SeqCst);
+                if ui
+                    .add_enabled(!checking, egui::Button::new(if checking {
+                        "Checking…"
+                    } else {
+                        "Check for update"
+                    }))
+                    .clicked()
+                {
+                    self.kick_update_check(true);
+                }
+
+                ui.add_space(6.0);
+                match &self.update_check_status {
+                    super::UpdateCheckStatus::Idle => {}
+                    super::UpdateCheckStatus::Checking => {
+                        ui.label(egui::RichText::new("Checking for updates…").small().weak());
+                    }
+                    super::UpdateCheckStatus::UpToDate => {
+                        ui.label(
+                            egui::RichText::new("You're up to date.")
+                                .small()
+                                .color(Color32::from_rgb(140, 220, 160)),
+                        );
+                    }
+                    super::UpdateCheckStatus::Available { version } => {
+                        ui.label(
+                            egui::RichText::new(format!("Update {version} available"))
+                                .small()
+                                .color(Color32::from_rgb(220, 200, 120)),
+                        );
+                    }
+                    super::UpdateCheckStatus::Failed { message } => {
+                        ui.label(
+                            egui::RichText::new(message)
+                                .small()
+                                .color(Color32::from_rgb(255, 160, 120)),
+                        );
+                    }
                 }
                     }
                 }
