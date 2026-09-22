@@ -45,6 +45,9 @@ pub struct UiPrefs {
     pub camera_list_open: bool,
     #[serde(default = "default_true")]
     pub sidebar_open: bool,
+    /// Camera library side panel width (pixels).
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
     /// Name of the last selected view; restored on launch if it still exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_view: Option<String>,
@@ -101,6 +104,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_sidebar_width() -> f32 {
+    220.0
+}
+
+pub fn clamp_sidebar_width(w: f32) -> f32 {
+    w.clamp(160.0, 360.0)
+}
+
 fn default_outline_width() -> f32 {
     3.0
 }
@@ -147,6 +158,7 @@ impl Default for UiPrefs {
             outline_width: default_outline_width(),
             camera_list_open: true,
             sidebar_open: true,
+            sidebar_width: default_sidebar_width(),
             last_view: None,
             last_aux_view: None,
             fit: None,
@@ -255,6 +267,7 @@ impl ViewerApp {
             outline_width: self.outline_width,
             camera_list_open: self.camera_list_open,
             sidebar_open: self.sidebar_open,
+            sidebar_width: clamp_sidebar_width(self.sidebar_width),
             last_view: Some(self.views.active_view().name.clone()),
             last_aux_view: aux_name,
             fit: Some(self.fit.as_str().to_string()),

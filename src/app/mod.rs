@@ -302,6 +302,8 @@ pub struct ViewerApp {
     outline_width: f32,
     camera_list_open: bool,
     sidebar_open: bool,
+    /// Width of the camera library side panel (drag edge to resize).
+    sidebar_width: f32,
     /// Ordered camera library groups (persisted in ui.toml).
     library_groups: Vec<LibraryGroup>,
     /// Group index being renamed in the sidebar, if any.
@@ -512,6 +514,7 @@ impl ViewerApp {
             outline_width: ui_prefs.outline_width(),
             camera_list_open: ui_prefs.camera_list_open,
             sidebar_open: ui_prefs.sidebar_open,
+            sidebar_width: settings::clamp_sidebar_width(ui_prefs.sidebar_width),
             library_groups: ui_prefs.library_groups,
             library_renaming: None,
             library_rename_buf: String::new(),
@@ -1927,29 +1930,7 @@ impl eframe::App for ViewerApp {
             }
 
             if self.sidebar_open {
-                egui::SidePanel::left("cameras_side")
-                    .resizable(true)
-                    .default_width(220.0)
-                    .width_range(160.0..=360.0)
-                    .frame(
-                        egui::Frame::NONE
-                            .fill(PANEL_BG)
-                            .inner_margin(egui::Margin::symmetric(10, 8)),
-                    )
-                    .show(ctx, |ui| {
-                        ui.set_max_width(ui.max_rect().width());
-                        ui.horizontal(|ui| {
-                            if ui
-                                .small_button(icons::CARET_LEFT)
-                                .on_hover_text("Collapse sidebar")
-                                .clicked()
-                            {
-                                self.sidebar_open = false;
-                                self.save_ui_prefs();
-                            }
-                        });
-                        self.camera_sidebar(ui, self.views.active, false);
-                    });
+                self.show_resizable_camera_sidebar(ctx, self.views.active, false, "cameras_side");
             } else {
                 egui::SidePanel::left("cameras_collapsed")
                     .exact_width(28.0)

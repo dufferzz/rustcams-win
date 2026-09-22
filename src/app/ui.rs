@@ -12,7 +12,7 @@ use egui::{Color32, Id, Rect, Sense, Vec2};
 use std::time::Instant;
 use tracing::info;
 
-use super::settings::{CANVAS_BG, PANEL_BG};
+use super::settings::{clamp_sidebar_width, CANVAS_BG, PANEL_BG};
 
 impl ViewerApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
@@ -313,6 +313,82 @@ impl ViewerApp {
                     });
                 });
         }
+    }
+
+    /// Side panel with an explicit width we own. Built-in egui resize fights widgets
+    /// that allocate infinite width in horizontal layouts, so we use `exact_width`
+    /// plus a custom drag handle on the right edge.
+    pub(super) fn show_resizable_camera_sidebar(
+        &mut self,
+        ctx: &egui::Context,
+        view_idx: usize,
+        is_aux: bool,
+        id: &'static str,
+    ) {
+        let width = clamp_sidebar_width(self.sidebar_width);
+        let panel = egui::SidePanel::left(id)
+            .exact_width(width)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(PANEL_BG)
+                    .inner_margin(egui::Margin::symmetric(10, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(ui.max_rect().width());
+                if !is_aux {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button(icons::CARET_LEFT)
+                            .on_hover_text("Collapse sidebar")
+                            .clicked()
+                        {
+                            self.sidebar_open = false;
+                            self.save_ui_prefs();
+                        }
+                    });
+                }
+                self.camera_sidebar(ui, view_idx, is_aux);
+            });
+
+        let rect = panel.response.rect;
+        let resize_id = Id::new((id, "resize_handle"));
+        egui::Area::new(resize_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(rect.right() - 4.0, rect.top()))
+            .interactable(true)
+            .show(ctx, |ui| {
+                let size = Vec2::new(8.0, rect.height());
+                let (_r, response) = ui.allocate_exact_size(size, Sense::drag());
+                if response.hovered() || response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    ui.painter().rect_filled(
+                        response.rect,
+                        0.0,
+                        if response.dragged() {
+                            self.accent.linear_multiply(0.55)
+                        } else {
+                            Color32::from_rgba_unmultiplied(
+                                self.accent.r(),
+                                self.accent.g(),
+                                self.accent.b(),
+                                40,
+                            )
+                        },
+                    );
+                }
+                if response.dragged() {
+                    let next =
+                        clamp_sidebar_width(self.sidebar_width + response.drag_delta().x);
+                    if (next - self.sidebar_width).abs() > 0.1 {
+                        self.sidebar_width = next;
+                    }
+                }
+                if response.drag_stopped() {
+                    self.sidebar_width = clamp_sidebar_width(self.sidebar_width);
+                    self.save_ui_prefs();
+                }
+            });
     }
 
     pub(super) fn camera_sidebar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
@@ -754,7 +830,8 @@ impl ViewerApp {
         let mut home = false;
 
         let gap = 4.0;
-        let width = ui.available_width();
+        // Prefer the panel's max rect — available_width can be infinite in some layouts.
+        let width = ui.max_rect().width().min(ui.available_width()).clamp(120.0, 360.0);
         let cell = ((width - gap * 2.0) / 3.0).floor().clamp(34.0, 48.0);
         let font = (cell * 0.42).clamp(14.0, 18.0);
         let pad_w = cell * 3.0 + gap * 2.0;
@@ -774,8 +851,10 @@ impl ViewerApp {
         };
 
         ui.horizontal(|ui| {
-            let inset = ((ui.available_width() - pad_w) * 0.5).max(0.0);
-            if inset > 0.0 {
+            // Never use available_width() here — it's infinite in LTR and add_space(∞)
+            // expands the whole side panel to its max.
+            let inset = ((width - pad_w) * 0.5).max(0.0);
+            if inset > 0.0 && inset.is_finite() {
                 ui.add_space(inset);
             }
             egui::Grid::new("ptz_pad")
@@ -1668,19 +1747,7 @@ impl ViewerApp {
                         });
 
                     if self.sidebar_open {
-                        egui::SidePanel::left("aux_cameras_side")
-                            .resizable(true)
-                            .default_width(220.0)
-                            .width_range(160.0..=360.0)
-                            .frame(
-                                egui::Frame::NONE
-                                    .fill(PANEL_BG)
-                                    .inner_margin(egui::Margin::symmetric(10, 8)),
-                            )
-                            .show(ctx, |ui| {
-                                ui.set_max_width(ui.max_rect().width());
-                                self.camera_sidebar(ui, aux_view, true);
-                            });
+                        self.show_resizable_camera_sidebar(ctx, aux_view, true, "aux_cameras_side");
                     }
                 }
 
