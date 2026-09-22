@@ -1927,7 +1927,7 @@ impl eframe::App for ViewerApp {
             }
 
             if self.sidebar_open {
-                egui::SidePanel::left("cameras")
+                egui::SidePanel::left("cameras_side")
                     .resizable(true)
                     .default_width(220.0)
                     .width_range(160.0..=360.0)
@@ -1937,7 +1937,7 @@ impl eframe::App for ViewerApp {
                             .inner_margin(egui::Margin::symmetric(10, 8)),
                     )
                     .show(ctx, |ui| {
-                        ui.set_width(ui.available_width());
+                        ui.set_max_width(ui.max_rect().width());
                         ui.horizontal(|ui| {
                             if ui
                                 .small_button(icons::CARET_LEFT)

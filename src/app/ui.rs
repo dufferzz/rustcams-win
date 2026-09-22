@@ -325,11 +325,11 @@ impl ViewerApp {
         let mut cancel_rename = false;
         let mut place_cam: Option<String> = None;
 
-        ui.set_width(ui.available_width());
+        ui.set_max_width(ui.max_rect().width());
         ui.horizontal(|ui| {
+            // Horizontal layouts report infinite available_width — size from max_rect.
             let btn_reserve = 64.0;
-            let edit_w =
-                (ui.available_width() - btn_reserve - ui.spacing().item_spacing.x).max(40.0);
+            let edit_w = (ui.max_rect().width() - btn_reserve - ui.spacing().item_spacing.x).max(40.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.sidebar_filter)
                     .hint_text("Filter…")
@@ -368,9 +368,10 @@ impl ViewerApp {
 
                     if self.library_renaming == Some(gi) {
                         ui.horizontal(|ui| {
+                            let edit_w = (ui.max_rect().width() - 52.0).max(40.0);
                             let edit = ui.add(
                                 egui::TextEdit::singleline(&mut self.library_rename_buf)
-                                    .desired_width(ui.available_width() - 52.0)
+                                    .desired_width(edit_w)
                                     .hint_text("Group name"),
                             );
                             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -903,7 +904,6 @@ impl ViewerApp {
             {
                 self.ptz.refresh_park_action(target.clone());
             }
-
             match self.ptz.park_status(&target) {
                 ParkActionStatus::Idle => {
                     self.ptz.fetch_park_action(target.clone());
@@ -921,51 +921,56 @@ impl ViewerApp {
                             .color(Color32::from_rgb(160, 160, 160)),
                     );
                 }
-                ParkActionStatus::Error(err) => {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Park ?")
-                                    .color(Color32::from_rgb(255, 160, 120)),
-                            )
-                            .min_size(Vec2::new(ui.available_width(), 0.0)),
-                        )
-                        .on_hover_text(err)
-                        .clicked()
-                    {
-                        self.ptz.refresh_park_action(target.clone());
-                    }
-                }
-                ParkActionStatus::Ready(park) => {
-                    let (label, color) = if park.enabled {
-                        ("Park On", Color32::from_rgb(140, 210, 150))
-                    } else {
-                        ("Park Off", Color32::from_rgb(180, 180, 180))
-                    };
-                    let hint = park_action_hint(&park);
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new(label).color(color))
-                                .min_size(Vec2::new(ui.available_width(), 0.0)),
-                        )
-                        .on_hover_text(format!(
-                            "{hint}\nClick to {}",
-                            if park.enabled { "disable" } else { "enable" }
-                        ))
-                        .clicked()
-                    {
-                        self.ptz.set_park_enabled(target.clone(), !park.enabled);
-                    }
-                }
+                ParkActionStatus::Error(_) | ParkActionStatus::Ready(_) => {}
             }
         });
 
-        if let ParkActionStatus::Ready(park) = self.ptz.park_status(&target) {
-            ui.label(
-                egui::RichText::new(park_action_hint(&park))
-                    .small()
-                    .color(Color32::from_rgb(140, 150, 160)),
-            );
+        // Full-width controls must stay in the vertical layout — inside a
+        // horizontal row `available_width()` is infinite and blows the side panel
+        // out to its max.
+        match self.ptz.park_status(&target) {
+            ParkActionStatus::Idle | ParkActionStatus::Loading => {}
+            ParkActionStatus::Error(err) => {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::Button::new(
+                            egui::RichText::new("Park ?")
+                                .color(Color32::from_rgb(255, 160, 120)),
+                        ),
+                    )
+                    .on_hover_text(err)
+                    .clicked()
+                {
+                    self.ptz.refresh_park_action(target.clone());
+                }
+            }
+            ParkActionStatus::Ready(park) => {
+                let (label, color) = if park.enabled {
+                    ("Park On", Color32::from_rgb(140, 210, 150))
+                } else {
+                    ("Park Off", Color32::from_rgb(180, 180, 180))
+                };
+                let hint = park_action_hint(&park);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 0.0],
+                        egui::Button::new(egui::RichText::new(label).color(color)),
+                    )
+                    .on_hover_text(format!(
+                        "{hint}\nClick to {}",
+                        if park.enabled { "disable" } else { "enable" }
+                    ))
+                    .clicked()
+                {
+                    self.ptz.set_park_enabled(target.clone(), !park.enabled);
+                }
+                ui.label(
+                    egui::RichText::new(hint)
+                        .small()
+                        .color(Color32::from_rgb(140, 150, 160)),
+                );
+            }
         }
     }
 
@@ -1663,7 +1668,7 @@ impl ViewerApp {
                         });
 
                     if self.sidebar_open {
-                        egui::SidePanel::left("aux_cameras")
+                        egui::SidePanel::left("aux_cameras_side")
                             .resizable(true)
                             .default_width(220.0)
                             .width_range(160.0..=360.0)
@@ -1673,7 +1678,7 @@ impl ViewerApp {
                                     .inner_margin(egui::Margin::symmetric(10, 8)),
                             )
                             .show(ctx, |ui| {
-                                ui.set_width(ui.available_width());
+                                ui.set_max_width(ui.max_rect().width());
                                 self.camera_sidebar(ui, aux_view, true);
                             });
                     }
