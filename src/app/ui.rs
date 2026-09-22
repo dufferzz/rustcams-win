@@ -325,11 +325,15 @@ impl ViewerApp {
         let mut cancel_rename = false;
         let mut place_cam: Option<String> = None;
 
+        ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
+            let btn_reserve = 64.0;
+            let edit_w =
+                (ui.available_width() - btn_reserve - ui.spacing().item_spacing.x).max(40.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.sidebar_filter)
                     .hint_text("Filter…")
-                    .desired_width(ui.available_width() - 72.0),
+                    .desired_width(edit_w),
             );
             if ui
                 .small_button(icons::labeled(icons::PLUS, "Group"))
@@ -588,6 +592,7 @@ impl ViewerApp {
                 };
                 ui.add(
                     egui::Label::new(egui::RichText::new(label).color(color))
+                        .truncate()
                         .sense(Sense::click_and_drag()),
                 )
             });
@@ -696,18 +701,26 @@ impl ViewerApp {
 
         match (&cam_label, &target) {
             (Some(name), Some(_)) => {
-                ui.label(
-                    egui::RichText::new(name)
-                        .small()
-                        .color(Color32::from_rgb(180, 190, 200)),
-                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .small()
+                            .color(Color32::from_rgb(180, 190, 200)),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(name.clone());
             }
             (Some(name), None) => {
-                ui.label(
-                    egui::RichText::new(name)
-                        .small()
-                        .color(Color32::from_rgb(180, 190, 200)),
-                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .small()
+                            .color(Color32::from_rgb(180, 190, 200)),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(name.clone());
                 ui.label(
                     egui::RichText::new("No PTZ on this camera")
                         .small()
@@ -1660,6 +1673,7 @@ impl ViewerApp {
                                     .inner_margin(egui::Margin::symmetric(10, 8)),
                             )
                             .show(ctx, |ui| {
+                                ui.set_width(ui.available_width());
                                 self.camera_sidebar(ui, aux_view, true);
                             });
                     }

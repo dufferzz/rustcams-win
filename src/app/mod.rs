@@ -1937,6 +1937,7 @@ impl eframe::App for ViewerApp {
                             .inner_margin(egui::Margin::symmetric(10, 8)),
                     )
                     .show(ctx, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             if ui
                                 .small_button(icons::CARET_LEFT)
