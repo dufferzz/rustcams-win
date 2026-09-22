@@ -23,11 +23,15 @@ pub struct AvailableUpdate {
     pub appimage_url: String,
     pub sha256_url: String,
     pub asset_name: String,
+    /// Release notes from GitHub (`body`), lightly cleaned for UI display.
+    pub changelog: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct GhRelease {
     tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
     #[serde(default)]
     assets: Vec<GhAsset>,
 }
@@ -214,7 +218,42 @@ fn offer_from_release(
         appimage_url,
         sha256_url,
         asset_name: asset_name.to_string(),
+        changelog: plain_changelog(release.body.as_deref().unwrap_or("")),
     }))
+}
+
+/// Trim and lightly de-markdown a GitHub release body for the update banner.
+pub fn plain_changelog(body: &str) -> String {
+    let mut out = String::new();
+    for raw in body.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            continue;
+        }
+        let mut t = trimmed;
+        while let Some(rest) = t.strip_prefix('#') {
+            t = rest.trim_start();
+        }
+        let bullet = t.starts_with('-') || t.starts_with('*');
+        if bullet {
+            t = t[1..].trim_start();
+        }
+        let cleaned = t.replace("**", "").replace("__", "").replace('`', "");
+        if cleaned.is_empty() {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if bullet {
+            out.push_str("• ");
+        }
+        out.push_str(&cleaned);
+    }
+    out.trim().to_string()
 }
 
 fn asset_url(assets: &[GhAsset], name: &str) -> Option<String> {
@@ -379,8 +418,9 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"{
+    const SAMPLE: &str = r###"{
         "tag_name": "v0.3.0",
+        "body": "## Summary\n- Auto updates\n- About tab\n\n## Assets\n- AppImage",
         "assets": [
             {
                 "name": "Citadel_CCTV-linux-x86_64.AppImage",
@@ -399,7 +439,7 @@ mod tests {
                 "browser_download_url": "https://example.com/sha-arm"
             }
         ]
-    }"#;
+    }"###;
 
     #[test]
     fn normalize_strips_v_prefix() {
@@ -446,6 +486,17 @@ mod tests {
         assert_eq!(offer.appimage_url, "https://example.com/app");
         assert_eq!(offer.sha256_url, "https://example.com/sha");
         assert_eq!(offer.asset_name, "Citadel_CCTV-linux-x86_64.AppImage");
+        assert!(offer.changelog.contains("Auto updates"));
+        assert!(offer.changelog.contains('•'));
+    }
+
+    #[test]
+    fn plain_changelog_strips_markdown() {
+        let text = plain_changelog("## Summary\n- **Bold** item\n- `code`\n\n## Assets\n- file");
+        assert!(!text.contains('#'));
+        assert!(!text.contains("**"));
+        assert!(text.contains("Bold item"));
+        assert!(text.contains("code"));
     }
 
     #[test]

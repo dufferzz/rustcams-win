@@ -3,7 +3,7 @@ mod input;
 mod settings;
 mod ui;
 
-use self::settings::{CANVAS_BG, PANEL_BG, STATUS_BG};
+use self::settings::{LibraryGroup, CANVAS_BG, PANEL_BG, STATUS_BG};
 use crate::config::{
     absolute_path, default_cameras_toml, AppConfig, CameraConfig, ResolvedConfig, StreamType,
 };
@@ -50,8 +50,6 @@ pub(super) enum UpdateCheckStatus {
     Available { version: String },
     Failed { message: String },
 }
-
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SidebarControls {
@@ -304,6 +302,11 @@ pub struct ViewerApp {
     outline_width: f32,
     camera_list_open: bool,
     sidebar_open: bool,
+    /// Ordered camera library groups (persisted in ui.toml).
+    library_groups: Vec<LibraryGroup>,
+    /// Group index being renamed in the sidebar, if any.
+    library_renaming: Option<usize>,
+    library_rename_buf: String,
     ui_prefs_path: PathBuf,
     log_buffer: LogBuffer,
     log_auto_scroll: bool,
@@ -321,10 +324,7 @@ pub struct ViewerApp {
     update_progress: Arc<AtomicU64>,
     update_inflight: Arc<AtomicBool>,
     update_check_inflight: Arc<AtomicBool>,
-    last_update_check: Instant,
     update_check_status: UpdateCheckStatus,
-    /// When true, the next offer from `pending_update` starts download immediately.
-    update_auto_apply: Arc<AtomicBool>,
 }
 
 impl ViewerApp {
@@ -512,6 +512,9 @@ impl ViewerApp {
             outline_width: ui_prefs.outline_width(),
             camera_list_open: ui_prefs.camera_list_open,
             sidebar_open: ui_prefs.sidebar_open,
+            library_groups: ui_prefs.library_groups,
+            library_renaming: None,
+            library_rename_buf: String::new(),
             ui_prefs_path,
             log_buffer,
             log_auto_scroll: true,
@@ -532,11 +535,10 @@ impl ViewerApp {
             update_progress: Arc::new(AtomicU64::new(0)),
             update_inflight: Arc::new(AtomicBool::new(false)),
             update_check_inflight: Arc::new(AtomicBool::new(false)),
-            last_update_check: Instant::now(),
             update_check_status: UpdateCheckStatus::Idle,
-            update_auto_apply: Arc::new(AtomicBool::new(false)),
         };
         app.save_ui_prefs();
+        app.ensure_library_groups(true);
         if app.nvr_retry {
             app.kick_nvr_resolve();
         }
@@ -782,6 +784,168 @@ impl ViewerApp {
                 self.ptz_stop();
             }
         }
+        self.ensure_library_groups(true);
+    }
+
+    /// Keep library groups in sync with the resolved camera list.
+    ///
+    /// Empty prefs → one "Cameras" group sorted alphabetically by display name.
+    /// Unknown ids are pruned; newly discovered cameras are appended to the first
+    /// group in alphabetical order.
+    pub(super) fn ensure_library_groups(&mut self, persist: bool) {
+        let mut name_by_id: HashMap<String, String> = HashMap::new();
+        for cam in &self.cameras {
+            name_by_id.insert(cam.id.clone(), cam.name.to_ascii_lowercase());
+        }
+        let sort_ids = |ids: &mut Vec<String>, names: &HashMap<String, String>| {
+            ids.sort_by(|a, b| {
+                let na = names.get(a).map(String::as_str).unwrap_or(a.as_str());
+                let nb = names.get(b).map(String::as_str).unwrap_or(b.as_str());
+                na.cmp(nb).then_with(|| a.cmp(b))
+            });
+        };
+
+        let known: std::collections::HashSet<String> =
+            self.cameras.iter().map(|c| c.id.clone()).collect();
+
+        if self.library_groups.is_empty() {
+            let mut ids: Vec<String> = self.cameras.iter().map(|c| c.id.clone()).collect();
+            sort_ids(&mut ids, &name_by_id);
+            self.library_groups.push(LibraryGroup {
+                name: "Cameras".into(),
+                open: true,
+                cameras: ids,
+            });
+            if persist {
+                self.save_ui_prefs();
+            }
+            return;
+        }
+
+        let mut changed = false;
+        for g in &mut self.library_groups {
+            let before = g.cameras.len();
+            g.cameras.retain(|id| known.contains(id));
+            if g.cameras.len() != before {
+                changed = true;
+            }
+        }
+        if self.library_groups.is_empty() {
+            self.library_groups.push(LibraryGroup {
+                name: "Cameras".into(),
+                open: true,
+                cameras: Vec::new(),
+            });
+            changed = true;
+        }
+
+        let mut assigned = std::collections::HashSet::new();
+        for g in &self.library_groups {
+            for id in &g.cameras {
+                assigned.insert(id.clone());
+            }
+        }
+        let mut orphans: Vec<String> = self
+            .cameras
+            .iter()
+            .filter(|c| !assigned.contains(&c.id))
+            .map(|c| c.id.clone())
+            .collect();
+        if !orphans.is_empty() {
+            sort_ids(&mut orphans, &name_by_id);
+            self.library_groups[0].cameras.extend(orphans);
+            changed = true;
+        }
+
+        if changed && persist {
+            self.save_ui_prefs();
+        }
+    }
+
+    pub(super) fn add_library_group(&mut self) {
+        self.ensure_library_groups(false);
+        let n = self.library_groups.len() + 1;
+        let name = format!("Group {n}");
+        self.library_groups.push(LibraryGroup {
+            name: name.clone(),
+            open: true,
+            cameras: Vec::new(),
+        });
+        self.library_renaming = Some(self.library_groups.len() - 1);
+        self.library_rename_buf = name;
+        self.save_ui_prefs();
+    }
+
+    pub(super) fn delete_library_group(&mut self, group_idx: usize) {
+        if self.library_groups.len() <= 1 || group_idx >= self.library_groups.len() {
+            return;
+        }
+        let removed = self.library_groups.remove(group_idx);
+        self.library_groups[0].cameras.extend(removed.cameras);
+        if self.library_renaming == Some(group_idx) {
+            self.library_renaming = None;
+        } else if let Some(r) = self.library_renaming {
+            if r > group_idx {
+                self.library_renaming = Some(r - 1);
+            }
+        }
+        self.save_ui_prefs();
+    }
+
+    pub(super) fn finish_library_rename(&mut self) {
+        let Some(idx) = self.library_renaming.take() else {
+            return;
+        };
+        let name = self.library_rename_buf.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(g) = self.library_groups.get_mut(idx) {
+            if g.name != name {
+                g.name = name;
+                self.save_ui_prefs();
+            }
+        }
+    }
+
+    /// Move `cam_id` into `dest_group` at `dest_index` (0 = top).
+    pub(super) fn library_move_camera(
+        &mut self,
+        cam_id: &str,
+        dest_group: usize,
+        dest_index: usize,
+    ) {
+        if self.camera_by_id(cam_id).is_none() || self.library_groups.is_empty() {
+            return;
+        }
+        let dest_group = dest_group.min(self.library_groups.len() - 1);
+
+        let mut from_group = None;
+        let mut from_index = None;
+        for (gi, g) in self.library_groups.iter_mut().enumerate() {
+            if let Some(pos) = g.cameras.iter().position(|c| c == cam_id) {
+                g.cameras.remove(pos);
+                from_group = Some(gi);
+                from_index = Some(pos);
+                break;
+            }
+        }
+
+        let mut idx = dest_index;
+        if from_group == Some(dest_group) {
+            if let Some(fi) = from_index {
+                if fi < idx {
+                    idx = idx.saturating_sub(1);
+                }
+            }
+        }
+        let g = &mut self.library_groups[dest_group];
+        idx = idx.min(g.cameras.len());
+        if from_group == Some(dest_group) && from_index == Some(idx) {
+            // No-op reinsert at same place — still put it back.
+        }
+        g.cameras.insert(idx, cam_id.to_string());
+        self.save_ui_prefs();
     }
 
     fn clamp_aux_view(&mut self) {
@@ -1542,10 +1706,10 @@ impl ViewerApp {
 
     /// Start a GitHub release check.
     ///
-    /// - `manual`: from Settings → About; ignores the auto-updates toggle and
+    /// - `manual`: from Settings → About; ignores the check-on-launch toggle and
     ///   `update_later`, and does not treat a skipped version as quiet.
     /// - automatic: requires `check_updates`, skips if a check/download is already
-    ///   running; offers auto-download + relaunch when an update is found.
+    ///   running; shows a banner and waits for confirmation before download.
     fn kick_update_check(&mut self, manual: bool) {
         if !manual && !self.check_updates {
             return;
@@ -1573,12 +1737,7 @@ impl ViewerApp {
             return;
         }
 
-        self.last_update_check = Instant::now();
         self.update_check_status = UpdateCheckStatus::Checking;
-        // Automatic checks auto-apply; manual checks only auto-apply when the toggle is on.
-        let auto_apply = self.check_updates;
-        self.update_auto_apply
-            .store(auto_apply, Ordering::SeqCst);
         if manual {
             self.update_later = false;
         }
@@ -1586,7 +1745,6 @@ impl ViewerApp {
         info!(
             path = %path.display(),
             manual,
-            auto_apply,
             "checking GitHub for AppImage updates"
         );
         let skipped = if manual {
@@ -1616,12 +1774,7 @@ impl ViewerApp {
                     self.update_banner = UpdateBanner::Ready {
                         version: version.clone(),
                     };
-                    self.update_check_status = UpdateCheckStatus::Available {
-                        version: version.clone(),
-                    };
-                    if self.check_updates {
-                        self.relaunch_after_update();
-                    }
+                    self.update_check_status = UpdateCheckStatus::Available { version };
                 }
                 Err(message) => {
                     self.update_banner = UpdateBanner::Failed {
@@ -1646,39 +1799,12 @@ impl ViewerApp {
                         version: offer.tag.clone(),
                     };
                     self.last_update_offer = Some(offer.clone());
-                    let auto = self.update_auto_apply.swap(false, Ordering::SeqCst);
-                    if auto {
-                        self.update_later = false;
-                        self.start_update_download();
-                    } else if !self.update_later
-                        && matches!(self.update_banner, UpdateBanner::Hidden)
-                    {
+                    if !self.update_later && matches!(self.update_banner, UpdateBanner::Hidden) {
                         self.update_banner = UpdateBanner::Offer(offer);
                     }
                 }
             }
         }
-    }
-
-    fn maybe_periodic_update_check(&mut self) {
-        if !self.check_updates {
-            return;
-        }
-        if crate::update::appimage_path().is_none() {
-            return;
-        }
-        if self.update_check_inflight.load(Ordering::SeqCst)
-            || self.update_inflight.load(Ordering::SeqCst)
-        {
-            return;
-        }
-        if !matches!(self.update_banner, UpdateBanner::Hidden | UpdateBanner::Failed { .. }) {
-            return;
-        }
-        if self.last_update_check.elapsed() < UPDATE_CHECK_INTERVAL {
-            return;
-        }
-        self.kick_update_check(false);
     }
 
     fn start_update_download(&mut self) {
@@ -1742,7 +1868,6 @@ impl eframe::App for ViewerApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.poll_update_check();
-        self.maybe_periodic_update_check();
         if matches!(
             self.update_banner,
             UpdateBanner::Downloading { .. } | UpdateBanner::Ready { .. }
@@ -1787,18 +1912,6 @@ impl eframe::App for ViewerApp {
                 .show(ctx, |ui| {
                     self.toolbar(ui, self.views.active, false);
                 });
-
-            if !matches!(self.update_banner, UpdateBanner::Hidden) {
-                egui::TopBottomPanel::top("update_banner")
-                    .frame(
-                        egui::Frame::NONE
-                            .fill(STATUS_BG)
-                            .inner_margin(egui::Margin::symmetric(8, 4)),
-                    )
-                    .show(ctx, |ui| {
-                        self.update_banner_bar(ui, ctx);
-                    });
-            }
 
             if self.debug_overlay {
                 egui::TopBottomPanel::bottom("statusbar")
@@ -1897,6 +2010,7 @@ impl eframe::App for ViewerApp {
 
         self.draw_clear_slot_dialog(ctx);
         self.draw_gate_confirm_dialog(ctx);
+        self.update_dialog(ctx);
         self.draw_anpr_alert(ctx);
         self.draw_debug_panel(ctx);
         self.draw_log_panel(ctx);

@@ -26,6 +26,16 @@ pub const CANVAS_BG: Color32 = Color32::from_rgb(8, 9, 12);
 pub const STATUS_BG: Color32 = Color32::from_rgb(16, 18, 22);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryGroup {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub open: bool,
+    /// Camera ids in display order within this group.
+    #[serde(default)]
+    pub cameras: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiPrefs {
     #[serde(default = "default_accent_hex")]
     pub accent: String,
@@ -46,13 +56,15 @@ pub struct UiPrefs {
     /// Append `stutter-stats.log` next to cameras.toml (~2s). Off by default.
     #[serde(default)]
     pub stutter_log_file: bool,
-    /// Linux AppImage: check GitHub Releases on launch and every 5 minutes;
-    /// when an update is found, download and relaunch automatically.
+    /// Linux AppImage: query GitHub Releases on launch; confirm before download.
     #[serde(default = "default_true")]
     pub check_updates: bool,
     /// Last skipped update version (`0.3.0`); stay quiet until a newer tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_update: Option<String>,
+    /// Named camera-library groups with manual order (drag-and-drop).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_groups: Vec<LibraryGroup>,
     #[serde(default = "default_w1")]
     pub decode_1: i32,
     #[serde(default = "default_w1_hd")]
@@ -141,6 +153,7 @@ impl Default for UiPrefs {
             stutter_log_file: false,
             check_updates: true,
             skipped_update: None,
+            library_groups: Vec::new(),
             decode_1: default_w1(),
             decode_1_hd: default_w1_hd(),
             decode_2: default_w2(),
@@ -248,6 +261,7 @@ impl ViewerApp {
             stutter_log_file: self.stutter_log_file,
             check_updates: self.check_updates,
             skipped_update: self.skipped_update.clone(),
+            library_groups: self.library_groups.clone(),
             decode_1: self.decode_1,
             decode_1_hd: self.decode_1_hd,
             decode_2: self.decode_2,
@@ -927,17 +941,12 @@ impl ViewerApp {
                 ui.add_space(4.0);
                 ui.label("Made by Sam Duff");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                ui.label(
-                    egui::RichText::new("Includes auto-update improvements from 0.2.4.")
-                        .small()
-                        .weak(),
-                );
                 ui.add_space(12.0);
 
                 let is_appimage = crate::update::appimage_path().is_some();
                 if is_appimage {
                     if ui
-                        .checkbox(&mut self.check_updates, "Auto updates")
+                        .checkbox(&mut self.check_updates, "Check for updates on launch")
                         .changed()
                     {
                         save_ui = true;
@@ -956,7 +965,7 @@ impl ViewerApp {
                     }
                     ui.label(
                         egui::RichText::new(
-                            "On launch and every 5 minutes: download a newer AppImage and relaunch.",
+                            "Looks up the latest GitHub release. You confirm before download.",
                         )
                         .small()
                         .weak(),
@@ -965,7 +974,7 @@ impl ViewerApp {
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "Automatic updates are available when running the Linux AppImage.",
+                            "Update checks are available when running the Linux AppImage.",
                         )
                         .small()
                         .weak(),

@@ -174,32 +174,29 @@ impl ViewerApp {
             }
 
             ui.separator();
-            let gate_ready = self.gate_draft.is_configured();
-            let gate_busy = self.gate_busy();
-            let gate_tip = if !gate_ready {
-                "Set host, user, and password in Settings → Gates. DualShock Share also opens."
-                    .to_string()
-            } else if let Some(msg) = self.gate_status_text() {
-                format!("{msg} · Share · confirm with Enter or ✕")
-            } else {
-                "Open gates (confirms first). DualShock Share, then Enter or ✕.".to_string()
-            };
-            if ui
-                .add_enabled(
-                    gate_ready && !gate_busy && !self.pending_gate_confirm,
-                    egui::Button::new(if gate_busy {
-                        "Opening…".to_string()
-                    } else {
-                        icons::labeled(icons::DOOR_OPEN, "Gates")
-                    }),
-                )
-                .on_hover_text(gate_tip)
-                .clicked()
-            {
-                self.prompt_open_gates();
+            if self.gate_draft.is_configured() {
+                let gate_busy = self.gate_busy();
+                let gate_tip = if let Some(msg) = self.gate_status_text() {
+                    format!("{msg} · Share · confirm with Enter or ✕")
+                } else {
+                    "Open gates (confirms first). DualShock Share, then Enter or ✕.".to_string()
+                };
+                if ui
+                    .add_enabled(
+                        !gate_busy && !self.pending_gate_confirm,
+                        egui::Button::new(if gate_busy {
+                            "Opening…".to_string()
+                        } else {
+                            icons::labeled(icons::DOOR_OPEN, "Gates")
+                        }),
+                    )
+                    .on_hover_text(gate_tip)
+                    .clicked()
+                {
+                    self.prompt_open_gates();
+                }
+                ui.separator();
             }
-
-            ui.separator();
             if !is_aux {
                 if ui
                     .selectable_label(self.window_fullscreen, icons::CORNERS_OUT)
@@ -319,109 +316,355 @@ impl ViewerApp {
     }
 
     pub(super) fn camera_sidebar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
-        let mut list_open = self.camera_list_open;
-        let cam_header =
-            egui::CollapsingHeader::new(icons::labeled(icons::VIDEO_CAMERA, "Cameras"))
-                .id_salt(("camera_library_header", is_aux))
-                .open(Some(list_open))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.sidebar_filter)
-                            .hint_text("Filter…")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.add_space(4.0);
+        let mut save_groups = false;
+        let mut lib_drop: Option<(String, usize, usize)> = None;
+        let mut add_group = false;
+        let mut delete_group: Option<usize> = None;
+        let mut start_rename: Option<usize> = None;
+        let mut finish_rename = false;
+        let mut cancel_rename = false;
+        let mut place_cam: Option<String> = None;
 
-                    let filter = self.sidebar_filter.to_ascii_lowercase();
-                    let active_ids = self.view_camera_ids_at(view_idx);
-                    let selected_ptz = self.sidebar_ptz_cam.clone();
-                    let cameras: Vec<(String, String, bool, bool)> = self
-                        .cameras
-                        .iter()
-                        .filter(|c| {
-                            filter.is_empty()
-                                || c.name.to_ascii_lowercase().contains(&filter)
-                                || c.id.to_ascii_lowercase().contains(&filter)
-                        })
-                        .map(|c| {
-                            (
-                                c.id.clone(),
-                                c.name.clone(),
-                                active_ids.contains(&c.id),
-                                c.ptz.is_some(),
-                            )
-                        })
-                        .collect();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sidebar_filter)
+                    .hint_text("Filter…")
+                    .desired_width(ui.available_width() - 72.0),
+            );
+            if ui
+                .small_button(icons::labeled(icons::PLUS, "Group"))
+                .on_hover_text("Create a camera group")
+                .clicked()
+            {
+                add_group = true;
+            }
+        });
+        ui.add_space(4.0);
 
-                    let available = ui.available_height();
-                    let list_h = (available * 0.55).clamp(80.0, available.max(80.0));
+        let filter = self.sidebar_filter.to_ascii_lowercase();
+        let active_ids = self.view_camera_ids_at(view_idx);
+        let selected_ptz = self.sidebar_ptz_cam.clone();
+        let dragging_library = matches!(&self.cross_drag, Some(DragPayload::FromLibrary(_)))
+            || ui.ctx().dragged_id().is_some();
 
-                    egui::ScrollArea::vertical()
-                        .id_salt(("camera_library", is_aux))
-                        .max_height(list_h)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for (id, name, on_view, has_ptz) in cameras {
-                                let item_id = Id::new(("lib_cam", is_aux)).with(&id);
-                                let payload = DragPayload::FromLibrary(id.clone());
-                                let is_ptz_sel = selected_ptz.as_deref() == Some(id.as_str());
-                                let accent = self.accent;
-                                let response = ui.dnd_drag_source(item_id, payload.clone(), |ui| {
-                                    let mark = if on_view { icons::PLAY } else { icons::SQUARE };
-                                    let label = if has_ptz {
-                                        format!("{mark}  {name}  {}", icons::CROSSHAIR)
-                                    } else {
-                                        format!("{mark}  {name}")
-                                    };
-                                    let color = if is_ptz_sel {
-                                        selection_border(has_ptz)
-                                    } else if on_view {
-                                        super::settings::mix_rgb(
-                                            accent,
-                                            Color32::from_rgb(200, 210, 220),
-                                            0.35,
-                                        )
-                                    } else {
-                                        Color32::from_rgb(210, 210, 210)
-                                    };
-                                    ui.add(
-                                        egui::Label::new(egui::RichText::new(label).color(color))
-                                            .sense(Sense::click_and_drag()),
-                                    )
-                                });
-                                let can_replace = selected_ptz
-                                    .as_ref()
-                                    .is_some_and(|id| active_ids.contains(id));
-                                let hover = if can_replace {
-                                    "Click to replace the selected camera"
-                                } else if has_ptz {
-                                    "Drag onto a grid cell · click to select for PTZ"
-                                } else {
-                                    "Drag onto a grid cell · click to select"
-                                };
-                                let clicked = response.inner.clicked();
-                                if response.inner.drag_started() {
-                                    self.cross_drag = Some(payload);
-                                }
-                                response.inner.on_hover_text(hover);
-                                if clicked {
-                                    self.place_library_camera(&id, view_idx);
-                                }
-                                ui.add_space(2.0);
+        let available = ui.available_height();
+        let list_h = (available * 0.55).clamp(80.0, available.max(80.0));
+
+        egui::ScrollArea::vertical()
+            .id_salt(("camera_library", is_aux))
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let group_count = self.library_groups.len();
+                let multi = group_count > 1;
+                for gi in 0..group_count {
+                    let group_name = self.library_groups[gi].name.clone();
+                    let group_open = self.library_groups[gi].open || !multi;
+                    let cam_ids = self.library_groups[gi].cameras.clone();
+
+                    if self.library_renaming == Some(gi) {
+                        ui.horizontal(|ui| {
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut self.library_rename_buf)
+                                    .desired_width(ui.available_width() - 52.0)
+                                    .hint_text("Group name"),
+                            );
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                finish_rename = true;
+                            }
+                            if ui.small_button("OK").clicked() {
+                                finish_rename = true;
+                            }
+                            if ui.small_button("✕").clicked() {
+                                cancel_rename = true;
                             }
                         });
-                });
-        if cam_header.header_response.clicked() {
-            list_open = !list_open;
+                    }
+
+                    let mut body = |ui: &mut egui::Ui| {
+                        self.library_group_body(
+                            ui,
+                            is_aux,
+                            gi,
+                            &cam_ids,
+                            &filter,
+                            &active_ids,
+                            selected_ptz.as_deref(),
+                            dragging_library,
+                            &mut lib_drop,
+                            &mut place_cam,
+                        );
+                    };
+
+                    if multi {
+                        let header = egui::CollapsingHeader::new(format!(
+                            "{}  ({})",
+                            group_name,
+                            cam_ids.len()
+                        ))
+                        .id_salt(("lib_group", is_aux, gi))
+                        .open(Some(group_open))
+                        .show(ui, |ui| body(ui));
+
+                        if header.header_response.clicked() {
+                            if let Some(g) = self.library_groups.get_mut(gi) {
+                                g.open = !g.open;
+                                save_groups = true;
+                            }
+                        }
+                        header.header_response.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                start_rename = Some(gi);
+                                ui.close_menu();
+                            }
+                            if ui.button("Delete group").clicked() {
+                                delete_group = Some(gi);
+                                ui.close_menu();
+                            }
+                        });
+
+                        let href = &header.header_response;
+                        let hovering = href.dnd_hover_payload::<DragPayload>().is_some()
+                            || (href.contains_pointer()
+                                && matches!(
+                                    &self.cross_drag,
+                                    Some(DragPayload::FromLibrary(_))
+                                ));
+                        if hovering {
+                            ui.painter().rect_stroke(
+                                href.rect,
+                                2.0,
+                                egui::Stroke::new(1.5_f32, self.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        if let Some(payload) = href.dnd_release_payload::<DragPayload>() {
+                            if let DragPayload::FromLibrary(id) = (*payload).clone() {
+                                lib_drop = Some((id, gi, cam_ids.len()));
+                                self.cross_drag = None;
+                            }
+                        } else if href.contains_pointer()
+                            && ui.input(|i| i.pointer.primary_released())
+                        {
+                            if let Some(DragPayload::FromLibrary(id)) = self.cross_drag.take() {
+                                lib_drop = Some((id, gi, cam_ids.len()));
+                            }
+                        }
+                    } else {
+                        body(ui);
+                    }
+                }
+            });
+
+        if add_group {
+            self.add_library_group();
         }
-        if list_open != self.camera_list_open {
-            self.camera_list_open = list_open;
+        if let Some(gi) = start_rename {
+            self.library_renaming = Some(gi);
+            self.library_rename_buf = self
+                .library_groups
+                .get(gi)
+                .map(|g| g.name.clone())
+                .unwrap_or_default();
+        }
+        if finish_rename {
+            self.finish_library_rename();
+        }
+        if cancel_rename {
+            self.library_renaming = None;
+        }
+        if let Some(gi) = delete_group {
+            self.delete_library_group(gi);
+        }
+        if let Some((id, g, i)) = lib_drop {
+            self.library_move_camera(&id, g, i);
+        }
+        if let Some(id) = place_cam {
+            self.place_library_camera(&id, view_idx);
+        }
+        if save_groups {
             self.save_ui_prefs();
         }
 
         ui.add_space(6.0);
         ui.separator();
         self.sidebar_ptz_panel(ui);
+    }
+
+    fn library_group_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_aux: bool,
+        gi: usize,
+        cam_ids: &[String],
+        filter: &str,
+        active_ids: &[String],
+        selected_ptz: Option<&str>,
+        dragging_library: bool,
+        lib_drop: &mut Option<(String, usize, usize)>,
+        place_cam: &mut Option<String>,
+    ) {
+        let mut visible: Vec<(usize, String, String, bool, bool)> = Vec::new();
+        for (ci, id) in cam_ids.iter().enumerate() {
+            let Some(cam) = self.camera_by_id(id) else {
+                continue;
+            };
+            if !filter.is_empty()
+                && !cam.name.to_ascii_lowercase().contains(filter)
+                && !cam.id.to_ascii_lowercase().contains(filter)
+            {
+                continue;
+            }
+            visible.push((
+                ci,
+                cam.id.clone(),
+                cam.name.clone(),
+                active_ids.contains(&cam.id),
+                cam.ptz.is_some(),
+            ));
+        }
+
+        if visible.is_empty() {
+            let (rect, drop_resp) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), 28.0),
+                Sense::hover(),
+            );
+            ui.painter().text(
+                rect.left_center() + Vec2::new(6.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                if filter.is_empty() {
+                    "Drop cameras here"
+                } else {
+                    "No matches"
+                },
+                egui::FontId::proportional(12.0),
+                Color32::from_rgb(120, 125, 135),
+            );
+            let hovering = drop_resp.dnd_hover_payload::<DragPayload>().is_some()
+                || (drop_resp.contains_pointer()
+                    && matches!(&self.cross_drag, Some(DragPayload::FromLibrary(_))));
+            if hovering {
+                ui.painter().rect_stroke(
+                    rect,
+                    2.0,
+                    egui::Stroke::new(1.5_f32, self.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some(payload) = drop_resp.dnd_release_payload::<DragPayload>() {
+                if let DragPayload::FromLibrary(id) = (*payload).clone() {
+                    *lib_drop = Some((id, gi, cam_ids.len()));
+                    self.cross_drag = None;
+                }
+            } else if drop_resp.contains_pointer() && ui.input(|i| i.pointer.primary_released()) {
+                if let Some(DragPayload::FromLibrary(id)) = self.cross_drag.take() {
+                    *lib_drop = Some((id, gi, cam_ids.len()));
+                }
+            }
+        }
+
+        for (ci, id, name, on_view, has_ptz) in visible {
+            let item_id = Id::new(("lib_cam", is_aux, gi)).with(&id);
+            let payload = DragPayload::FromLibrary(id.clone());
+            let is_ptz_sel = selected_ptz == Some(id.as_str());
+            let accent = self.accent;
+            let response = ui.dnd_drag_source(item_id, payload.clone(), |ui| {
+                let mark = if on_view {
+                    icons::PLAY
+                } else {
+                    icons::SQUARE
+                };
+                let label = if has_ptz {
+                    format!("{mark}  {name}  {}", icons::CROSSHAIR)
+                } else {
+                    format!("{mark}  {name}")
+                };
+                let color = if is_ptz_sel {
+                    selection_border(has_ptz)
+                } else if on_view {
+                    super::settings::mix_rgb(accent, Color32::from_rgb(200, 210, 220), 0.35)
+                } else {
+                    Color32::from_rgb(210, 210, 210)
+                };
+                ui.add(
+                    egui::Label::new(egui::RichText::new(label).color(color))
+                        .sense(Sense::click_and_drag()),
+                )
+            });
+
+            let row = &response.response;
+            let hovering = row.dnd_hover_payload::<DragPayload>().is_some()
+                || (row.contains_pointer()
+                    && matches!(
+                        &self.cross_drag,
+                        Some(DragPayload::FromLibrary(other)) if other != &id
+                    ));
+            if hovering {
+                ui.painter().hline(
+                    row.rect.x_range(),
+                    row.rect.top(),
+                    egui::Stroke::new(2.0_f32, self.accent),
+                );
+            }
+            if let Some(payload) = row.dnd_release_payload::<DragPayload>() {
+                if let DragPayload::FromLibrary(drag_id) = (*payload).clone() {
+                    if drag_id != id {
+                        *lib_drop = Some((drag_id, gi, ci));
+                    }
+                    self.cross_drag = None;
+                }
+            } else if row.contains_pointer() && ui.input(|i| i.pointer.primary_released()) {
+                if let Some(DragPayload::FromLibrary(drag_id)) = self.cross_drag.clone() {
+                    if drag_id != id {
+                        *lib_drop = Some((drag_id, gi, ci));
+                        self.cross_drag = None;
+                    }
+                }
+            }
+
+            let can_replace = selected_ptz.is_some_and(|sid| active_ids.iter().any(|id| id == sid));
+            let hover = if can_replace {
+                "Click to replace the selected camera"
+            } else if has_ptz {
+                "Drag to reorder or onto a grid cell · click for PTZ"
+            } else {
+                "Drag to reorder or onto a grid cell · click to select"
+            };
+            let clicked = response.inner.clicked();
+            if response.inner.drag_started() {
+                self.cross_drag = Some(payload);
+            }
+            response.inner.on_hover_text(hover);
+            if clicked {
+                *place_cam = Some(id);
+            }
+            ui.add_space(2.0);
+        }
+
+        if dragging_library && !cam_ids.is_empty() && filter.is_empty() {
+            let (rect, drop_resp) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), Sense::hover());
+            let hovering = drop_resp.dnd_hover_payload::<DragPayload>().is_some()
+                || (drop_resp.contains_pointer()
+                    && matches!(&self.cross_drag, Some(DragPayload::FromLibrary(_))));
+            if hovering {
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.center().y,
+                    egui::Stroke::new(2.0_f32, self.accent),
+                );
+            }
+            if let Some(payload) = drop_resp.dnd_release_payload::<DragPayload>() {
+                if let DragPayload::FromLibrary(id) = (*payload).clone() {
+                    *lib_drop = Some((id, gi, cam_ids.len()));
+                    self.cross_drag = None;
+                }
+            } else if drop_resp.contains_pointer() && ui.input(|i| i.pointer.primary_released()) {
+                if let Some(DragPayload::FromLibrary(id)) = self.cross_drag.take() {
+                    *lib_drop = Some((id, gi, cam_ids.len()));
+                }
+            }
+        }
     }
 
     fn sidebar_ptz_panel(&mut self, ui: &mut egui::Ui) {
@@ -799,60 +1042,123 @@ impl ViewerApp {
             });
     }
 
-    pub(super) fn update_banner_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| match self.update_banner.clone() {
-            UpdateBanner::Hidden => {}
-            UpdateBanner::Offer(offer) => {
-                ui.colored_label(
-                    Color32::from_rgb(220, 200, 120),
-                    format!("Update to {} available", offer.tag),
-                );
-                if ui.button("Update").clicked() {
-                    self.start_update_download();
+    pub(super) fn update_dialog(&mut self, ctx: &egui::Context) {
+        if matches!(self.update_banner, UpdateBanner::Hidden) {
+            return;
+        }
+
+        let title = match &self.update_banner {
+            UpdateBanner::Offer(offer) => format!("Update to {}", offer.tag),
+            UpdateBanner::Downloading { version } => format!("Downloading {version}"),
+            UpdateBanner::Ready { version } => format!("Update {version} installed"),
+            UpdateBanner::Failed { .. } => "Update failed".into(),
+            UpdateBanner::Hidden => return,
+        };
+
+        let mut open = true;
+        egui::Window::new(title)
+            .id(Id::new("update_dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .show(ctx, |ui| match self.update_banner.clone() {
+                UpdateBanner::Hidden => {}
+                UpdateBanner::Offer(offer) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "A newer AppImage ({}) is available.",
+                            offer.tag
+                        ))
+                        .color(Color32::from_rgb(220, 200, 120)),
+                    );
+                    if !offer.changelog.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("What's new").strong());
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("update_changelog")
+                            .max_height(220.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&offer.changelog)
+                                        .color(Color32::from_rgb(190, 195, 205)),
+                                );
+                            });
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Update").clicked() {
+                            self.start_update_download();
+                        }
+                        if ui.button("Later").clicked() {
+                            self.update_later = true;
+                            self.update_banner = UpdateBanner::Hidden;
+                        }
+                        if ui.button("Skip this version").clicked() {
+                            self.skip_this_update();
+                        }
+                    });
                 }
-                if ui.button("Later").clicked() {
+                UpdateBanner::Downloading { version } => {
+                    let bytes = self
+                        .update_progress
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    ui.label(format!(
+                        "Downloading {version}… {}",
+                        format_download_bytes(bytes)
+                    ));
+                }
+                UpdateBanner::Ready { version } => {
+                    ui.colored_label(
+                        Color32::from_rgb(140, 220, 160),
+                        format!("Update {version} is ready."),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Restart now").clicked() {
+                            self.relaunch_after_update();
+                        }
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                }
+                UpdateBanner::Failed { message } => {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 160, 120),
+                        format!("Update failed: {message}"),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Retry").clicked() {
+                            self.start_update_download();
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            self.update_later = true;
+                            self.update_banner = UpdateBanner::Hidden;
+                        }
+                    });
+                }
+            });
+
+        if !open {
+            match &self.update_banner {
+                UpdateBanner::Downloading { .. } => {
+                    // Keep dialog open while download runs.
+                }
+                UpdateBanner::Offer(_) | UpdateBanner::Failed { .. } => {
                     self.update_later = true;
                     self.update_banner = UpdateBanner::Hidden;
                 }
-                if ui.button("Skip this version").clicked() {
-                    self.skip_this_update();
-                }
-            }
-            UpdateBanner::Downloading { version } => {
-                let bytes = self
-                    .update_progress
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                ui.label(format!(
-                    "Downloading {version}… {}",
-                    format_download_bytes(bytes)
-                ));
-            }
-            UpdateBanner::Ready { version } => {
-                ui.colored_label(
-                    Color32::from_rgb(140, 220, 160),
-                    format!("Update {version} installed"),
-                );
-                if ui.button("Restart now").clicked() {
-                    self.relaunch_after_update();
-                }
-                if ui.button("Quit").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-            UpdateBanner::Failed { message } => {
-                ui.colored_label(
-                    Color32::from_rgb(255, 160, 120),
-                    format!("Update failed: {message}"),
-                );
-                if ui.button("Retry").clicked() {
-                    self.start_update_download();
-                }
-                if ui.button("Dismiss").clicked() {
-                    self.update_later = true;
+                UpdateBanner::Ready { .. } => {
                     self.update_banner = UpdateBanner::Hidden;
                 }
+                UpdateBanner::Hidden => {}
             }
-        });
+        }
     }
 
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
