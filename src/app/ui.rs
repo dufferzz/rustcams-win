@@ -51,7 +51,8 @@ impl ViewerApp {
                     self.views.active = active;
                     self.exit_fullscreen();
                 }
-                self.persist_views();
+                self.mark_views_dirty();
+                self.save_ui_prefs();
             }
 
             if ui
@@ -70,7 +71,8 @@ impl ViewerApp {
                     self.views.active = idx;
                     self.exit_fullscreen();
                 }
-                self.persist_views();
+                self.mark_views_dirty();
+                self.save_ui_prefs();
             }
 
             if !is_aux {
@@ -98,7 +100,29 @@ impl ViewerApp {
                 self.clamp_aux_view();
                 self.exit_fullscreen();
                 self.aux_fullscreen_slot = None;
-                self.persist_views();
+                self.mark_views_dirty();
+                self.save_ui_prefs();
+            }
+
+            {
+                let dirty = self.views.is_dirty();
+                let icon = if dirty {
+                    egui::RichText::new(icons::FLOPPY_DISK).color(self.accent)
+                } else {
+                    egui::RichText::new(icons::FLOPPY_DISK)
+                        .color(Color32::from_rgb(110, 115, 125))
+                };
+                if ui
+                    .add_enabled(dirty, egui::Button::new(icon).small())
+                    .on_hover_text(if dirty {
+                        "Save views (unsaved changes)"
+                    } else {
+                        "Views saved"
+                    })
+                    .clicked()
+                {
+                    self.save_views_now();
+                }
             }
 
             ui.separator();
@@ -303,7 +327,8 @@ impl ViewerApp {
                             let name = self.rename_buffer.trim().to_string();
                             if !name.is_empty() {
                                 self.views.active_view_mut().name = name;
-                                self.persist_views();
+                                self.mark_views_dirty();
+                                self.save_ui_prefs();
                             }
                             self.show_rename = false;
                         }
@@ -399,7 +424,9 @@ impl ViewerApp {
         let mut start_rename: Option<usize> = None;
         let mut finish_rename = false;
         let mut cancel_rename = false;
-        let mut place_cam: Option<String> = None;
+        let mut select_cam: Option<String> = None;
+        let mut assign_cam: Option<String> = None;
+        let mut play_group: Option<usize> = None;
 
         ui.set_max_width(ui.max_rect().width());
         ui.horizontal(|ui| {
@@ -473,66 +500,74 @@ impl ViewerApp {
                             selected_ptz.as_deref(),
                             dragging_library,
                             &mut lib_drop,
-                            &mut place_cam,
+                            &mut select_cam,
+                            &mut assign_cam,
                         );
                     };
 
-                    if multi {
-                        let header = egui::CollapsingHeader::new(format!(
-                            "{}  ({})",
-                            group_name,
-                            cam_ids.len()
-                        ))
-                        .id_salt(("lib_group", is_aux, gi))
-                        .open(Some(group_open))
-                        .show(ui, |ui| body(ui));
+                    // Always show a header so groups can be double-clicked to play.
+                    let header = egui::CollapsingHeader::new(format!(
+                        "{}  ({})",
+                        group_name,
+                        cam_ids.len()
+                    ))
+                    .id_salt(("lib_group", is_aux, gi))
+                    .open(Some(group_open))
+                    .show(ui, |ui| body(ui));
 
-                        if header.header_response.clicked() {
-                            if let Some(g) = self.library_groups.get_mut(gi) {
-                                g.open = !g.open;
-                                save_groups = true;
-                            }
+                    if header.header_response.double_clicked() {
+                        play_group = Some(gi);
+                    } else if multi && header.header_response.clicked() {
+                        if let Some(g) = self.library_groups.get_mut(gi) {
+                            g.open = !g.open;
+                            save_groups = true;
                         }
-                        header.header_response.context_menu(|ui| {
-                            if ui.button("Rename").clicked() {
-                                start_rename = Some(gi);
-                                ui.close_menu();
-                            }
-                            if ui.button("Delete group").clicked() {
-                                delete_group = Some(gi);
-                                ui.close_menu();
-                            }
-                        });
+                    }
+                    header.header_response.context_menu(|ui| {
+                        if ui.button("Play group").clicked() {
+                            play_group = Some(gi);
+                            ui.close_menu();
+                        }
+                        if ui.button("Rename").clicked() {
+                            start_rename = Some(gi);
+                            ui.close_menu();
+                        }
+                        if multi && ui.button("Delete group").clicked() {
+                            delete_group = Some(gi);
+                            ui.close_menu();
+                        }
+                    });
+                    header
+                        .header_response
+                        .clone()
+                        .on_hover_text("Double-click to play this group on the grid");
 
-                        let href = &header.header_response;
-                        let hovering = href.dnd_hover_payload::<DragPayload>().is_some()
-                            || (href.contains_pointer()
-                                && matches!(
-                                    &self.cross_drag,
-                                    Some(DragPayload::FromLibrary(_))
-                                ));
-                        if hovering {
-                            ui.painter().rect_stroke(
-                                href.rect,
-                                2.0,
-                                egui::Stroke::new(1.5_f32, self.accent),
-                                egui::StrokeKind::Inside,
-                            );
+                    let href = &header.header_response;
+                    let hovering = href.dnd_hover_payload::<DragPayload>().is_some()
+                        || (href.contains_pointer()
+                            && matches!(
+                                &self.cross_drag,
+                                Some(DragPayload::FromLibrary(_))
+                            ));
+                    if hovering {
+                        ui.painter().rect_stroke(
+                            href.rect,
+                            2.0,
+                            egui::Stroke::new(1.5_f32, self.accent),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if let Some(payload) = href.dnd_release_payload::<DragPayload>() {
+                        if let DragPayload::FromLibrary(id) = (*payload).clone() {
+                            lib_drop = Some((id, gi, cam_ids.len()));
+                            self.cross_drag = None;
                         }
-                        if let Some(payload) = href.dnd_release_payload::<DragPayload>() {
-                            if let DragPayload::FromLibrary(id) = (*payload).clone() {
-                                lib_drop = Some((id, gi, cam_ids.len()));
-                                self.cross_drag = None;
-                            }
-                        } else if href.contains_pointer()
-                            && ui.input(|i| i.pointer.primary_released())
-                        {
-                            if let Some(DragPayload::FromLibrary(id)) = self.cross_drag.take() {
-                                lib_drop = Some((id, gi, cam_ids.len()));
-                            }
+                    } else if href.contains_pointer()
+                        && ui.input(|i| i.pointer.primary_released())
+                    {
+                        if let Some(DragPayload::FromLibrary(id)) = self.cross_drag.take() {
+                            lib_drop = Some((id, gi, cam_ids.len()));
                         }
-                    } else {
-                        body(ui);
                     }
                 }
             });
@@ -560,8 +595,14 @@ impl ViewerApp {
         if let Some((id, g, i)) = lib_drop {
             self.library_move_camera(&id, g, i);
         }
-        if let Some(id) = place_cam {
-            self.place_library_camera(&id, view_idx);
+        if let Some(id) = select_cam {
+            self.select_camera(&id);
+        }
+        if let Some(id) = assign_cam {
+            self.assign_camera_to_selected_slot(&id, view_idx, is_aux);
+        }
+        if let Some(gi) = play_group {
+            self.play_library_group(gi, view_idx, is_aux);
         }
         if save_groups {
             self.save_ui_prefs();
@@ -583,7 +624,8 @@ impl ViewerApp {
         selected_ptz: Option<&str>,
         dragging_library: bool,
         lib_drop: &mut Option<(String, usize, usize)>,
-        place_cam: &mut Option<String>,
+        select_cam: &mut Option<String>,
+        assign_cam: &mut Option<String>,
     ) {
         let mut visible: Vec<(usize, String, String, bool, bool)> = Vec::new();
         for (ci, id) in cam_ids.iter().enumerate() {
@@ -704,21 +746,21 @@ impl ViewerApp {
                 }
             }
 
-            let can_replace = selected_ptz.is_some_and(|sid| active_ids.iter().any(|id| id == sid));
-            let hover = if can_replace {
-                "Click to replace the selected camera"
-            } else if has_ptz {
-                "Drag to reorder or onto a grid cell · click for PTZ"
+            let hover = if has_ptz {
+                "Click to select · double-click onto selected slot · drag to reorder"
             } else {
-                "Drag to reorder or onto a grid cell · click to select"
+                "Click to select · double-click onto selected slot · drag to reorder"
             };
             let clicked = response.inner.clicked();
+            let double = response.inner.double_clicked();
             if response.inner.drag_started() {
                 self.cross_drag = Some(payload);
             }
             response.inner.on_hover_text(hover);
-            if clicked {
-                *place_cam = Some(id);
+            if double {
+                *assign_cam = Some(id);
+            } else if clicked {
+                *select_cam = Some(id);
             }
             ui.add_space(2.0);
         }
@@ -1570,6 +1612,13 @@ impl ViewerApp {
         ui.painter()
             .rect_filled(cell, 0.0, Color32::from_rgb(12, 14, 18));
 
+        let live = self.streams.has_live_frame(&cam.id);
+        let reconnecting = self.streams.is_reconnecting(&cam.id);
+        let err = self.streams.error(&cam.id);
+        let waiting = self.streams.is_running(&cam.id) && !live;
+        let has_tex = self.textures.contains_key(&cam.id);
+        let offline = !has_tex || !live || err.is_some() || reconnecting;
+
         if let Some(tex) = self.textures.get(&cam.id) {
             let size = tex.handle.size_vec2();
             let aspect = if size.y > 0.0 {
@@ -1579,11 +1628,7 @@ impl ViewerApp {
             };
             let draw = fitted_rect(cell, aspect, self.fit);
             let painter = ui.painter().with_clip_rect(cell);
-            let live = self.streams.has_live_frame(&cam.id);
-            let reconnecting = self.streams.is_reconnecting(&cam.id);
-            let err = self.streams.error(&cam.id);
-            let waiting = self.streams.is_running(&cam.id) && !live;
-            let tint = if live && err.is_none() {
+            let tint = if live && err.is_none() && !reconnecting {
                 Color32::WHITE
             } else {
                 // Hold last good frame dimmed while reconnecting / waiting for keyframe.
@@ -1595,49 +1640,33 @@ impl ViewerApp {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 tint,
             );
-            let overlay = if self.paused {
-                Some("Paused")
-            } else if reconnecting {
-                Some("Reconnecting…")
-            } else if waiting {
-                Some("Connecting…")
-            } else if err.is_some() {
-                Some("Error")
-            } else {
-                None
-            };
-            if let Some(msg) = overlay {
-                ui.painter().text(
-                    cell.center(),
-                    egui::Align2::CENTER_CENTER,
-                    msg,
-                    self.scaled_font(14.0),
-                    Color32::from_rgb(220, 220, 220),
-                );
-            }
+        }
+
+        let status = if self.paused {
+            Some("Paused")
+        } else if reconnecting || err.is_some() {
+            // Keep the banner short — never paint the raw GStreamer error string.
+            Some("Reconnecting…")
+        } else if waiting || (has_tex && !live) {
+            Some("Connecting…")
+        } else if !has_tex {
+            Some("Offline")
         } else {
-            let msg = if self.paused {
-                "Paused".to_string()
-            } else if let Some(err) = self.streams.error(&cam.id) {
-                format!("Error\n{err}")
-            } else if self.streams.is_running(&cam.id) {
-                "Connecting…".to_string()
-            } else if self.streams.is_reconnecting(&cam.id) {
-                "Reconnecting…".to_string()
-            } else {
-                "Offline".to_string()
-            };
+            None
+        };
+        if let Some(msg) = status {
             ui.painter().text(
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
                 msg,
-                self.scaled_font(14.0),
-                Color32::from_rgb(180, 180, 180),
+                self.scaled_font(11.0),
+                Color32::from_rgb(190, 195, 205),
             );
         }
 
-        if hovered || selected {
-            let bar_h = 24.0;
+        // Always show the name on offline / reconnecting cells; otherwise on hover/select.
+        if hovered || selected || offline || self.paused {
+            let bar_h = 22.0;
             let bar = Rect::from_min_max(egui::pos2(cell.min.x, cell.max.y - bar_h), cell.max);
             ui.painter()
                 .rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
@@ -1650,7 +1679,7 @@ impl ViewerApp {
                 bar.left_center() + Vec2::new(8.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 label,
-                self.scaled_font(13.0),
+                self.scaled_font(12.0),
                 if selected {
                     selection_border(cam.ptz.is_some())
                 } else {
@@ -1830,6 +1859,7 @@ impl ViewerApp {
         let mut clear: Option<usize> = None;
         let mut exit_os_fullscreen = false;
         let mut select: Option<String> = None;
+        let mut clear_selection = false;
         let mut focus_slot: Option<usize> = None;
 
         for (i, slot) in slots.iter().enumerate() {
@@ -1930,9 +1960,12 @@ impl ViewerApp {
                 }
             }
             if response.clicked() {
+                // Single-click selects the slot (destination for library double-click).
                 focus_slot = Some(i);
                 if let Some(cam_id) = slot {
                     select = Some(cam_id.clone());
+                } else {
+                    clear_selection = true;
                 }
             }
             if response.double_clicked() && slot.is_some() {
@@ -1954,6 +1987,9 @@ impl ViewerApp {
 
         if let Some((idx, payload)) = drop_action {
             self.apply_drop(view_idx, idx, payload);
+        }
+        if clear_selection {
+            self.clear_camera_selection();
         }
         if let Some(id) = select {
             self.select_camera(&id);

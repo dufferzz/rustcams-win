@@ -610,7 +610,7 @@ impl ViewerApp {
                 if let Some(view) = self.views.views.first_mut() {
                     view.fill_from_cameras(&ids);
                 }
-                self.persist_views();
+                self.mark_views_dirty();
             }
         }
         self.config_warning = warning;
@@ -990,7 +990,7 @@ impl ViewerApp {
             .views
             .push(crate::views::View::new("Screen 2", layout));
         self.aux_view = self.views.views.len() - 1;
-        self.persist_views();
+        self.mark_views_dirty();
     }
 
     fn camera_by_id(&self, id: &str) -> Option<&CameraConfig> {
@@ -1002,13 +1002,18 @@ impl ViewerApp {
     }
 
     fn persist_view_file(&mut self) {
-        if let Err(err) = self.views.save_if_dirty() {
+        if let Err(err) = self.views.save() {
             warn!("failed to save views: {err:#}");
         }
     }
 
-    fn persist_views(&mut self) {
+    /// Mark views dirty without writing `views.toml` (manual Save button).
+    fn mark_views_dirty(&mut self) {
         self.views.mark_dirty();
+    }
+
+    /// Write views to disk and refresh ui.toml (last view name, etc.).
+    fn save_views_now(&mut self) {
         self.persist_view_file();
         self.save_ui_prefs();
     }
@@ -1317,14 +1322,12 @@ impl ViewerApp {
                 }
             }
         }
-        self.persist_view_file();
     }
 
     fn clear_slot(&mut self, view_idx: usize, slot_idx: usize) {
         if let Some(slot) = self.views.view_mut(view_idx).slots.get_mut(slot_idx) {
             *slot = None;
             self.views.mark_dirty();
-            self.persist_view_file();
         }
         if self.fullscreen_slot == Some(slot_idx) && view_idx == self.views.active {
             self.exit_fullscreen();
@@ -1343,7 +1346,6 @@ impl ViewerApp {
             self.aux_fullscreen_slot = None;
         }
         self.views.mark_dirty();
-        self.persist_view_file();
     }
 
     fn ptz_stop(&mut self) {
@@ -1397,6 +1399,106 @@ impl ViewerApp {
         self.sync_listen_audio();
     }
 
+    fn clear_camera_selection(&mut self) {
+        if self.sidebar_ptz_cam.is_none() {
+            return;
+        }
+        self.ptz_stop();
+        self.ptz_rearm_buttons = true;
+        self.sidebar_ptz_cam = None;
+        self.sync_listen_audio();
+    }
+
+    /// Put `cam_id` on the single-clicked / pad-focused slot of `view_idx`.
+    fn assign_camera_to_selected_slot(&mut self, cam_id: &str, view_idx: usize, is_aux: bool) {
+        if self.camera_by_id(cam_id).is_none() {
+            return;
+        }
+        let n = self.views.view(view_idx).slots.len();
+        if n == 0 {
+            return;
+        }
+        let focused = if is_aux {
+            self.aux_pad_focus_slot
+        } else {
+            self.pad_focus_slot
+        };
+        let slot_idx = focused
+            .filter(|&i| i < n)
+            .or_else(|| {
+                let selected = self.sidebar_ptz_cam.as_deref()?;
+                self.views
+                    .view(view_idx)
+                    .slots
+                    .iter()
+                    .position(|s| s.as_deref() == Some(selected))
+            })
+            .unwrap_or(0);
+
+        let already = self
+            .views
+            .view(view_idx)
+            .slots
+            .iter()
+            .position(|s| s.as_deref() == Some(cam_id));
+        if let Some(other_idx) = already {
+            if other_idx != slot_idx {
+                self.apply_drop(
+                    view_idx,
+                    slot_idx,
+                    DragPayload::FromSlot {
+                        view: view_idx,
+                        slot: other_idx,
+                    },
+                );
+            }
+        } else {
+            self.apply_drop(
+                view_idx,
+                slot_idx,
+                DragPayload::FromLibrary(cam_id.to_string()),
+            );
+        }
+        if is_aux {
+            self.aux_pad_focus_slot = Some(slot_idx);
+        } else {
+            self.pad_focus_slot = Some(slot_idx);
+        }
+        self.select_camera(cam_id);
+    }
+
+    /// Fill `view_idx` with every camera in a library group (auto-picks a layout that fits).
+    fn play_library_group(&mut self, group_idx: usize, view_idx: usize, is_aux: bool) {
+        let ids: Vec<String> = match self.library_groups.get(group_idx) {
+            Some(g) => g
+                .cameras
+                .iter()
+                .filter(|id| self.camera_by_id(id).is_some())
+                .cloned()
+                .collect(),
+            None => return,
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let layout = Layout::all()
+            .iter()
+            .copied()
+            .find(|l| l.cells() >= ids.len())
+            .unwrap_or(Layout::Grid6);
+        self.set_layout_at(view_idx, layout);
+        self.views.view_mut(view_idx).fill_from_cameras(&ids);
+        self.views.mark_dirty();
+        if is_aux {
+            self.aux_pad_focus_slot = Some(0);
+        } else {
+            self.pad_focus_slot = Some(0);
+        }
+        if let Some(id) = ids.first() {
+            self.select_camera(id);
+        }
+    }
+
     pub(super) fn sync_listen_audio(&mut self) {
         let target = if self.audio_enabled && !self.paused {
             self.sidebar_ptz_cam.as_ref().and_then(|id| {
@@ -1415,52 +1517,6 @@ impl ViewerApp {
             self.listen.set_enabled(self.audio_enabled);
         }
         self.listen.sync(target);
-    }
-
-    /// If a grid cell is selected on `view_idx`, put `cam_id` in that cell.
-    fn place_library_camera(&mut self, cam_id: &str, view_idx: usize) {
-        if self.camera_by_id(cam_id).is_none() {
-            return;
-        }
-        let selected = self.sidebar_ptz_cam.clone();
-        let Some(selected) = selected else {
-            self.select_camera(cam_id);
-            return;
-        };
-        if selected.as_str() == cam_id {
-            return;
-        }
-        let found = {
-            let slots = &self.views.view(view_idx).slots;
-            slots
-                .iter()
-                .position(|s| s.as_deref() == Some(selected.as_str()))
-                .map(|sel_idx| {
-                    let already = slots.iter().position(|s| s.as_deref() == Some(cam_id));
-                    (sel_idx, already)
-                })
-        };
-        let Some((sel_idx, already)) = found else {
-            self.select_camera(cam_id);
-            return;
-        };
-        if let Some(other_idx) = already {
-            self.apply_drop(
-                view_idx,
-                sel_idx,
-                DragPayload::FromSlot {
-                    view: view_idx,
-                    slot: other_idx,
-                },
-            );
-        } else {
-            self.apply_drop(
-                view_idx,
-                sel_idx,
-                DragPayload::FromLibrary(cam_id.to_string()),
-            );
-        }
-        self.select_camera(cam_id);
     }
 
     fn enter_fullscreen_at(&mut self, view_idx: usize, slot: usize, is_aux: bool) {
@@ -2023,10 +2079,6 @@ impl eframe::App for ViewerApp {
         let main_down = ctx.input(|i| i.pointer.primary_down());
         if !main_down && !self.aux_pointer_down {
             self.cross_drag = None;
-        }
-
-        if let Err(err) = self.views.save_if_dirty() {
-            warn!("failed to save views: {err:#}");
         }
 
         if active && !self.paused {

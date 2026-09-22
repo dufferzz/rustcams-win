@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 pub struct SavedView {
     pub name: String,
     pub layout: String,
-    /// Camera ids; empty string or missing = empty slot.
+    /// Camera ids for the current layout; empty string = empty slot.
     pub slots: Vec<String>,
+    /// Cameras beyond the current layout (kept when shrinking e.g. 6×6 → 5×5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overflow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -25,6 +28,8 @@ pub struct View {
     pub name: String,
     pub layout: Layout,
     pub slots: Vec<Option<String>>,
+    /// Slots clipped when the layout shrinks; restored when it grows again.
+    pub overflow_slots: Vec<Option<String>>,
 }
 
 impl View {
@@ -34,6 +39,7 @@ impl View {
             name: name.into(),
             layout,
             slots: vec![None; n],
+            overflow_slots: Vec::new(),
         }
     }
 
@@ -41,9 +47,15 @@ impl View {
         let n = layout.cells();
         self.layout = layout;
         if self.slots.len() < n {
+            let need = n - self.slots.len();
+            let take = need.min(self.overflow_slots.len());
+            self.slots
+                .extend(self.overflow_slots.drain(..take));
             self.slots.resize(n, None);
         } else if self.slots.len() > n {
-            self.slots.truncate(n);
+            let mut clipped: Vec<Option<String>> = self.slots.drain(n..).collect();
+            clipped.append(&mut self.overflow_slots);
+            self.overflow_slots = clipped;
         }
     }
 
@@ -60,16 +72,33 @@ impl View {
                 }
             })
             .collect();
+        let mut overflow_slots: Vec<Option<String>> = saved
+            .overflow
+            .iter()
+            .map(|id| {
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.clone())
+                }
+            })
+            .collect();
         let n = layout.cells();
         if slots.len() < n {
+            let need = n - slots.len();
+            let take = need.min(overflow_slots.len());
+            slots.extend(overflow_slots.drain(..take));
             slots.resize(n, None);
         } else if slots.len() > n {
-            slots.truncate(n);
+            let mut clipped: Vec<Option<String>> = slots.drain(n..).collect();
+            clipped.append(&mut overflow_slots);
+            overflow_slots = clipped;
         }
         Self {
             name: saved.name.clone(),
             layout,
             slots,
+            overflow_slots,
         }
     }
 
@@ -82,10 +111,16 @@ impl View {
                 .iter()
                 .map(|s| s.clone().unwrap_or_default())
                 .collect(),
+            overflow: self
+                .overflow_slots
+                .iter()
+                .map(|s| s.clone().unwrap_or_default())
+                .collect(),
         }
     }
 
     pub fn fill_from_cameras(&mut self, camera_ids: &[String]) {
+        self.overflow_slots.clear();
         for (i, slot) in self.slots.iter_mut().enumerate() {
             *slot = camera_ids.get(i).cloned();
         }
@@ -157,15 +192,12 @@ impl ViewStore {
         self.view_mut(i)
     }
 
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
-    pub fn save_if_dirty(&mut self) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        self.save()
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     pub fn save(&mut self) -> Result<()> {
