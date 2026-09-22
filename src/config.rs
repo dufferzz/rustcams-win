@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub nvr: Option<NvrConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anpr: Option<AnprConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cameras: Vec<CameraEntry>,
     #[serde(default)]
@@ -119,6 +121,162 @@ impl GateConfig {
             format!("http://{host}{}", self.request_path())
         } else {
             format!("http://{host}:{}{}", self.http_port, self.request_path())
+        }
+    }
+}
+
+/// Built-in alert sound keys (embedded under `assets/`).
+pub const ANPR_SOUND_ALERT: &str = "alert";
+pub const ANPR_SOUND_KIM: &str = "kim";
+
+/// Hikvision ANPR event stream (`GET …/Event/notification/alertStream`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnprConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    pub host: String,
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+    #[serde(default = "default_gate_user")]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Mute all alert audio (watchlist still fires UI popups).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silent: bool,
+    /// Snapshot channel for `/ISAPI/Streaming/channels/{n}/picture`.
+    #[serde(default = "default_anpr_channel", skip_serializing_if = "is_default_anpr_channel")]
+    pub channel: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plates: Vec<AnprPlate>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+fn default_anpr_channel() -> u32 {
+    1
+}
+
+fn is_default_anpr_channel(v: &u32) -> bool {
+    *v == 1
+}
+
+impl Default for AnprConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: String::new(),
+            http_port: default_http_port(),
+            username: default_gate_user(),
+            password: String::new(),
+            silent: false,
+            channel: default_anpr_channel(),
+            plates: Vec::new(),
+        }
+    }
+}
+
+impl AnprConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.host.trim().is_empty() && !self.username.trim().is_empty()
+    }
+
+    pub fn should_run(&self) -> bool {
+        self.enabled && self.is_configured()
+    }
+
+    pub fn base_url(&self) -> String {
+        let host = self.host.trim();
+        if self.http_port == 80 {
+            format!("http://{host}")
+        } else {
+            format!("http://{host}:{}", self.http_port)
+        }
+    }
+
+    pub fn alert_stream_path() -> &'static str {
+        "/ISAPI/Event/notification/alertStream"
+    }
+
+    pub fn alert_stream_url(&self) -> String {
+        format!("{}{}", self.base_url(), Self::alert_stream_path())
+    }
+
+    pub fn snapshot_path(&self) -> String {
+        let ch = if self.channel == 0 { 1 } else { self.channel };
+        format!("/ISAPI/Streaming/channels/{ch}/picture")
+    }
+
+    pub fn snapshot_url(&self) -> String {
+        format!("{}{}", self.base_url(), self.snapshot_path())
+    }
+
+    /// Normalize plate text for watchlist lookup (upper, strip spaces).
+    pub fn normalize_plate(plate: &str) -> String {
+        plate
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(|c| c.to_uppercase())
+            .collect()
+    }
+
+    pub fn find_plate(&self, plate: &str) -> Option<&AnprPlate> {
+        let key = Self::normalize_plate(plate);
+        self.plates
+            .iter()
+            .find(|p| Self::normalize_plate(&p.plate) == key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnprPlate {
+    pub plate: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// Builtin (`alert` / `kim`) or path relative to cameras.toml / absolute.
+    #[serde(default = "default_anpr_sound", skip_serializing_if = "is_default_anpr_sound")]
+    pub sound: String,
+}
+
+fn default_anpr_sound() -> String {
+    ANPR_SOUND_ALERT.into()
+}
+
+fn is_default_anpr_sound(v: &str) -> bool {
+    v.is_empty() || v == ANPR_SOUND_ALERT
+}
+
+impl Default for AnprPlate {
+    fn default() -> Self {
+        Self {
+            plate: String::new(),
+            name: String::new(),
+            enabled: true,
+            sound: default_anpr_sound(),
+        }
+    }
+}
+
+impl AnprPlate {
+    pub fn display_name(&self) -> &str {
+        let n = self.name.trim();
+        if n.is_empty() {
+            self.plate.trim()
+        } else {
+            n
+        }
+    }
+
+    pub fn sound_key(&self) -> &str {
+        let s = self.sound.trim();
+        if s.is_empty() {
+            ANPR_SOUND_ALERT
+        } else {
+            s
         }
     }
 }
@@ -511,6 +669,19 @@ impl AppConfig {
                 validate_host(&gate.host).context("[gate] host")?;
             }
             validate_gate_fields(gate).context("[gate]")?;
+        }
+        if let Some(anpr) = &self.anpr {
+            if !anpr.host.trim().is_empty() {
+                validate_host(&anpr.host).context("[anpr] host")?;
+            }
+            if anpr.channel == 0 {
+                bail!("[anpr] channel must be >= 1");
+            }
+            for (i, plate) in anpr.plates.iter().enumerate() {
+                if plate.plate.trim().is_empty() {
+                    bail!("[anpr].plates[{i}] plate is empty");
+                }
+            }
         }
         for cam in &self.cameras {
             let url = cam.url.trim();

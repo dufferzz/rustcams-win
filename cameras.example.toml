@@ -52,3 +52,19 @@ pause_when_unfocused = true
 # http_port = 80
 # username = "admin"
 # password = "changeme"
+
+# Hikvision ANPR watchlist (Settings → ANPR). Listens to alertStream.
+# [anpr]
+# enabled = true
+# host = "203.0.113.90"
+# http_port = 80
+# username = "admin"
+# password = "changeme"
+# silent = false
+# channel = 1
+#
+# [[anpr.plates]]
+# plate = "AB12CDE"
+# name = "Example"
+# enabled = true
+# sound = "alert"   # builtin: alert | kim  (or a path to an .mp3)

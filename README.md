@@ -278,8 +278,10 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | Clear cell | Right-click, then confirm |
 | Fullscreen | Double-click / Cross(X) / `Esc` / right-click — switches that cam to **direct main** RTSP; keeps PTZ on that cam |
 | Full screen | ⛶ toolbar — true OS/monitor fullscreen; `Esc` / right-click grid / Triangle toggles (after camera FS) |
-| Settings | ⚙ toolbar — tabs for NVR, gates, display, diagnostics |
+| Settings | ⚙ toolbar — tabs for NVR, gates, ANPR, display, diagnostics |
 | Open gates | Toolbar **Gates** or DualShock **Share**, then confirm (Enter / ✕ / OK). Any other controller button or Cancel aborts. |
+| ANPR watchlist | Settings → **ANPR** — Hikvision `alertStream`, plate list, per-plate sound (`alert` / `kim`). Popup + audio only; no clips saved. |
+| Camera audio | Toolbar speaker — when on, plays PCMU/PCMA from the **selected** camera (intercoms). Off by default; saved in `ui.toml`. |
 | Second window | 🖵 toolbar — auxiliary window for another monitor; click a cell to select (one camera / PTZ target at a time) |
 | Debug | Settings → Diagnostics — perf overlay + stream decode metrics; status bar while open |
 | Log | Settings → Diagnostics — in-app log console (Windows release builds hide the OS console) |

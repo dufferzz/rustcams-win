@@ -142,7 +142,17 @@ $PluginAllowList = @(
     'gstlibav.dll',             # avdec_* software fallback
     'gstmediafoundation.dll',   # mfh264/h265 fallback
     'gstnvcodec.dll',           # NVIDIA NVDEC (optional; skipped if missing)
-    'gstjpeg.dll'
+    'gstjpeg.dll',
+    # Selected-camera audio (PCMU/PCMA)
+    'gstmulaw.dll',
+    'gstalaw.dll',
+    'gstaudioconvert.dll',
+    'gstaudioresample.dll',
+    'gstautodetect.dll',        # autoaudiosink
+    'gstvolume.dll',
+    'gstdirectsound.dll',       # Windows audio sink (optional)
+    'gstwasapi.dll',
+    'gstwasapi2.dll'
 )
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")

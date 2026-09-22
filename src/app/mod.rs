@@ -162,6 +162,13 @@ struct NvrDiscoverJob {
     retry: bool,
 }
 
+struct AnprAlertUi {
+    person: String,
+    plate: String,
+    at: Instant,
+    texture: Option<TextureHandle>,
+}
+
 pub struct ViewerApp {
     /// Shown when config is missing / empty / failed to load.
     /// Shown when config is missing / empty / failed to load.
@@ -186,6 +193,17 @@ pub struct ViewerApp {
     gate_draft: crate::config::GateConfig,
     gate_status: Arc<Mutex<Option<String>>>,
     gate_inflight: Arc<AtomicBool>,
+    anpr_draft: crate::config::AnprConfig,
+    anpr_status: Option<String>,
+    anpr: crate::anpr::AnprWorker,
+    anpr_test_inflight: Arc<AtomicBool>,
+    /// `Ok((jpeg, sound_err))` — sound_err is set when playback failed (or muted).
+    pending_anpr_test: Arc<Mutex<Option<Result<(Vec<u8>, Option<String>), String>>>>,
+    /// Active watchlist popup (latest hit).
+    anpr_alert: Option<AnprAlertUi>,
+    /// Toolbar speaker: play RTSP audio for the selected camera.
+    audio_enabled: bool,
+    listen: crate::listen::ListenAudio,
     cameras: Vec<CameraConfig>,
     camera_index: HashMap<String, usize>,
     streams: StreamManager,
@@ -372,6 +390,12 @@ impl ViewerApp {
         }
 
         let gate_draft = app_config.gate.clone().unwrap_or_default();
+        let anpr_draft = app_config.anpr.clone().unwrap_or_default();
+        let anpr_config_dir = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let anpr = crate::anpr::AnprWorker::start(anpr_draft.clone(), anpr_config_dir);
         let config_mtime = std::fs::metadata(&config_path)
             .and_then(|m| m.modified())
             .ok();
@@ -394,6 +418,14 @@ impl ViewerApp {
             gate_draft,
             gate_status: Arc::new(Mutex::new(None)),
             gate_inflight: Arc::new(AtomicBool::new(false)),
+            anpr_draft,
+            anpr_status: None,
+            anpr,
+            anpr_test_inflight: Arc::new(AtomicBool::new(false)),
+            pending_anpr_test: Arc::new(Mutex::new(None)),
+            anpr_alert: None,
+            audio_enabled: ui_prefs.audio_enabled,
+            listen: crate::listen::ListenAudio::new(),
             cameras: cfg.cameras,
             camera_index,
             streams,
@@ -530,6 +562,8 @@ impl ViewerApp {
             self.nvr_draft = nvr_draft;
             self.nvr_protocols = nvr_protocols;
             self.gate_draft = self.app_config.gate.clone().unwrap_or_default();
+            self.anpr_draft = self.app_config.anpr.clone().unwrap_or_default();
+            self.restart_anpr_from_config();
         }
         self.app_name = crate::config::app_brand_name(&resolved.viewer.app_name);
         self.pause_when_unfocused = resolved.viewer.pause_when_unfocused;
@@ -640,6 +674,8 @@ impl ViewerApp {
                         self.nvr_draft = nvr_draft;
                         self.nvr_protocols = nvr_protocols;
                         self.gate_draft = self.app_config.gate.clone().unwrap_or_default();
+                        self.anpr_draft = self.app_config.anpr.clone().unwrap_or_default();
+                        self.restart_anpr_from_config();
                     }
                     self.app_name = crate::config::app_brand_name(&self.app_config.viewer.app_name);
                     self.pause_when_unfocused = self.app_config.viewer.pause_when_unfocused;
@@ -929,6 +965,7 @@ impl ViewerApp {
             if !self.paused {
                 info!("window inactive — stopping all streams");
                 self.streams.stop_all();
+                self.listen.stop();
                 self.textures.clear();
                 self.paused = true;
             }
@@ -944,6 +981,7 @@ impl ViewerApp {
         self.streams.sync_active(&desired);
         let keep: Vec<String> = desired.iter().map(|d| d.id.clone()).collect();
         self.textures.retain(|id, _| keep.contains(id));
+        self.sync_listen_audio();
     }
 
     fn update_textures(&mut self, ctx: &egui::Context) {
@@ -1146,6 +1184,27 @@ impl ViewerApp {
             self.ptz.fetch_presets(target.clone());
             self.ptz.fetch_park_action(target);
         }
+        self.sync_listen_audio();
+    }
+
+    pub(super) fn sync_listen_audio(&mut self) {
+        let target = if self.audio_enabled && !self.paused {
+            self.sidebar_ptz_cam.as_ref().and_then(|id| {
+                let cam = self.camera_by_id(id)?;
+                Some(crate::listen::ListenTarget {
+                    id: id.clone(),
+                    url: cam.url.clone(),
+                    protocols: cam.protocols.clone(),
+                })
+            })
+        } else {
+            None
+        };
+        // Keep enabled flag on the listener; sync only switches the target.
+        if self.listen.enabled() != self.audio_enabled {
+            self.listen.set_enabled(self.audio_enabled);
+        }
+        self.listen.sync(target);
     }
 
     /// If a grid cell is selected on `view_idx`, put `cam_id` in that cell.
@@ -1315,6 +1374,149 @@ impl ViewerApp {
         self.gate_inflight.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(super) fn restart_anpr_from_config(&mut self) {
+        let dir = self
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let cfg = self.app_config.anpr.clone().unwrap_or_default();
+        self.anpr_draft = cfg.clone();
+        self.anpr.apply_config(cfg, dir);
+    }
+
+    pub(super) fn poll_anpr_alerts(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.pending_anpr_test.lock().take() {
+            ctx.request_repaint();
+            match result {
+                Ok((jpeg, sound_note)) => {
+                    let texture = image::load_from_memory(&jpeg).ok().map(|img| {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                        ctx.load_texture("anpr_alert", color, TextureOptions::LINEAR)
+                    });
+                    self.anpr_status = Some(match sound_note.as_deref() {
+                        None => format!("Test OK — snapshot + alert sound ({} bytes).", jpeg.len()),
+                        Some("muted") => format!(
+                            "Test snapshot OK ({} bytes); audio muted.",
+                            jpeg.len()
+                        ),
+                        Some(err) => format!(
+                            "Test snapshot OK ({} bytes); sound failed: {err}",
+                            jpeg.len()
+                        ),
+                    });
+                    self.anpr_alert = Some(AnprAlertUi {
+                        person: "Test snapshot".into(),
+                        plate: self.anpr_draft.host.trim().to_string(),
+                        at: Instant::now(),
+                        texture,
+                    });
+                }
+                Err(err) => {
+                    self.anpr_status = Some(format!("Test snapshot failed: {err}"));
+                    warn!("ANPR test snapshot failed: {err}");
+                }
+            }
+        }
+
+        // Don't overwrite a fresh test-status message with the listener status.
+        if self.anpr_status.as_deref().is_none_or(|s| {
+            !s.starts_with("Test snapshot") && !s.starts_with("Fetching test")
+        }) {
+            self.anpr_status = self.anpr.status();
+        }
+        if self.anpr.needs_repaint() {
+            ctx.request_repaint();
+        }
+        let incoming = self.anpr.take_alerts();
+        if incoming.is_empty() {
+            return;
+        }
+        ctx.request_repaint();
+        if let Some(alert) = incoming.into_iter().last() {
+            let texture = alert.image_jpeg.as_ref().and_then(|jpeg| {
+                image::load_from_memory(jpeg).ok().map(|img| {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    ctx.load_texture("anpr_alert", color, TextureOptions::LINEAR)
+                })
+            });
+            self.anpr_alert = Some(AnprAlertUi {
+                person: alert.person,
+                plate: alert.plate,
+                at: alert.at,
+                texture,
+            });
+        }
+    }
+
+    pub(super) fn test_anpr_snapshot(&mut self) {
+        if self.anpr_draft.host.trim().is_empty() {
+            self.anpr_status = Some("Set ANPR host first.".into());
+            return;
+        }
+        if self.anpr_draft.username.trim().is_empty() {
+            self.anpr_status = Some("Set ANPR username first.".into());
+            return;
+        }
+        if let Err(err) = crate::config::validate_host(&self.anpr_draft.host) {
+            self.anpr_status = Some(format!("Invalid ANPR host: {err:#}"));
+            return;
+        }
+        if self
+            .anpr_test_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.anpr_status = Some("Test snapshot already in progress…".into());
+            return;
+        }
+        self.anpr_status = Some("Fetching test snapshot…".into());
+        let mut cfg = self.anpr_draft.clone();
+        if cfg.channel == 0 {
+            cfg.channel = 1;
+        }
+        let play_audio = !cfg.silent;
+        let config_dir = self
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let slot = self.pending_anpr_test.clone();
+        let inflight = self.anpr_test_inflight.clone();
+        std::thread::spawn(move || {
+            let result = match crate::anpr::fetch_snapshot(&cfg) {
+                Ok(jpeg) => {
+                    // Show the popup immediately; play sound in parallel (do not block UI).
+                    let sound_note = if play_audio {
+                        None
+                    } else {
+                        Some("muted".into())
+                    };
+                    *slot.lock() = Some(Ok((jpeg, sound_note)));
+                    inflight.store(false, Ordering::SeqCst);
+                    if play_audio {
+                        std::thread::spawn(move || {
+                            if let Err(err) = crate::anpr::play_sound(
+                                crate::config::ANPR_SOUND_ALERT,
+                                &config_dir,
+                            ) {
+                                warn!(error = %err, "ANPR test alert sound failed");
+                            }
+                        });
+                    }
+                    return;
+                }
+                Err(err) => Err(format!("{err:#}")),
+            };
+            *slot.lock() = Some(result);
+            inflight.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn kick_update_check(&self) {
         if !self.check_updates {
             return;
@@ -1406,6 +1608,11 @@ impl eframe::App for ViewerApp {
         self.ui_perf.tick_frame();
         self.ensure_maximized_on_launch(ctx);
         self.poll_config_reload();
+        self.poll_anpr_alerts(ctx);
+        if self.anpr_draft.should_run() {
+            // Wake periodically so watchlist hits surface even when video is paused.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         self.poll_update_check();
         if matches!(self.update_banner, UpdateBanner::Downloading { .. }) {
             ctx.request_repaint();
@@ -1557,6 +1764,7 @@ impl eframe::App for ViewerApp {
 
         self.draw_clear_slot_dialog(ctx);
         self.draw_gate_confirm_dialog(ctx);
+        self.draw_anpr_alert(ctx);
         self.draw_debug_panel(ctx);
         self.draw_log_panel(ctx);
         self.settings_window(ctx);

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ureq::Agent;
 
 /// Match typical Hikvision PTZ defaults (move 30 / zoom 25).
@@ -504,6 +504,16 @@ fn digest_request(
     content_type: &str,
 ) -> anyhow::Result<(u16, String)> {
     let url = format!("http://{}{}", target.host, path);
+    let body_preview = body
+        .map(|b| String::from_utf8_lossy(b).chars().take(160).collect::<String>())
+        .unwrap_or_default();
+    debug!(
+        method,
+        host = %target.host,
+        path,
+        body = %body_preview,
+        "PTZ request"
+    );
 
     let handle = session_handle(sessions, target);
     let mut sess = handle.lock();
@@ -516,10 +526,26 @@ fn digest_request(
     for attempt in 0..2 {
         if !sess.is_warm() {
             let (status, www, resp_body) = send(agent, method, &url, body, content_type, None)?;
+            debug!(
+                method,
+                path,
+                status,
+                attempt,
+                auth = false,
+                body = %truncate_log(&resp_body, 200),
+                "PTZ response"
+            );
             if status != 401 {
                 if (200..300).contains(&status) {
                     return Ok((status, resp_body));
                 }
+                warn!(
+                    method,
+                    path,
+                    status,
+                    body = %truncate_log(&resp_body, 300),
+                    "PTZ request failed"
+                );
                 anyhow::bail!("{method} {path} HTTP {status}");
             }
             let www = www.ok_or_else(|| anyhow::anyhow!("401 missing WWW-Authenticate"))?;
@@ -528,6 +554,15 @@ fn digest_request(
 
         let auth = sess.build_header(method, path);
         let (status, www, resp_body) = send(agent, method, &url, body, content_type, Some(&auth))?;
+        debug!(
+            method,
+            path,
+            status,
+            attempt,
+            auth = true,
+            body = %truncate_log(&resp_body, 200),
+            "PTZ response"
+        );
 
         if status == 401 && attempt == 0 {
             sess.clear();
@@ -537,11 +572,30 @@ fn digest_request(
             continue;
         }
         if !(200..300).contains(&status) {
+            warn!(
+                method,
+                path,
+                status,
+                body = %truncate_log(&resp_body, 300),
+                "PTZ request failed"
+            );
             anyhow::bail!("{method} {path} HTTP {status}");
         }
         return Ok((status, resp_body));
     }
+    warn!(method, path, "PTZ digest auth failed");
     anyhow::bail!("digest auth failed")
+}
+
+fn truncate_log(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        t.to_string()
+    } else {
+        let mut out: String = t.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn send(
@@ -874,6 +928,14 @@ fn ptz_proxy_request(
 fn continuous_put(shared: &Shared, target: &PtzTarget, vec: PtzVector) -> anyhow::Result<()> {
     // Official ISAPI continuous PTZ is pan/tilt/zoom only. Focus is a separate
     // `/System/Video/inputs/channels/{ch}/focus` FocusData PUT.
+    debug!(
+        host = %target.host,
+        channel = target.channel,
+        pan = vec.pan,
+        tilt = vec.tilt,
+        zoom = vec.zoom,
+        "PTZ continuous"
+    );
     let body = continuous_body(vec);
     ptz_proxy_request(
         shared,
@@ -917,6 +979,12 @@ fn focus_candidates(target: &PtzTarget) -> Vec<(PtzTarget, String)> {
 }
 
 fn focus_put(shared: &Shared, target: &PtzTarget, speed: i32) -> anyhow::Result<()> {
+    debug!(
+        host = %target.host,
+        channel = target.channel,
+        focus = speed,
+        "PTZ focus"
+    );
     let body = focus_body(speed);
     let key = route_key(target);
     if let Some((t, path)) = shared.focus_route.lock().get(&key).cloned() {
@@ -1009,8 +1077,33 @@ fn xml_tag_text(xml_lower: &str, tag: &str) -> Option<String> {
 }
 
 fn oneshot_put(shared: &Shared, target: &PtzTarget, suffix: &str) -> anyhow::Result<()> {
-    digest_ptz(shared, "PUT", target, suffix, None, "")?;
-    Ok(())
+    debug!(
+        host = %target.host,
+        channel = target.channel,
+        suffix,
+        "PTZ oneshot"
+    );
+    match digest_ptz(shared, "PUT", target, suffix, None, "") {
+        Ok((status, body)) => {
+            debug!(
+                host = %target.host,
+                suffix,
+                status,
+                body = %truncate_log(&body, 200),
+                "PTZ oneshot ok"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            warn!(
+                host = %target.host,
+                channel = target.channel,
+                suffix,
+                "PTZ oneshot failed: {err:#}"
+            );
+            Err(err)
+        }
+    }
 }
 
 const PARK_RELS: &[&str] = &["parkaction", "parkAction"];

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anpr;
 mod app;
 mod config;
 mod gate;
@@ -7,6 +8,7 @@ mod gst_env;
 mod gst_link;
 mod http_client;
 mod layout;
+mod listen;
 mod log_buffer;
 mod nvr;
 mod ptz;

@@ -6,7 +6,7 @@ use gstreamer::prelude::*;
 use parking_lot::Mutex;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::gst_env::{cuda_postproc_available, d3d11_postproc_available};
 
@@ -14,6 +14,23 @@ pub(crate) fn is_audio_caps(caps: &gst::Caps) -> bool {
     caps.structure(0)
         .map(|s| s.name().starts_with("audio/"))
         .unwrap_or(false)
+}
+
+/// RTSP audio pads are usually `application/x-rtp, media=(string)audio`, not `audio/*`.
+pub(crate) fn is_rtp_or_raw_audio_caps(caps: &gst::Caps) -> bool {
+    let Some(s) = caps.structure(0) else {
+        return false;
+    };
+    if s.name().starts_with("audio/") {
+        return true;
+    }
+    if s.name() != "application/x-rtp" {
+        return false;
+    }
+    s.get::<String>("media")
+        .ok()
+        .or_else(|| s.get::<&str>("media").ok().map(|v| v.to_string()))
+        .is_some_and(|m| m.eq_ignore_ascii_case("audio"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +110,7 @@ pub(crate) fn codec_from_rtp_caps(caps: &gst::Caps) -> Option<VideoCodec> {
     }
 }
 
-/// Link rtspsrc video pad → depay → parse → decoder → (optional GPU postproc) → queue.
+/// Link rtspsrc video pad → depay → parse → decode → (optional GPU postproc) → queue.
 pub(crate) fn link_explicit_video(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
@@ -102,6 +119,7 @@ pub(crate) fn link_explicit_video(
     max_height: i32,
     decoder_name_out: &Arc<Mutex<String>>,
     backend: DecodeBackend,
+    camera: &str,
 ) -> Result<()> {
     let Some(queue_sink) = queue.static_pad("sink") else {
         return Err(anyhow!("queue missing sink pad"));
@@ -114,6 +132,7 @@ pub(crate) fn link_explicit_video(
         .current_caps()
         .unwrap_or_else(|| src_pad.query_caps(None));
     if is_audio_caps(&caps) {
+        debug!(camera = %camera, caps = %caps, "skipping RTSP audio pad");
         return Ok(());
     }
 
@@ -132,7 +151,8 @@ pub(crate) fn link_explicit_video(
     if let Some(factory) = decoder.factory() {
         let name = factory.name().to_string();
         *decoder_name_out.lock() = name.clone();
-        info!(
+        debug!(
+            camera = %camera,
             decoder = %name,
             codec = ?codec,
             hw = used_hw,
@@ -152,32 +172,44 @@ pub(crate) fn link_explicit_video(
     if used_hw && decoder_is_nv(&decoder) && cuda_postproc_available() {
         match link_cuda_postproc(pipeline, &decoder, &queue_sink, max_width, max_height) {
             Ok(()) => {
-                info!(
+                debug!(
+                    camera = %camera,
                     max_width,
-                    max_height, "linked explicit decode via CUDA convert/scale/download"
+                    max_height,
+                    "linked explicit decode via CUDA convert/scale/download"
                 );
             }
             Err(err) => {
-                warn!("CUDA post-process link failed, using CPU after NVDEC: {err:#}");
+                warn!(
+                    camera = %camera,
+                    error = %format!("{err:#}"),
+                    "CUDA post-process link failed, using CPU after NVDEC"
+                );
                 link_decoder_to_queue(&decoder, &queue_sink)?;
             }
         }
     } else if used_hw && d3d11_postproc_available() {
         match link_d3d11_postproc(pipeline, &decoder, &queue_sink, max_width, max_height) {
             Ok(()) => {
-                info!(
+                debug!(
+                    camera = %camera,
                     max_width,
-                    max_height, "linked explicit decode via D3D11 convert/scale/download"
+                    max_height,
+                    "linked explicit decode via D3D11 convert/scale/download"
                 );
             }
             Err(err) => {
-                warn!("D3D11 post-process link failed, using CPU after HW decode: {err:#}");
+                warn!(
+                    camera = %camera,
+                    error = %format!("{err:#}"),
+                    "D3D11 post-process link failed, using CPU after HW decode"
+                );
                 link_decoder_to_queue(&decoder, &queue_sink)?;
             }
         }
     } else {
         link_decoder_to_queue(&decoder, &queue_sink)?;
-        debug!("linked explicit decode (CPU path)");
+        debug!(camera = %camera, "linked explicit decode (CPU path)");
     }
 
     for el in [&depay, &parse, &decoder] {

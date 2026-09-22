@@ -608,6 +608,7 @@ fn try_explicit_link(
         max_height,
         decoder_name_out,
         decode,
+        camera_id,
     ) {
         warn!(
             camera = %camera_id,

@@ -157,6 +157,16 @@ OPTIONAL_PLUGINS=(
   libgstjpeg.so
   libgstvideo4linux2.so
   libgstnvcodec.so
+  # Selected-camera audio (PCMU/PCMA intercoms)
+  libgstmulaw.so
+  libgstalaw.so
+  libgstaudioconvert.so
+  libgstaudioresample.so
+  libgstautodetect.so
+  libgstpulseaudio.so
+  libgstalsa.so
+  libgstpipewire.so
+  libgstvolume.so
 )
 
 echo "GStreamer plugins: $PLUGINS_SRC"

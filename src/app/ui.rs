@@ -150,6 +150,30 @@ impl ViewerApp {
             }
 
             ui.separator();
+            let audio_label = if self.audio_enabled {
+                icons::SPEAKER_HIGH
+            } else {
+                icons::SPEAKER_SLASH
+            };
+            let audio_tip = if !self.audio_enabled {
+                "Audio off — click to hear the selected camera (PCMU/PCMA intercoms)".to_string()
+            } else if let Some(id) = self.sidebar_ptz_cam.as_deref() {
+                format!("Audio on — listening to {id}. Click to mute.")
+            } else {
+                "Audio on — select a camera to listen".to_string()
+            };
+            if ui
+                .selectable_label(self.audio_enabled, audio_label)
+                .on_hover_text(audio_tip)
+                .clicked()
+            {
+                self.audio_enabled = !self.audio_enabled;
+                self.save_ui_prefs();
+                self.sync_listen_audio();
+                info!(audio = self.audio_enabled, "camera audio toggled");
+            }
+
+            ui.separator();
             let gate_ready = self.gate_draft.is_configured();
             let gate_busy = self.gate_busy();
             let gate_tip = if !gate_ready {
@@ -1641,6 +1665,68 @@ impl ViewerApp {
             self.open_gates();
         } else if cancelled || !open {
             self.pending_gate_confirm = false;
+        }
+    }
+
+    pub(super) fn draw_anpr_alert(&mut self, ctx: &egui::Context) {
+        let Some(alert) = &self.anpr_alert else {
+            return;
+        };
+
+        let title = format!("ANPR: {}", alert.person);
+        let plate = alert.plate.clone();
+        let person = alert.person.clone();
+        let elapsed = alert.at.elapsed().as_secs();
+        let texture = alert.texture.clone();
+        let mut silent = self.anpr.silent();
+        let mut dismiss = false;
+        let mut open = true;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            dismiss = true;
+        }
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if let Some(tex) = &texture {
+                    let max_w = ui.available_width().min(640.0);
+                    let size = tex.size_vec2();
+                    let scale = (max_w / size.x).min(360.0 / size.y).min(1.0);
+                    ui.image((tex.id(), size * scale));
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("{person}  ·  {plate}"))
+                        .size(18.0)
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{elapsed}s ago"))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .checkbox(&mut silent, "Mute alert audio")
+                    .changed()
+                {
+                    self.anpr.set_silent(silent);
+                    self.anpr_draft.silent = silent;
+                }
+                ui.add_space(4.0);
+                if ui.button("Dismiss").clicked() {
+                    dismiss = true;
+                }
+            });
+
+        if dismiss || !open {
+            self.anpr_alert = None;
         }
     }
 }

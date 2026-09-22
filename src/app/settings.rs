@@ -13,6 +13,7 @@ pub(super) enum SettingsTab {
     #[default]
     Nvr,
     Gates,
+    Anpr,
     Display,
     Diagnostics,
 }
@@ -73,6 +74,9 @@ pub struct UiPrefs {
     /// software | nvdec | hardware. `RUSTCAMS_DECODE` overrides when set.
     #[serde(default)]
     pub decode_backend: crate::gst_link::DecodeBackend,
+    /// Play RTSP audio for the selected camera (toolbar speaker). Off by default.
+    #[serde(default)]
+    pub audio_enabled: bool,
 }
 
 fn default_accent_hex() -> String {
@@ -146,6 +150,7 @@ impl Default for UiPrefs {
             decode_5x5: default_w5(),
             decode_6x6: default_w6(),
             decode_backend: crate::gst_link::DecodeBackend::Software,
+            audio_enabled: false,
         }
     }
 }
@@ -252,6 +257,7 @@ impl ViewerApp {
             decode_5x5: self.decode_5x5,
             decode_6x6: self.decode_6x6,
             decode_backend: self.decode_backend,
+            audio_enabled: self.audio_enabled,
         }
         .save(&self.ui_prefs_path);
     }
@@ -279,6 +285,7 @@ impl ViewerApp {
             self.app_config.nvr = Some(nvr);
         }
         self.sync_gate_into_app_config();
+        self.sync_anpr_into_app_config();
 
         if let Err(err) = self.app_config.save(&self.config_path) {
             self.nvr_status = Some(format!("Failed to save cameras.toml: {err:#}"));
@@ -327,6 +334,15 @@ impl ViewerApp {
         };
     }
 
+    fn sync_anpr_into_app_config(&mut self) {
+        self.anpr_draft.plates.retain(|p| !p.plate.trim().is_empty());
+        self.app_config.anpr = if self.anpr_draft.host.trim().is_empty() {
+            None
+        } else {
+            Some(self.anpr_draft.clone())
+        };
+    }
+
     fn apply_gate_from_settings(&mut self) {
         if self.gate_draft.host.trim().is_empty() {
             *self.gate_status.lock() = Some("Gate host is empty — not saved.".into());
@@ -353,6 +369,47 @@ impl ViewerApp {
         info!(host = %self.gate_draft.host, "saved gate settings");
     }
 
+    fn apply_anpr_from_settings(&mut self) {
+        if self.anpr_draft.host.trim().is_empty() {
+            self.anpr_status = Some("ANPR host is empty — cleared.".into());
+            self.app_config.anpr = None;
+        } else {
+            if self.anpr_draft.username.trim().is_empty() {
+                self.anpr_status = Some("ANPR username is empty — not saved.".into());
+                return;
+            }
+            if let Err(err) = crate::config::validate_host(&self.anpr_draft.host) {
+                self.anpr_status = Some(format!("Invalid ANPR host: {err:#}"));
+                return;
+            }
+            if self.anpr_draft.channel == 0 {
+                self.anpr_draft.channel = 1;
+            }
+            self.sync_anpr_into_app_config();
+        }
+        self.sync_gate_into_app_config();
+        if let Err(err) = self.app_config.save(&self.config_path) {
+            self.anpr_status = Some(format!("Failed to save cameras.toml: {err:#}"));
+            warn!("failed to save cameras.toml: {err:#}");
+            return;
+        }
+        self.note_config_mtime();
+        self.restart_anpr_from_config();
+        let n = self
+            .app_config
+            .anpr
+            .as_ref()
+            .map(|a| a.plates.len())
+            .unwrap_or(0);
+        self.anpr_status = Some(format!("ANPR settings saved ({n} plate(s))."));
+        info!(
+            host = %self.anpr_draft.host,
+            plates = n,
+            enabled = self.anpr_draft.enabled,
+            "saved ANPR settings"
+        );
+    }
+
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -361,17 +418,19 @@ impl ViewerApp {
         let mut open = self.show_settings;
         let mut save_nvr = false;
         let mut save_gate = false;
+        let mut save_anpr = false;
         let mut save_ui = false;
         egui::Window::new(icons::labeled(icons::GEAR, "Settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(440.0)
-            .default_height(520.0)
+            .default_width(480.0)
+            .default_height(560.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Nvr, "NVR");
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Gates, "Gates");
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Anpr, "ANPR");
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Display, "Display");
                     ui.selectable_value(
                         &mut self.settings_tab,
@@ -562,6 +621,161 @@ impl ViewerApp {
                     ui.label(egui::RichText::new(msg).small().weak());
                 }
                     }
+                    SettingsTab::Anpr => {
+                ui.heading("ANPR");
+                ui.label(
+                    egui::RichText::new(
+                        "Hikvision license-plate events (alertStream). Watchlist hits play a sound and show a popup — no files are saved.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.anpr_draft.enabled, "Enable ANPR listener")
+                    .on_hover_text("Off keeps credentials/watchlist in cameras.toml but stops listening.");
+                ui.horizontal(|ui| {
+                    ui.label("Host");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.anpr_draft.host)
+                            .desired_width(220.0)
+                            .hint_text("192.168.x.x"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("HTTP port");
+                    ui.add(
+                        egui::DragValue::new(&mut self.anpr_draft.http_port).range(1..=65535),
+                    );
+                    ui.label("Channel");
+                    ui.add(
+                        egui::DragValue::new(&mut self.anpr_draft.channel).range(1..=64),
+                    )
+                    .on_hover_text("Snapshot channel for the popup still (ISAPI picture).");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("User");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.anpr_draft.username)
+                            .desired_width(120.0),
+                    );
+                    ui.label("Password");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.anpr_draft.password)
+                            .password(true)
+                            .desired_width(140.0),
+                    );
+                });
+                if ui
+                    .checkbox(&mut self.anpr_draft.silent, "Mute alert audio")
+                    .changed()
+                {
+                    self.anpr.set_silent(self.anpr_draft.silent);
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading("Watchlist");
+                ui.label(
+                    egui::RichText::new(
+                        "Sound: alert (default) or kim — both shipped in the app. Or a path to an .mp3 next to cameras.toml.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+
+                let mut remove_idx: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (i, plate) in self.anpr_draft.plates.iter_mut().enumerate() {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut plate.enabled, "");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut plate.plate)
+                                            .desired_width(100.0)
+                                            .hint_text("Plate"),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut plate.name)
+                                            .desired_width(120.0)
+                                            .hint_text("Name"),
+                                    );
+                                    if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                                        remove_idx = Some(i);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Sound");
+                                    let current = {
+                                        let s = plate.sound.trim();
+                                        if s.is_empty() {
+                                            "alert".to_string()
+                                        } else {
+                                            s.to_string()
+                                        }
+                                    };
+                                    egui::ComboBox::from_id_salt(("anpr_sound", i))
+                                        .selected_text(&current)
+                                        .width(100.0)
+                                        .show_ui(ui, |ui| {
+                                            for key in ["alert", "kim"] {
+                                                if ui
+                                                    .selectable_label(current.as_str() == key, key)
+                                                    .clicked()
+                                                {
+                                                    plate.sound = key.to_string();
+                                                }
+                                            }
+                                        });
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut plate.sound)
+                                            .desired_width(160.0)
+                                            .hint_text("alert / kim / path"),
+                                    );
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+                if let Some(i) = remove_idx {
+                    self.anpr_draft.plates.remove(i);
+                }
+                if ui.button("Add plate").clicked() {
+                    self.anpr_draft.plates.push(crate::config::AnprPlate::default());
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Save ANPR")
+                        .on_hover_text("Write [anpr] to cameras.toml and reconnect")
+                        .clicked()
+                    {
+                        save_anpr = true;
+                    }
+                    let testing = self
+                        .anpr_test_inflight
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    if ui
+                        .add_enabled(!testing, egui::Button::new(if testing {
+                            "Testing…"
+                        } else {
+                            "Test snapshot"
+                        }))
+                        .on_hover_text(
+                            "Fetch a still and play the default alert sound (unless muted). Not saved to disk.",
+                        )
+                        .clicked()
+                    {
+                        self.test_anpr_snapshot();
+                    }
+                });
+                if let Some(msg) = self.anpr_status.clone().or_else(|| self.anpr.status()) {
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
+                    }
                     SettingsTab::Display => {
                 ui.heading("Decoder");
                 ui.label(
@@ -739,6 +953,9 @@ impl ViewerApp {
         }
         if save_gate {
             self.apply_gate_from_settings();
+        }
+        if save_anpr {
+            self.apply_anpr_from_settings();
         }
     }
 }
