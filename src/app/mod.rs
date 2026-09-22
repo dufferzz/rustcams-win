@@ -300,6 +300,8 @@ pub struct ViewerApp {
     /// Selection / outline color (default on-view blue).
     accent: Color32,
     outline_width: f32,
+    /// Font + icon scale (1.0 = default).
+    ui_scale: f32,
     camera_list_open: bool,
     sidebar_open: bool,
     /// Width of the camera library side panel (drag edge to resize).
@@ -512,6 +514,7 @@ impl ViewerApp {
             show_settings: false,
             accent: ui_prefs.accent_color(),
             outline_width: ui_prefs.outline_width(),
+            ui_scale: ui_prefs.ui_scale(),
             camera_list_open: ui_prefs.camera_list_open,
             sidebar_open: ui_prefs.sidebar_open,
             sidebar_width: settings::clamp_sidebar_width(ui_prefs.sidebar_width),
@@ -795,7 +798,15 @@ impl ViewerApp {
     /// Empty prefs → one "Cameras" group sorted alphabetically by display name.
     /// Unknown ids are pruned; newly discovered cameras are appended to the first
     /// group in alphabetical order.
+    ///
+    /// When `self.cameras` is empty (e.g. NVR discovery still in flight), do nothing —
+    /// pruning against an empty inventory would wipe every group's membership and
+    /// persist that to `ui.toml`.
     pub(super) fn ensure_library_groups(&mut self, persist: bool) {
+        if self.cameras.is_empty() {
+            return;
+        }
+
         let mut name_by_id: HashMap<String, String> = HashMap::new();
         for cam in &self.cameras {
             name_by_id.insert(cam.id.clone(), cam.name.to_ascii_lowercase());
@@ -840,6 +851,16 @@ impl ViewerApp {
                 cameras: Vec::new(),
             });
             changed = true;
+        }
+
+        // Drop duplicate ids (keep the first group that lists each camera).
+        let mut seen = std::collections::HashSet::new();
+        for g in &mut self.library_groups {
+            let before = g.cameras.len();
+            g.cameras.retain(|id| seen.insert(id.clone()));
+            if g.cameras.len() != before {
+                changed = true;
+            }
         }
 
         let mut assigned = std::collections::HashSet::new();
@@ -1371,8 +1392,7 @@ impl ViewerApp {
         self.sidebar_ptz_cam = Some(cam_id.to_string());
         if let Some(target) = target {
             self.ptz.prewarm(target.clone());
-            self.ptz.fetch_presets(target.clone());
-            self.ptz.fetch_park_action(target);
+            self.ptz.fetch_presets(target);
         }
         self.sync_listen_audio();
     }

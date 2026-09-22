@@ -41,6 +41,9 @@ pub struct UiPrefs {
     pub accent: String,
     #[serde(default = "default_outline_width")]
     pub outline_width: f32,
+    /// Scale factor for UI fonts and icons (1.0 = default).
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
     #[serde(default = "default_true")]
     pub camera_list_open: bool,
     #[serde(default = "default_true")]
@@ -116,6 +119,17 @@ fn default_outline_width() -> f32 {
     3.0
 }
 
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+pub fn clamp_ui_scale(s: f32) -> f32 {
+    s.clamp(0.75, 1.75)
+}
+
+const BASE_FONT_SIZE: f32 = 14.0;
+const BASE_ICON_SIZE: f32 = 16.0;
+
 pub fn default_w1() -> i32 {
     640
 }
@@ -156,6 +170,7 @@ impl Default for UiPrefs {
         Self {
             accent: default_accent_hex(),
             outline_width: default_outline_width(),
+            ui_scale: default_ui_scale(),
             camera_list_open: true,
             sidebar_open: true,
             sidebar_width: default_sidebar_width(),
@@ -210,6 +225,10 @@ impl UiPrefs {
     pub fn outline_width(&self) -> f32 {
         self.outline_width.clamp(1.0, 16.0)
     }
+
+    pub fn ui_scale(&self) -> f32 {
+        clamp_ui_scale(self.ui_scale)
+    }
 }
 
 pub fn parse_hex_color(s: &str) -> Option<Color32> {
@@ -258,6 +277,46 @@ impl ViewerApp {
         v.widgets.hovered.bg_stroke.color = accent;
         v.widgets.active.bg_stroke.color = accent;
         ctx.set_visuals(v);
+        self.apply_ui_type_scale(ctx);
+    }
+
+    /// Apply Display → UI scale to egui text styles and hit targets.
+    pub(super) fn apply_ui_type_scale(&self, ctx: &egui::Context) {
+        let scale = clamp_ui_scale(self.ui_scale);
+        let font = BASE_FONT_SIZE * scale;
+        let icon = BASE_ICON_SIZE * scale;
+        let mut style = (*ctx.style()).clone();
+        style.text_styles = [
+            (
+                egui::TextStyle::Small,
+                egui::FontId::new(font * 0.85, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Body,
+                egui::FontId::new(font, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Button,
+                egui::FontId::new(icon, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Heading,
+                egui::FontId::new(font * 1.3, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Monospace,
+                egui::FontId::new(font, egui::FontFamily::Monospace),
+            ),
+        ]
+        .into();
+        style.spacing.interact_size = egui::vec2(18.0 * scale, 18.0 * scale);
+        style.spacing.button_padding = egui::vec2(4.0 * scale, 2.0 * scale);
+        ctx.set_style(style);
+    }
+
+    /// Scale a hardcoded label/icon size by the Display UI scale.
+    pub(super) fn scaled_font(&self, base: f32) -> egui::FontId {
+        egui::FontId::proportional(base * clamp_ui_scale(self.ui_scale))
     }
 
     pub(super) fn save_ui_prefs(&self) {
@@ -265,6 +324,7 @@ impl ViewerApp {
         UiPrefs {
             accent: color_to_hex(self.accent),
             outline_width: self.outline_width,
+            ui_scale: clamp_ui_scale(self.ui_scale),
             camera_list_open: self.camera_list_open,
             sidebar_open: self.sidebar_open,
             sidebar_width: clamp_sidebar_width(self.sidebar_width),
@@ -932,10 +992,37 @@ impl ViewerApp {
                     self.outline_width = self.outline_width.clamp(1.0, 16.0);
                     save_ui = true;
                 }
+                ui.add_space(8.0);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.ui_scale, 0.75..=1.75)
+                            .text("UI scale")
+                            .suffix("%")
+                            .custom_formatter(|n, _| format!("{:.0}", n * 100.0))
+                            .custom_parser(|s| {
+                                s.trim()
+                                    .trim_end_matches('%')
+                                    .parse::<f64>()
+                                    .ok()
+                                    .map(|p| p / 100.0)
+                            })
+                            .step_by(0.05),
+                    )
+                    .changed()
+                {
+                    self.ui_scale = clamp_ui_scale(self.ui_scale);
+                    save_ui = true;
+                }
+                ui.label(
+                    egui::RichText::new("Fonts and icons scale together")
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(6.0);
                 if ui.button("Reset appearance").clicked() {
                     self.accent = DEFAULT_ACCENT;
                     self.outline_width = default_outline_width();
+                    self.ui_scale = default_ui_scale();
                     self.decode_1 = default_w1();
                     self.decode_1_hd = default_w1_hd();
                     self.decode_2 = default_w2();

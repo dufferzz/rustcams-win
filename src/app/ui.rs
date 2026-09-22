@@ -618,7 +618,7 @@ impl ViewerApp {
                 } else {
                     "No matches"
                 },
-                egui::FontId::proportional(12.0),
+                self.scaled_font(12.0),
                 Color32::from_rgb(120, 125, 135),
             );
             let hovering = drop_resp.dnd_hover_payload::<DragPayload>().is_some()
@@ -823,6 +823,17 @@ impl ViewerApp {
     }
 
     fn sidebar_ptz_pad(&mut self, ui: &mut egui::Ui) {
+        // Display → UI scale must not affect the PTZ pad; keep default button chrome here.
+        {
+            let style = ui.style_mut();
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::new(16.0, egui::FontFamily::Proportional),
+            );
+            style.spacing.interact_size = egui::vec2(18.0, 18.0);
+            style.spacing.button_padding = egui::vec2(4.0, 2.0);
+        }
+
         let mut pan = 0i32;
         let mut tilt = 0i32;
         let mut zoom = 0i32;
@@ -965,11 +976,9 @@ impl ViewerApp {
             self.apply_ptz_vector(PtzVector::STOP);
             ui.ctx().data_mut(|d| d.insert_temp(pad_id, false));
         }
-
-        ui.add_space(8.0);
-        self.sidebar_park_action(ui);
     }
 
+    #[allow(dead_code)] // Hidden: parkaction toggle is unreliable on our NVRs.
     fn sidebar_park_action(&mut self, ui: &mut egui::Ui) {
         let Some(target) = self.active_ptz_target() else {
             return;
@@ -1602,7 +1611,7 @@ impl ViewerApp {
                     cell.center(),
                     egui::Align2::CENTER_CENTER,
                     msg,
-                    egui::FontId::proportional(14.0),
+                    self.scaled_font(14.0),
                     Color32::from_rgb(220, 220, 220),
                 );
             }
@@ -1622,7 +1631,7 @@ impl ViewerApp {
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
                 msg,
-                egui::FontId::proportional(14.0),
+                self.scaled_font(14.0),
                 Color32::from_rgb(180, 180, 180),
             );
         }
@@ -1641,7 +1650,7 @@ impl ViewerApp {
                 bar.left_center() + Vec2::new(8.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 label,
-                egui::FontId::proportional(13.0),
+                self.scaled_font(13.0),
                 if selected {
                     selection_border(cam.ptz.is_some())
                 } else {
@@ -1856,7 +1865,7 @@ impl ViewerApp {
                         cell.center(),
                         egui::Align2::CENTER_CENTER,
                         "Missing camera",
-                        egui::FontId::proportional(13.0),
+                        self.scaled_font(13.0),
                         Color32::from_rgb(180, 100, 100),
                     );
                 }
@@ -1887,7 +1896,7 @@ impl ViewerApp {
                     cell.center(),
                     egui::Align2::CENTER_CENTER,
                     "Drop camera here",
-                    egui::FontId::proportional(13.0),
+                    self.scaled_font(13.0),
                     Color32::from_rgb(90, 95, 105),
                 );
                 if screen_focused && pad_focus == Some(i) {
@@ -2134,6 +2143,7 @@ fn selection_border(has_ptz: bool) -> Color32 {
     }
 }
 
+#[allow(dead_code)] // Used only by hidden park action UI.
 fn park_action_hint(park: &ParkAction) -> String {
     let action = match (park.action_type.as_deref(), park.action_num) {
         (Some(kind), Some(n)) if n > 0 => format!("{kind} {n}"),
