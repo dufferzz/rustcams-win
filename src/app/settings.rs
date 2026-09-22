@@ -927,6 +927,11 @@ impl ViewerApp {
                 ui.add_space(4.0);
                 ui.label("Made by Sam Duff");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.label(
+                    egui::RichText::new("Includes auto-update improvements from 0.2.4.")
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(12.0);
 
                 let is_appimage = crate::update::appimage_path().is_some();
