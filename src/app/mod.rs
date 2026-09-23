@@ -291,6 +291,9 @@ pub struct ViewerApp {
     /// Last rustcams screen that had focus (`true` = Screen 2). PTZ outline stays here when both are in the background.
     last_ptz_screen_aux: bool,
     aux_window_fullscreen: bool,
+    /// OS-fullscreen: auto-show toolbar while the pointer is near the top edge.
+    fs_toolbar_reveal: bool,
+    aux_fs_toolbar_reveal: bool,
     /// In-flight drag so drops work across the auxiliary viewport.
     cross_drag: Option<DragPayload>,
     aux_pointer_down: bool,
@@ -510,6 +513,8 @@ impl ViewerApp {
             main_focused: false,
             last_ptz_screen_aux: false,
             aux_window_fullscreen: false,
+            fs_toolbar_reveal: false,
+            aux_fs_toolbar_reveal: false,
             cross_drag: None,
             aux_pointer_down: false,
             show_log: false,
@@ -801,8 +806,8 @@ impl ViewerApp {
     /// Keep library groups in sync with the resolved camera list.
     ///
     /// Empty prefs → one "Cameras" group sorted alphabetically by display name.
-    /// Unknown ids are pruned; newly discovered cameras are appended to the first
-    /// group in alphabetical order.
+    /// Unknown ids are pruned; newly discovered cameras join the first group.
+    /// Each group's membership list is kept A–Z by display name.
     ///
     /// When `self.cameras` is empty (e.g. NVR discovery still in flight), do nothing —
     /// pruning against an empty inventory would wipe every group's membership and
@@ -812,24 +817,13 @@ impl ViewerApp {
             return;
         }
 
-        let mut name_by_id: HashMap<String, String> = HashMap::new();
-        for cam in &self.cameras {
-            name_by_id.insert(cam.id.clone(), cam.name.to_ascii_lowercase());
-        }
-        let sort_ids = |ids: &mut Vec<String>, names: &HashMap<String, String>| {
-            ids.sort_by(|a, b| {
-                let na = names.get(a).map(String::as_str).unwrap_or(a.as_str());
-                let nb = names.get(b).map(String::as_str).unwrap_or(b.as_str());
-                na.cmp(nb).then_with(|| a.cmp(b))
-            });
-        };
-
+        let name_by_id = self.library_name_keys();
         let known: std::collections::HashSet<String> =
             self.cameras.iter().map(|c| c.id.clone()).collect();
 
         if self.library_groups.is_empty() {
             let mut ids: Vec<String> = self.cameras.iter().map(|c| c.id.clone()).collect();
-            sort_ids(&mut ids, &name_by_id);
+            Self::sort_camera_ids(&mut ids, &name_by_id);
             self.library_groups.push(LibraryGroup {
                 name: "Cameras".into(),
                 open: true,
@@ -874,21 +868,55 @@ impl ViewerApp {
                 assigned.insert(id.clone());
             }
         }
-        let mut orphans: Vec<String> = self
+        let orphans: Vec<String> = self
             .cameras
             .iter()
             .filter(|c| !assigned.contains(&c.id))
             .map(|c| c.id.clone())
             .collect();
         if !orphans.is_empty() {
-            sort_ids(&mut orphans, &name_by_id);
             self.library_groups[0].cameras.extend(orphans);
             changed = true;
+        }
+
+        // Keep each group A–Z by display name (DnD between groups still moves membership).
+        for g in &mut self.library_groups {
+            let before = g.cameras.clone();
+            Self::sort_camera_ids(&mut g.cameras, &name_by_id);
+            if g.cameras != before {
+                changed = true;
+            }
         }
 
         if changed && persist {
             self.save_ui_prefs();
         }
+    }
+
+    fn library_name_keys(&self) -> HashMap<String, String> {
+        let mut name_by_id: HashMap<String, String> = HashMap::new();
+        for cam in &self.cameras {
+            name_by_id.insert(cam.id.clone(), cam.name.to_ascii_lowercase());
+        }
+        name_by_id
+    }
+
+    fn sort_camera_ids(ids: &mut Vec<String>, names: &HashMap<String, String>) {
+        ids.sort_by(|a, b| {
+            let na = names.get(a).map(String::as_str).unwrap_or(a.as_str());
+            let nb = names.get(b).map(String::as_str).unwrap_or(b.as_str());
+            na.cmp(nb).then_with(|| a.cmp(b))
+        });
+    }
+
+    /// Sort one library group's cameras A–Z by display name.
+    pub(super) fn sort_library_group(&mut self, group_idx: usize) {
+        if group_idx >= self.library_groups.len() {
+            return;
+        }
+        let names = self.library_name_keys();
+        Self::sort_camera_ids(&mut self.library_groups[group_idx].cameras, &names);
+        self.save_ui_prefs();
     }
 
     pub(super) fn add_library_group(&mut self) {
@@ -1558,6 +1586,9 @@ impl ViewerApp {
             return;
         }
         self.window_fullscreen = on;
+        if !on {
+            self.fs_toolbar_reveal = false;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
@@ -1568,7 +1599,23 @@ impl ViewerApp {
         // often still `None`/`true` for a frame after we send Fullscreen(false).
         if ctx.input(|i| i.viewport().fullscreen) == Some(false) {
             self.window_fullscreen = false;
+            self.fs_toolbar_reveal = false;
         }
+    }
+
+    /// In OS fullscreen, peek the toolbar when the pointer hits the top edge;
+    /// keep it up while the cursor stays over the bar.
+    pub(super) fn update_fs_toolbar_reveal(reveal: &mut bool, ctx: &egui::Context) -> bool {
+        const REVEAL_Y: f32 = 8.0;
+        const KEEP_Y: f32 = 56.0;
+        let y = ctx.input(|i| i.pointer.hover_pos().map(|p| p.y));
+        let show = match y {
+            Some(y) if *reveal => y <= KEEP_Y,
+            Some(y) => y <= REVEAL_Y,
+            None => false,
+        };
+        *reveal = show;
+        show
     }
 
     fn apply_ptz_vector(&mut self, vec: PtzVector) {
@@ -2018,6 +2065,20 @@ impl eframe::App for ViewerApp {
                         }
                     });
             }
+        } else if Self::update_fs_toolbar_reveal(&mut self.fs_toolbar_reveal, ctx) {
+            egui::TopBottomPanel::top("toolbar_fs")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(PANEL_BG)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(ctx, |ui| {
+                    self.toolbar(ui, self.views.active, false);
+                });
+            ctx.request_repaint();
+        } else {
+            // Keep polling pointer position while chrome is hidden.
+            ctx.request_repaint();
         }
 
         egui::CentralPanel::default()

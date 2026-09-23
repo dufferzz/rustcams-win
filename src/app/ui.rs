@@ -405,6 +405,7 @@ impl ViewerApp {
         let mut select_cam: Option<String> = None;
         let mut assign_cam: Option<String> = None;
         let mut play_group: Option<usize> = None;
+        let mut sort_group: Option<usize> = None;
 
         ui.set_max_width(ui.max_rect().width());
         ui.horizontal(|ui| {
@@ -510,6 +511,10 @@ impl ViewerApp {
                             play_group = Some(gi);
                             ui.close_menu();
                         }
+                        if ui.button("Sort A–Z").clicked() {
+                            sort_group = Some(gi);
+                            ui.close_menu();
+                        }
                         if ui.button("Rename").clicked() {
                             start_rename = Some(gi);
                             ui.close_menu();
@@ -585,6 +590,9 @@ impl ViewerApp {
         }
         if let Some(gi) = play_group {
             self.play_library_group(gi, view_idx, is_aux);
+        }
+        if let Some(gi) = sort_group {
+            self.sort_library_group(gi);
         }
         if save_groups {
             self.save_ui_prefs();
@@ -1796,6 +1804,7 @@ impl ViewerApp {
 
                 let aux_view = self.aux_view;
                 if !self.aux_window_fullscreen {
+                    self.aux_fs_toolbar_reveal = false;
                     egui::TopBottomPanel::top("aux_toolbar")
                         .frame(
                             egui::Frame::NONE
@@ -1809,6 +1818,19 @@ impl ViewerApp {
                     if self.sidebar_open {
                         self.show_resizable_camera_sidebar(ctx, aux_view, true, "aux_cameras_side");
                     }
+                } else if Self::update_fs_toolbar_reveal(&mut self.aux_fs_toolbar_reveal, ctx) {
+                    egui::TopBottomPanel::top("aux_toolbar_fs")
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(PANEL_BG)
+                                .inner_margin(egui::Margin::symmetric(8, 4)),
+                        )
+                        .show(ctx, |ui| {
+                            self.toolbar(ui, aux_view, true);
+                        });
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint();
                 }
 
                 egui::CentralPanel::default()
@@ -2096,29 +2118,69 @@ impl ViewerApp {
             cancelled = true;
         }
 
-        egui::Window::new("Open gates?")
+        egui::Window::new("Open Gate?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .order(egui::Order::Foreground)
+            .default_width(420.0)
+            .min_width(380.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("Open the gates?");
-                ui.label(
-                    egui::RichText::new(
-                        "Enter or ✕ / OK to open · any other button or Cancel to abort",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        confirmed = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancelled = true;
-                    }
+                ui.vertical_centered(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(icons::QUESTION)
+                            .size(72.0)
+                            .color(self.accent),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Open the gate?")
+                            .size(28.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Enter or ✕ to open  ·  Esc / Cancel to abort",
+                        )
+                        .size(14.0)
+                        .weak(),
+                    );
+                    ui.add_space(18.0);
+                    ui.horizontal(|ui| {
+                        let btn_h = 40.0;
+                        let btn_w = 140.0;
+                        let gap = 12.0;
+                        let total = btn_w * 2.0 + gap;
+                        let inset = ((ui.available_width() - total) * 0.5).max(0.0);
+                        if inset > 0.0 && inset.is_finite() {
+                            ui.add_space(inset);
+                        }
+                        if ui
+                            .add_sized(
+                                [btn_w, btn_h],
+                                egui::Button::new(
+                                    egui::RichText::new("Open Gate").size(18.0).strong(),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        ui.add_space(gap);
+                        if ui
+                            .add_sized(
+                                [btn_w, btn_h],
+                                egui::Button::new(egui::RichText::new("Cancel").size(18.0)),
+                            )
+                            .clicked()
+                        {
+                            cancelled = true;
+                        }
+                    });
+                    ui.add_space(12.0);
                 });
             });
 
