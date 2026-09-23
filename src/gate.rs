@@ -4,7 +4,10 @@ use digest_auth::{AuthContext, HttpMethod};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// `PUT /ISAPI/AccessControl/RemoteControl/door/{id}` with HTTP digest (same as curl `--digest`).
+/// `PUT /ISAPI/AccessControl/RemoteControl/door/{id}` with HTTP digest.
+///
+/// Body matches Hikvision / gogateopener:
+/// `<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>` (`Content-Type: application/xml`).
 pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
     if !cfg.is_configured() {
         bail!("gate host/username is empty");
@@ -14,16 +17,18 @@ pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
     let url = cfg.request_url();
     let action = cfg.action.trim();
     let action = if action.is_empty() { "open" } else { action };
+    let body = format!("<RemoteControlDoor><cmd>{action}</cmd></RemoteControlDoor>");
+    let body_bytes = body.as_bytes();
 
     info!(host = %cfg.host.trim(), door = %cfg.door_id.trim(), action, "opening gate");
-    debug!(%url, %path, "gate PUT");
+    debug!(%url, %path, %body, "gate PUT");
 
     let agent = crate::http_client::agent(Duration::from_secs(10));
 
     let mut challenge = agent
         .put(&url)
-        .header("Content-Type", "text/plain")
-        .send(action.as_bytes())
+        .header("Content-Type", "application/xml")
+        .send(body_bytes)
         .with_context(|| format!("gate probe PUT {url}"))?;
 
     let status = challenge.status().as_u16();
@@ -62,7 +67,7 @@ pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
         &cfg.username,
         &cfg.password,
         &path,
-        Some(action.as_bytes()),
+        Some(body_bytes),
         HttpMethod::PUT,
     );
     let answer = prompt
@@ -73,22 +78,22 @@ pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
     let mut response = agent
         .put(&url)
         .header("Authorization", &answer)
-        .header("Content-Type", "text/plain")
-        .send(action.as_bytes())
+        .header("Content-Type", "application/xml")
+        .send(body_bytes)
         .with_context(|| format!("gate authenticated PUT {url}"))?;
 
     let status = response.status().as_u16();
-    let body = response.body_mut().read_to_string().unwrap_or_default();
+    let resp_body = response.body_mut().read_to_string().unwrap_or_default();
     debug!(
         status,
-        body = %truncate(&body, 200),
+        body = %truncate(&resp_body, 200),
         "gate authenticated response"
     );
     if !(200..300).contains(&status) {
         warn!(
             %url,
             status,
-            body = %truncate(&body, 300),
+            body = %truncate(&resp_body, 300),
             "gate command failed"
         );
         bail!("gate command failed: HTTP {status}");

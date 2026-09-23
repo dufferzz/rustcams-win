@@ -306,6 +306,8 @@ pub struct ViewerApp {
     sidebar_open: bool,
     /// Width of the camera library side panel (drag edge to resize).
     sidebar_width: f32,
+    /// Height of the PTZ / Presets block under the camera list (drag splitter to resize).
+    sidebar_controls_height: f32,
     /// Ordered camera library groups (persisted in ui.toml).
     library_groups: Vec<LibraryGroup>,
     /// Group index being renamed in the sidebar, if any.
@@ -518,6 +520,9 @@ impl ViewerApp {
             camera_list_open: ui_prefs.camera_list_open,
             sidebar_open: ui_prefs.sidebar_open,
             sidebar_width: settings::clamp_sidebar_width(ui_prefs.sidebar_width),
+            sidebar_controls_height: settings::clamp_sidebar_controls_height(
+                ui_prefs.sidebar_controls_height,
+            ),
             library_groups: ui_prefs.library_groups,
             library_renaming: None,
             library_rename_buf: String::new(),
@@ -1063,20 +1068,6 @@ impl ViewerApp {
         ids.sort();
         ids.dedup();
         ids
-    }
-
-    fn hd_allowed(&self) -> bool {
-        self.fullscreen_slot.is_some()
-            || self.aux_fullscreen_slot.is_some()
-            || matches!(
-                self.active_layout(),
-                Layout::One | Layout::Two | Layout::Grid2
-            )
-            || (self.aux_open
-                && matches!(
-                    self.views.view(self.aux_view).layout,
-                    Layout::One | Layout::Two | Layout::Grid2
-                ))
     }
 
     /// Decode width / fps tier for a stream (fullscreen overrides grid tier).

@@ -51,6 +51,9 @@ pub struct UiPrefs {
     /// Camera library side panel width (pixels).
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    /// Height of the PTZ / Presets panel under the camera list (pixels).
+    #[serde(default = "default_sidebar_controls_height")]
+    pub sidebar_controls_height: f32,
     /// Name of the last selected view; restored on launch if it still exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_view: Option<String>,
@@ -115,6 +118,15 @@ pub fn clamp_sidebar_width(w: f32) -> f32 {
     w.clamp(160.0, 360.0)
 }
 
+/// Default fits the PTZ pad (tabs + label + 5×3 button grid) without wasted space.
+fn default_sidebar_controls_height() -> f32 {
+    280.0
+}
+
+pub fn clamp_sidebar_controls_height(h: f32) -> f32 {
+    h.clamp(140.0, 520.0)
+}
+
 fn default_outline_width() -> f32 {
     3.0
 }
@@ -174,6 +186,7 @@ impl Default for UiPrefs {
             camera_list_open: true,
             sidebar_open: true,
             sidebar_width: default_sidebar_width(),
+            sidebar_controls_height: default_sidebar_controls_height(),
             last_view: None,
             last_aux_view: None,
             fit: None,
@@ -328,6 +341,7 @@ impl ViewerApp {
             camera_list_open: self.camera_list_open,
             sidebar_open: self.sidebar_open,
             sidebar_width: clamp_sidebar_width(self.sidebar_width),
+            sidebar_controls_height: clamp_sidebar_controls_height(self.sidebar_controls_height),
             last_view: Some(self.views.active_view().name.clone()),
             last_aux_view: aux_name,
             fit: Some(self.fit.as_str().to_string()),

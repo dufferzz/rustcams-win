@@ -12,7 +12,7 @@ use egui::{Color32, Id, Rect, Sense, Vec2};
 use std::time::Instant;
 use tracing::info;
 
-use super::settings::{clamp_sidebar_width, CANVAS_BG, PANEL_BG};
+use super::settings::{clamp_sidebar_controls_height, clamp_sidebar_width, CANVAS_BG, PANEL_BG};
 
 impl ViewerApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, view_idx: usize, is_aux: bool) {
@@ -152,28 +152,6 @@ impl ViewerApp {
             }
 
             ui.separator();
-            let hd_allowed = self.hd_allowed();
-            let hd_response = ui
-                .add_enabled(
-                    hd_allowed,
-                    egui::SelectableLabel::new(
-                        self.hd && hd_allowed,
-                        icons::labeled(icons::MONITOR_PLAY, "HD"),
-                    ),
-                )
-                .on_hover_text(if self.fullscreen_slot.is_some() {
-                    "HD: main stream at higher decode width. Off: sub stream. Available in fullscreen."
-                } else if hd_allowed {
-                    "HD: main stream (…01 / 101). Off: sub stream (…02 / 102). Available on 1, 2, and 2×2."
-                } else {
-                    "HD disabled on dense grids (3×3+) — always use substreams to save CPU. Fullscreen to enable."
-                });
-            if hd_allowed && hd_response.clicked() {
-                self.hd = !self.hd;
-                info!(hd = self.hd, "stream quality toggled");
-            }
-
-            ui.separator();
             let audio_label = if self.audio_enabled {
                 icons::SPEAKER_HIGH
             } else {
@@ -211,7 +189,7 @@ impl ViewerApp {
                         egui::Button::new(if gate_busy {
                             "Opening…".to_string()
                         } else {
-                            icons::labeled(icons::DOOR_OPEN, "Gates")
+                            icons::labeled(icons::DOOR_OPEN, "Open Gate")
                         }),
                     )
                     .on_hover_text(gate_tip)
@@ -455,7 +433,11 @@ impl ViewerApp {
             || ui.ctx().dragged_id().is_some();
 
         let available = ui.available_height();
-        let list_h = (available * 0.55).clamp(80.0, available.max(80.0));
+        let handle_h = 8.0;
+        let max_controls = (available - 80.0 - handle_h).max(140.0);
+        let controls_h = clamp_sidebar_controls_height(self.sidebar_controls_height)
+            .min(max_controls);
+        let list_h = (available - controls_h - handle_h).max(80.0);
 
         egui::ScrollArea::vertical()
             .id_salt(("camera_library", is_aux))
@@ -608,9 +590,49 @@ impl ViewerApp {
             self.save_ui_prefs();
         }
 
-        ui.add_space(6.0);
-        ui.separator();
-        self.sidebar_ptz_panel(ui);
+        // Drag splitter between camera list and PTZ / Presets.
+        let full_w = ui.max_rect().width().min(ui.available_width()).max(1.0);
+        let (handle_rect, handle) =
+            ui.allocate_exact_size(Vec2::new(full_w, handle_h), Sense::drag());
+        let mid_y = handle_rect.center().y;
+        ui.painter().hline(
+            handle_rect.x_range().shrink(8.0),
+            mid_y,
+            egui::Stroke::new(
+                2.0_f32,
+                if handle.hovered() || handle.dragged() {
+                    self.accent
+                } else {
+                    Color32::from_rgb(55, 60, 70)
+                },
+            ),
+        );
+        if handle.hovered() || handle.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if handle.dragged() {
+            // Drag up → taller controls; drag down → taller camera list.
+            let next = self.sidebar_controls_height - handle.drag_delta().y;
+            self.sidebar_controls_height =
+                clamp_sidebar_controls_height(next).min(max_controls);
+            self.save_ui_prefs();
+        }
+
+        let controls_w = full_w;
+        ui.allocate_ui_with_layout(
+            Vec2::new(controls_w, controls_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_height(controls_h);
+                ui.set_max_height(controls_h);
+                egui::ScrollArea::vertical()
+                    .id_salt(("sidebar_controls", is_aux))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.sidebar_ptz_panel(ui);
+                    });
+            },
+        );
     }
 
     fn library_group_body(
