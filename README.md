@@ -290,7 +290,7 @@ Deep dive: [docs/streaming.md](docs/streaming.md).
 | PTZ focus | Sidebar **F−** / **F+**, DualShock L1/R1, or `,` / `.` |
 | PTZ home | Sidebar `H` |
 | PTZ park action | Sidebar **Park On/Off** — idle return to preset/patrol (NVR `PTZCtrlProxy` `parkaction`); click to toggle |
-| PTZ (DualShock 4) | Left stick pan/tilt (D-pad too in camera fullscreen); L2/R2 or right-stick Y zoom; L1/R1 focus; D-pad on grid moves selection; Cross/X = select (camera fullscreen); Triangle = back from camera FS, or toggle OS fullscreen on the grid; Square = patrol 1 |
+| PTZ (DualShock 4) | Left stick pan/tilt (D-pad too in camera fullscreen); L2/R2 zoom; L1/R1 focus; D-pad on grid moves selection; Cross/X = select (camera fullscreen); Triangle = back from camera FS, or toggle OS fullscreen on the grid; Square = patrol 1 |
 
 With **`[nvr]`**, video still comes from the NVR. PTZ uses the NVR
 (`PUT /ISAPI/ContentMgmt/PTZCtrlProxy/channels/{channel}/continuous`) and

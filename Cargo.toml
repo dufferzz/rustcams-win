@@ -1,6 +1,6 @@
 [package]
 name = "rustcams"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 description = "Performant multi-camera RTSP CCTV viewer"
 license = "MIT"

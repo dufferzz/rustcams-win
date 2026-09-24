@@ -102,7 +102,7 @@ pub struct UiPrefs {
     /// Play RTSP audio for the selected camera (toolbar speaker). Off by default.
     #[serde(default)]
     pub audio_enabled: bool,
-    /// Ignore stick deflection below this (0–1). Left stick pans; right stick zooms.
+    /// Ignore left-stick deflection below this (0–1). Left stick pans and tilts.
     #[serde(default = "default_stick_deadzone")]
     pub stick_deadzone: f32,
     /// Ignore shoulder / trigger pressure below this (0–1). LT/RT and L2/R2 zoom.
@@ -1173,15 +1173,13 @@ impl ViewerApp {
                             .weak(),
                         );
                         ui.add_space(8.0);
-                        if deadzone_slider(ui, &mut self.stick_deadzone, "Joysticks") {
+                        if deadzone_slider(ui, &mut self.stick_deadzone, "Left stick") {
                             save_ui = true;
                         }
                         ui.label(
-                            egui::RichText::new(
-                                "Left stick pan/tilt, and right stick up/down zoom.",
-                            )
-                            .small()
-                            .weak(),
+                            egui::RichText::new("Left stick pan/tilt.")
+                                .small()
+                                .weak(),
                         );
                         ui.add_space(8.0);
                         if deadzone_slider(ui, &mut self.shoulder_deadzone, "Shoulders") {
@@ -1219,12 +1217,6 @@ impl ViewerApp {
                                     ui,
                                     "Left stick",
                                     &[("X", pad.lx), ("Y", pad.ly)],
-                                    self.stick_deadzone,
-                                );
-                                axis_row(
-                                    ui,
-                                    "Right stick",
-                                    &[("X", pad.rx), ("Y", pad.ry)],
                                     self.stick_deadzone,
                                 );
                                 axis_row(

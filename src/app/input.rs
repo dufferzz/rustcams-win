@@ -7,8 +7,6 @@ pub(super) struct ControllerReadout {
     pub name: String,
     pub lx: f32,
     pub ly: f32,
-    pub rx: f32,
-    pub ry: f32,
     pub lb: f32,
     pub rb: f32,
     pub lt: f32,
@@ -121,9 +119,6 @@ impl ViewerApp {
                 );
                 if l2 > 0.0 || r2 > 0.0 {
                     zoom = merge_axis(zoom, stick_to_speed(r2 - l2, PTZ_ZOOM_SPEED));
-                } else {
-                    let ry = axis_with_deadzone(gamepad.value(Axis::RightStickY), stick_dz);
-                    zoom = merge_axis(zoom, stick_to_speed(-ry, PTZ_ZOOM_SPEED));
                 }
 
                 let lb =
@@ -145,8 +140,7 @@ impl ViewerApp {
                     || rb > 0.0
                     || l2 > 0.0
                     || r2 > 0.0
-                    || gamepad.is_pressed(Button::LeftThumb)
-                    || gamepad.is_pressed(Button::RightThumb);
+                    || gamepad.is_pressed(Button::LeftThumb);
             }
         }
 
@@ -323,8 +317,6 @@ impl ViewerApp {
             name: gamepad.name().to_string(),
             lx: gamepad.value(Axis::LeftStickX),
             ly: gamepad.value(Axis::LeftStickY),
-            rx: gamepad.value(Axis::RightStickX),
-            ry: gamepad.value(Axis::RightStickY),
             lb: raw_trigger(&gamepad, Button::LeftTrigger),
             rb: raw_trigger(&gamepad, Button::RightTrigger),
             lt: raw_trigger(&gamepad, Button::LeftTrigger2),

@@ -310,7 +310,7 @@ pub struct ViewerApp {
     outline_width: f32,
     /// Font + icon scale (1.0 = default).
     ui_scale: f32,
-    /// Stick axes below this magnitude are ignored (pan / tilt / right-stick zoom).
+    /// Left-stick axes below this magnitude are ignored (pan / tilt).
     stick_deadzone: f32,
     /// Shoulder triggers below this pressure are ignored (LT/RT zoom, LB/RB focus).
     shoulder_deadzone: f32,
