@@ -3410,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "rustcams"
-version = "0.3.8"
+version = "0.3.10"
 dependencies = [
  "anyhow",
  "digest_auth",

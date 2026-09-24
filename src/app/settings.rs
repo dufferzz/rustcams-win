@@ -6,6 +6,7 @@ use eframe::egui;
 use egui::{Color32, Stroke};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -15,6 +16,7 @@ pub(super) enum SettingsTab {
     Gates,
     Anpr,
     Display,
+    Controller,
     Diagnostics,
     About,
 }
@@ -100,6 +102,12 @@ pub struct UiPrefs {
     /// Play RTSP audio for the selected camera (toolbar speaker). Off by default.
     #[serde(default)]
     pub audio_enabled: bool,
+    /// Ignore stick deflection below this (0–1). Left stick pans; right stick zooms.
+    #[serde(default = "default_stick_deadzone")]
+    pub stick_deadzone: f32,
+    /// Ignore shoulder / trigger pressure below this (0–1). LT/RT and L2/R2 zoom.
+    #[serde(default = "default_shoulder_deadzone")]
+    pub shoulder_deadzone: f32,
 }
 
 fn default_accent_hex() -> String {
@@ -133,6 +141,18 @@ fn default_outline_width() -> f32 {
 
 fn default_ui_scale() -> f32 {
     1.0
+}
+
+fn default_stick_deadzone() -> f32 {
+    0.2
+}
+
+fn default_shoulder_deadzone() -> f32 {
+    0.05
+}
+
+pub fn clamp_deadzone(z: f32) -> f32 {
+    z.clamp(0.0, 0.9)
 }
 
 pub fn clamp_ui_scale(s: f32) -> f32 {
@@ -206,6 +226,8 @@ impl Default for UiPrefs {
             decode_6x6: default_w6(),
             decode_backend: crate::gst_link::DecodeBackend::Software,
             audio_enabled: false,
+            stick_deadzone: default_stick_deadzone(),
+            shoulder_deadzone: default_shoulder_deadzone(),
         }
     }
 }
@@ -361,6 +383,8 @@ impl ViewerApp {
             decode_6x6: self.decode_6x6,
             decode_backend: self.decode_backend,
             audio_enabled: self.audio_enabled,
+            stick_deadzone: clamp_deadzone(self.stick_deadzone),
+            shoulder_deadzone: clamp_deadzone(self.shoulder_deadzone),
         }
         .save(&self.ui_prefs_path);
     }
@@ -437,13 +461,78 @@ impl ViewerApp {
         };
     }
 
+    /// Config to write. Empty in-progress rows stay in the draft so typing isn't wiped.
+    fn anpr_config_to_save(&self) -> Option<crate::config::AnprConfig> {
+        if self.anpr_draft.host.trim().is_empty() {
+            return None;
+        }
+        let mut cfg = self.anpr_draft.clone();
+        cfg.plates.retain(|p| !p.plate.trim().is_empty());
+        if cfg.channel == 0 {
+            cfg.channel = 1;
+        }
+        Some(cfg)
+    }
+
     fn sync_anpr_into_app_config(&mut self) {
-        self.anpr_draft.plates.retain(|p| !p.plate.trim().is_empty());
-        self.app_config.anpr = if self.anpr_draft.host.trim().is_empty() {
-            None
-        } else {
-            Some(self.anpr_draft.clone())
+        self.app_config.anpr = self.anpr_config_to_save();
+    }
+
+    pub(super) fn schedule_anpr_persist(&mut self) {
+        self.anpr_persist_at = Some(Instant::now() + std::time::Duration::from_millis(400));
+    }
+
+    /// Write the watchlist (and the rest of `[anpr]`) to `cameras.toml`.
+    /// Returns false when the write was rejected; the status line explains why.
+    fn persist_anpr_draft(&mut self, force_reconnect: bool) -> bool {
+        let Some(cfg) = self.anpr_config_to_save() else {
+            return true;
         };
+        if cfg.username.trim().is_empty() {
+            self.anpr_status = Some("ANPR username is empty — not saved.".into());
+            return false;
+        }
+        if let Err(err) = crate::config::validate_host(&cfg.host) {
+            self.anpr_status = Some(format!("Invalid ANPR host: {err:#}"));
+            return false;
+        }
+        if self.app_config.anpr.as_ref() == Some(&cfg) {
+            return true;
+        }
+        let prev = self.app_config.anpr.clone();
+        let reconnect = force_reconnect || anpr_needs_reconnect(prev.as_ref(), &cfg);
+        let n = cfg.plates.len();
+        self.app_config.anpr = Some(cfg.clone());
+        if let Err(err) = self.app_config.save(&self.config_path) {
+            self.app_config.anpr = prev;
+            self.anpr_status = Some(format!("Failed to save cameras.toml: {err:#}"));
+            warn!("failed to save cameras.toml: {err:#}");
+            return false;
+        }
+        self.note_config_mtime();
+        let dir = self
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if reconnect {
+            self.anpr.apply_config(cfg, dir);
+        } else {
+            self.anpr.update_watchlist(cfg);
+        }
+        info!(plates = n, "saved ANPR watchlist");
+        true
+    }
+
+    pub(super) fn flush_anpr_persist(&mut self, force: bool) {
+        let due = self
+            .anpr_persist_at
+            .is_some_and(|t| force || Instant::now() >= t);
+        if !due {
+            return;
+        }
+        self.anpr_persist_at = None;
+        self.persist_anpr_draft(false);
     }
 
     fn apply_gate_from_settings(&mut self) {
@@ -462,6 +551,7 @@ impl ViewerApp {
         self.gate_draft.door_id = "1".into();
         self.gate_draft.action = "open".into();
         self.sync_gate_into_app_config();
+        self.sync_anpr_into_app_config();
         if let Err(err) = self.app_config.save(&self.config_path) {
             *self.gate_status.lock() = Some(format!("Failed to save cameras.toml: {err:#}"));
             warn!("failed to save cameras.toml: {err:#}");
@@ -473,37 +563,53 @@ impl ViewerApp {
     }
 
     fn apply_anpr_from_settings(&mut self) {
+        self.anpr_persist_at = None;
         if self.anpr_draft.host.trim().is_empty() {
             self.anpr_status = Some("ANPR host is empty — cleared.".into());
             self.app_config.anpr = None;
-        } else {
-            if self.anpr_draft.username.trim().is_empty() {
-                self.anpr_status = Some("ANPR username is empty — not saved.".into());
+            self.sync_gate_into_app_config();
+            if let Err(err) = self.app_config.save(&self.config_path) {
+                self.anpr_status = Some(format!("Failed to save cameras.toml: {err:#}"));
+                warn!("failed to save cameras.toml: {err:#}");
                 return;
             }
-            if let Err(err) = crate::config::validate_host(&self.anpr_draft.host) {
-                self.anpr_status = Some(format!("Invalid ANPR host: {err:#}"));
-                return;
-            }
-            if self.anpr_draft.channel == 0 {
-                self.anpr_draft.channel = 1;
-            }
-            self.sync_anpr_into_app_config();
+            self.note_config_mtime();
+            self.restart_anpr_from_config();
+            return;
         }
+        if self.anpr_draft.username.trim().is_empty() {
+            self.anpr_status = Some("ANPR username is empty — not saved.".into());
+            return;
+        }
+        if let Err(err) = crate::config::validate_host(&self.anpr_draft.host) {
+            self.anpr_status = Some(format!("Invalid ANPR host: {err:#}"));
+            return;
+        }
+        if self.anpr_draft.channel == 0 {
+            self.anpr_draft.channel = 1;
+        }
+        let prev = self.app_config.anpr.clone();
         self.sync_gate_into_app_config();
+        self.sync_anpr_into_app_config();
         if let Err(err) = self.app_config.save(&self.config_path) {
+            self.app_config.anpr = prev;
             self.anpr_status = Some(format!("Failed to save cameras.toml: {err:#}"));
             warn!("failed to save cameras.toml: {err:#}");
             return;
         }
         self.note_config_mtime();
-        self.restart_anpr_from_config();
-        let n = self
-            .app_config
-            .anpr
-            .as_ref()
-            .map(|a| a.plates.len())
-            .unwrap_or(0);
+        let cfg = self.app_config.anpr.clone().unwrap_or_default();
+        let n = cfg.plates.len();
+        let dir = self
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if anpr_needs_reconnect(prev.as_ref(), &cfg) {
+            self.anpr.apply_config(cfg, dir);
+        } else {
+            self.anpr.update_watchlist(cfg);
+        }
         self.anpr_status = Some(format!("ANPR settings saved ({n} plate(s))."));
         info!(
             host = %self.anpr_draft.host,
@@ -519,6 +625,7 @@ impl ViewerApp {
         }
 
         let mut open = self.show_settings;
+        let anpr_before = self.anpr_draft.clone();
         let mut save_nvr = false;
         let mut save_gate = false;
         let mut save_anpr = false;
@@ -530,11 +637,16 @@ impl ViewerApp {
             .default_width(480.0)
             .default_height(560.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Nvr, "NVR");
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Gates, "Gates");
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Anpr, "ANPR");
                     ui.selectable_value(&mut self.settings_tab, SettingsTab::Display, "Display");
+                    ui.selectable_value(
+                        &mut self.settings_tab,
+                        SettingsTab::Controller,
+                        "Controller",
+                    );
                     ui.selectable_value(
                         &mut self.settings_tab,
                         SettingsTab::Diagnostics,
@@ -781,7 +893,7 @@ impl ViewerApp {
                 ui.heading("Watchlist");
                 ui.label(
                     egui::RichText::new(
-                        "Sound: alert (default) or kim — both shipped in the app. Or a path to an .mp3 next to cameras.toml.",
+                        "Saved to cameras.toml as you edit. Sound: alert (default) or kim — both shipped in the app. Or a path to an .mp3 next to cameras.toml.",
                     )
                     .small()
                     .weak(),
@@ -1050,6 +1162,93 @@ impl ViewerApp {
                     save_ui = true;
                 }
                     }
+                    SettingsTab::Controller => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                        ui.heading("Deadzone");
+                        ui.label(
+                            egui::RichText::new(
+                                "Ignore resting stick drift and shoulder pressure. Raise a slider until a highlighted value below goes idle — that stops the camera zooming on its own.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        if deadzone_slider(ui, &mut self.stick_deadzone, "Joysticks") {
+                            save_ui = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "Left stick pan/tilt, and right stick up/down zoom.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        if deadzone_slider(ui, &mut self.shoulder_deadzone, "Shoulders") {
+                            save_ui = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "LT/RT (L2/R2) zoom, and LB/RB (L1/R1) focus.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        if ui.button("Reset deadzones").clicked() {
+                            self.stick_deadzone = default_stick_deadzone();
+                            self.shoulder_deadzone = default_shoulder_deadzone();
+                            save_ui = true;
+                        }
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.heading("Live input");
+                        ui.add_space(4.0);
+                        match self.controller_readout() {
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("No controller connected.")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                            Some(pad) => {
+                                ui.label(egui::RichText::new(&pad.name).strong());
+                                ui.add_space(4.0);
+                                axis_row(
+                                    ui,
+                                    "Left stick",
+                                    &[("X", pad.lx), ("Y", pad.ly)],
+                                    self.stick_deadzone,
+                                );
+                                axis_row(
+                                    ui,
+                                    "Right stick",
+                                    &[("X", pad.rx), ("Y", pad.ry)],
+                                    self.stick_deadzone,
+                                );
+                                axis_row(
+                                    ui,
+                                    "Shoulders",
+                                    &[
+                                        ("LB", pad.lb),
+                                        ("RB", pad.rb),
+                                        ("LT", pad.lt),
+                                        ("RT", pad.rt),
+                                    ],
+                                    self.shoulder_deadzone,
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Highlighted values are past the deadzone and will move PTZ.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        }
+                    }
                     SettingsTab::About => {
                 ui.heading("About");
                 ui.add_space(4.0);
@@ -1143,6 +1342,12 @@ impl ViewerApp {
                     }
                 }
             });
+        if self.anpr_draft != anpr_before {
+            self.schedule_anpr_persist();
+        }
+        if !open {
+            self.anpr_persist_at = Some(Instant::now());
+        }
         self.show_settings = open;
         if save_ui {
             self.save_ui_prefs();
@@ -1157,6 +1362,61 @@ impl ViewerApp {
             self.apply_anpr_from_settings();
         }
     }
+}
+
+fn anpr_needs_reconnect(
+    prev: Option<&crate::config::AnprConfig>,
+    next: &crate::config::AnprConfig,
+) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    prev.enabled != next.enabled
+        || prev.host != next.host
+        || prev.http_port != next.http_port
+        || prev.username != next.username
+        || prev.password != next.password
+        || prev.channel != next.channel
+}
+
+fn deadzone_slider(ui: &mut egui::Ui, value: &mut f32, label: &str) -> bool {
+    let changed = ui
+        .add(
+            egui::Slider::new(value, 0.0..=0.9)
+                .text(label)
+                .suffix("%")
+                .custom_formatter(|n, _| format!("{:.0}", n * 100.0))
+                .custom_parser(|s| {
+                    s.trim()
+                        .trim_end_matches('%')
+                        .parse::<f64>()
+                        .ok()
+                        .map(|p| p / 100.0)
+                })
+                .step_by(0.01),
+        )
+        .changed();
+    if changed {
+        *value = clamp_deadzone(*value);
+    }
+    changed
+}
+
+fn axis_row(ui: &mut egui::Ui, label: &str, axes: &[(&str, f32)], deadzone: f32) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).small());
+        for (name, value) in axes {
+            let hot = value.abs() > deadzone;
+            let text = format!("{name} {value:+.2}");
+            let mut rich = egui::RichText::new(text).monospace().small();
+            if hot {
+                rich = rich.color(Color32::from_rgb(255, 186, 92));
+            } else {
+                rich = rich.weak();
+            }
+            ui.label(rich);
+        }
+    });
 }
 
 fn decode_slider(ui: &mut egui::Ui, label: &str, value: &mut i32) -> bool {

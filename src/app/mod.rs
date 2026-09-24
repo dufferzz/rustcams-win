@@ -36,7 +36,6 @@ pub(super) enum UpdateBanner {
     Hidden,
     Offer(crate::update::AvailableUpdate),
     Downloading { version: String },
-    Ready { version: String },
     Failed { message: String },
 }
 
@@ -47,8 +46,12 @@ pub(super) enum UpdateCheckStatus {
     Idle,
     Checking,
     UpToDate,
-    Available { version: String },
-    Failed { message: String },
+    Available {
+        version: String,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,6 +208,8 @@ pub struct ViewerApp {
     gate_status: Arc<Mutex<Option<String>>>,
     gate_inflight: Arc<AtomicBool>,
     anpr_draft: crate::config::AnprConfig,
+    /// When set, write the ANPR watchlist to `cameras.toml` at this time.
+    anpr_persist_at: Option<Instant>,
     anpr_status: Option<String>,
     anpr: crate::anpr::AnprWorker,
     anpr_test_inflight: Arc<AtomicBool>,
@@ -305,6 +310,10 @@ pub struct ViewerApp {
     outline_width: f32,
     /// Font + icon scale (1.0 = default).
     ui_scale: f32,
+    /// Stick axes below this magnitude are ignored (pan / tilt / right-stick zoom).
+    stick_deadzone: f32,
+    /// Shoulder triggers below this pressure are ignored (LT/RT zoom, LB/RB focus).
+    shoulder_deadzone: f32,
     camera_list_open: bool,
     sidebar_open: bool,
     /// Width of the camera library side panel (drag edge to resize).
@@ -447,6 +456,7 @@ impl ViewerApp {
             gate_status: Arc::new(Mutex::new(None)),
             gate_inflight: Arc::new(AtomicBool::new(false)),
             anpr_draft,
+            anpr_persist_at: None,
             anpr_status: None,
             anpr,
             anpr_test_inflight: Arc::new(AtomicBool::new(false)),
@@ -522,6 +532,8 @@ impl ViewerApp {
             accent: ui_prefs.accent_color(),
             outline_width: ui_prefs.outline_width(),
             ui_scale: ui_prefs.ui_scale(),
+            stick_deadzone: settings::clamp_deadzone(ui_prefs.stick_deadzone),
+            shoulder_deadzone: settings::clamp_deadzone(ui_prefs.shoulder_deadzone),
             camera_list_open: ui_prefs.camera_list_open,
             sidebar_open: ui_prefs.sidebar_open,
             sidebar_width: settings::clamp_sidebar_width(ui_prefs.sidebar_width),
@@ -1604,15 +1616,22 @@ impl ViewerApp {
     }
 
     /// In OS fullscreen, peek the toolbar when the pointer hits the top edge;
-    /// keep it up while the cursor stays over the bar.
+    /// keep it up while the cursor stays over the bar, or while a dropdown/popup
+    /// (e.g. view picker) is open.
     pub(super) fn update_fs_toolbar_reveal(reveal: &mut bool, ctx: &egui::Context) -> bool {
         const REVEAL_Y: f32 = 8.0;
         const KEEP_Y: f32 = 56.0;
+        let popup_open = ctx.memory(|m| m.any_popup_open());
         let y = ctx.input(|i| i.pointer.hover_pos().map(|p| p.y));
-        let show = match y {
-            Some(y) if *reveal => y <= KEEP_Y,
-            Some(y) => y <= REVEAL_Y,
-            None => false,
+        let show = if popup_open && *reveal {
+            // Don't dismiss while a ComboBox / menu from the toolbar is open.
+            true
+        } else {
+            match y {
+                Some(y) if *reveal => y <= KEEP_Y,
+                Some(y) => y <= REVEAL_Y,
+                None => false,
+            }
         };
         *reveal = show;
         show
@@ -1702,10 +1721,9 @@ impl ViewerApp {
                     });
                     self.anpr_status = Some(match sound_note.as_deref() {
                         None => format!("Test OK — snapshot + alert sound ({} bytes).", jpeg.len()),
-                        Some("muted") => format!(
-                            "Test snapshot OK ({} bytes); audio muted.",
-                            jpeg.len()
-                        ),
+                        Some("muted") => {
+                            format!("Test snapshot OK ({} bytes); audio muted.", jpeg.len())
+                        }
                         Some(err) => format!(
                             "Test snapshot OK ({} bytes); sound failed: {err}",
                             jpeg.len()
@@ -1726,9 +1744,11 @@ impl ViewerApp {
         }
 
         // Don't overwrite a fresh test-status message with the listener status.
-        if self.anpr_status.as_deref().is_none_or(|s| {
-            !s.starts_with("Test snapshot") && !s.starts_with("Fetching test")
-        }) {
+        if self
+            .anpr_status
+            .as_deref()
+            .is_none_or(|s| !s.starts_with("Test snapshot") && !s.starts_with("Fetching test"))
+        {
             self.anpr_status = self.anpr.status();
         }
         if self.anpr.needs_repaint() {
@@ -1888,10 +1908,11 @@ impl ViewerApp {
             self.update_inflight.store(false, Ordering::SeqCst);
             match res {
                 Ok(version) => {
-                    self.update_banner = UpdateBanner::Ready {
+                    info!(%version, "update installed — relaunching");
+                    self.update_check_status = UpdateCheckStatus::Available {
                         version: version.clone(),
                     };
-                    self.update_check_status = UpdateCheckStatus::Available { version };
+                    self.relaunch_after_update();
                 }
                 Err(message) => {
                     self.update_banner = UpdateBanner::Failed {
@@ -1975,6 +1996,10 @@ impl ViewerApp {
 }
 
 impl eframe::App for ViewerApp {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.flush_anpr_persist(true);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui_perf.tick_frame();
         self.ensure_maximized_on_launch(ctx);
@@ -1985,10 +2010,8 @@ impl eframe::App for ViewerApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.poll_update_check();
-        if matches!(
-            self.update_banner,
-            UpdateBanner::Downloading { .. } | UpdateBanner::Ready { .. }
-        ) || matches!(self.update_check_status, UpdateCheckStatus::Checking)
+        if matches!(self.update_banner, UpdateBanner::Downloading { .. })
+            || matches!(self.update_check_status, UpdateCheckStatus::Checking)
         {
             ctx.request_repaint();
         }
@@ -2125,6 +2148,7 @@ impl eframe::App for ViewerApp {
         self.draw_debug_panel(ctx);
         self.draw_log_panel(ctx);
         self.settings_window(ctx);
+        self.flush_anpr_persist(false);
         self.show_aux_window(ctx);
         self.handle_ptz_input(ctx);
 

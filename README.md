@@ -213,8 +213,8 @@ pause_when_unfocused = false
 ```
 
 Each `[[cameras]]` entry needs `id` and a camera-direct RTSP `url` (credentials
-embedded). There is no shared `[ptz]` section. Set `ptz = true` to enable PTZ
-when the id/name does not contain `ptz` (`ptz = false` turns it off).
+embedded). There is no shared `[ptz]` section. PTZ is on for every camera
+unless that entry sets `ptz = false`.
 
 ### Direct cameras
 
@@ -297,8 +297,8 @@ With **`[nvr]`**, video still comes from the NVR. PTZ uses the NVR
 falls back to camera ISAPI (`http://{camera}:80/ISAPI/PTZCtrl/…`) if the NVR
 route fails. While a stick or pad is held, the same pan/tilt/zoom XML is
 re-sent about every 400 ms so the dome keeps moving. Digest is warmed when
-you **select** a PTZ camera. Speeds default to move 30 / zoom 25. Cameras
-whose id/name contain `ptz`, or that set `ptz = true`, get a PTZ target.
+you **select** a camera. Speeds default to move 30 / zoom 25. Every camera
+is PTZ unless it sets `ptz = false`.
 
 **Fullscreen** switches that camera to its **direct main-stream** URL (same `url`
 rewritten to `…01`) at higher decode width (1280). Pipelines always use

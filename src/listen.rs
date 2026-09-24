@@ -245,10 +245,7 @@ fn link_to_fakesink(pipeline: &gst::Pipeline, pad: &gst::Pad, camera: &str) -> R
 fn make_audio_sink() -> Result<(gst::Element, &'static str)> {
     // Prefer Pulse/PipeWire over raw ALSA so we hit the user's default device.
     for name in ["pulsesink", "pipewiresink", "autoaudiosink"] {
-        if let Ok(sink) = gst::ElementFactory::make(name)
-            .name("listen_sink")
-            .build()
-        {
+        if let Ok(sink) = gst::ElementFactory::make(name).name("listen_sink").build() {
             let _ = sink.set_property("sync", false);
             if name == "pulsesink" {
                 sink.set_property_from_str("client-name", "Citadel CCTV");
@@ -279,9 +276,8 @@ fn link_audio_pad(
         encoding
     };
 
-    let (depay_name, dec_name) = audio_chain_for_encoding(&encoding).ok_or_else(|| {
-        anyhow!("unsupported RTSP audio encoding {encoding:?} (need PCMU/PCMA)")
-    })?;
+    let (depay_name, dec_name) = audio_chain_for_encoding(&encoding)
+        .ok_or_else(|| anyhow!("unsupported RTSP audio encoding {encoding:?} (need PCMU/PCMA)"))?;
 
     let (sink, sink_name) = make_audio_sink()?;
 

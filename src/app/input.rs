@@ -3,7 +3,17 @@ use crate::ptz::{PtzVector, PTZ_MOVE_SPEED, PTZ_ZOOM_SPEED};
 use eframe::egui;
 use gilrs::{Axis, Button};
 
-const PTZ_STICK_DEADZONE: f32 = 0.2;
+pub(super) struct ControllerReadout {
+    pub name: String,
+    pub lx: f32,
+    pub ly: f32,
+    pub rx: f32,
+    pub ry: f32,
+    pub lb: f32,
+    pub rb: f32,
+    pub lt: f32,
+    pub rt: f32,
+}
 
 impl ViewerApp {
     pub(super) fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -80,8 +90,10 @@ impl ViewerApp {
         if let Some(gilrs) = self.gilrs.as_mut() {
             while gilrs.next_event().is_some() {}
             if let Some((_id, gamepad)) = gilrs.gamepads().next() {
-                let lx = axis_with_deadzone(gamepad.value(Axis::LeftStickX), PTZ_STICK_DEADZONE);
-                let ly = axis_with_deadzone(gamepad.value(Axis::LeftStickY), PTZ_STICK_DEADZONE);
+                let stick_dz = self.stick_deadzone;
+                let shoulder_dz = self.shoulder_deadzone;
+                let lx = axis_with_deadzone(gamepad.value(Axis::LeftStickX), stick_dz);
+                let ly = axis_with_deadzone(gamepad.value(Axis::LeftStickY), stick_dz);
                 // Stick up (gilrs Y negative) → tilt+; keyboard already uses +tilt for Up.
                 pan = merge_axis(pan, stick_to_speed(lx, PTZ_MOVE_SPEED));
                 tilt = merge_axis(tilt, stick_to_speed(ly, PTZ_MOVE_SPEED));
@@ -101,19 +113,26 @@ impl ViewerApp {
                     }
                 }
 
-                let l2 = trigger_value(&gamepad, Button::LeftTrigger2);
-                let r2 = trigger_value(&gamepad, Button::RightTrigger2);
-                if l2 > 0.05 || r2 > 0.05 {
+                let l2 =
+                    trigger_with_deadzone(raw_trigger(&gamepad, Button::LeftTrigger2), shoulder_dz);
+                let r2 = trigger_with_deadzone(
+                    raw_trigger(&gamepad, Button::RightTrigger2),
+                    shoulder_dz,
+                );
+                if l2 > 0.0 || r2 > 0.0 {
                     zoom = merge_axis(zoom, stick_to_speed(r2 - l2, PTZ_ZOOM_SPEED));
                 } else {
-                    let ry =
-                        axis_with_deadzone(gamepad.value(Axis::RightStickY), PTZ_STICK_DEADZONE);
+                    let ry = axis_with_deadzone(gamepad.value(Axis::RightStickY), stick_dz);
                     zoom = merge_axis(zoom, stick_to_speed(-ry, PTZ_ZOOM_SPEED));
                 }
 
-                if gamepad.is_pressed(Button::LeftTrigger) {
+                let lb =
+                    trigger_with_deadzone(raw_trigger(&gamepad, Button::LeftTrigger), shoulder_dz);
+                let rb =
+                    trigger_with_deadzone(raw_trigger(&gamepad, Button::RightTrigger), shoulder_dz);
+                if lb > 0.0 {
                     focus = -PTZ_ZOOM_SPEED;
-                } else if gamepad.is_pressed(Button::RightTrigger) {
+                } else if rb > 0.0 {
                     focus = PTZ_ZOOM_SPEED;
                 }
 
@@ -123,9 +142,9 @@ impl ViewerApp {
                 square = gamepad.is_pressed(Button::West);
                 extra_cancel = gamepad.is_pressed(Button::East)
                     || gamepad.is_pressed(Button::Start)
-                    || gamepad.is_pressed(Button::RightTrigger)
-                    || gamepad.is_pressed(Button::LeftTrigger2)
-                    || gamepad.is_pressed(Button::RightTrigger2)
+                    || rb > 0.0
+                    || l2 > 0.0
+                    || r2 > 0.0
                     || gamepad.is_pressed(Button::LeftThumb)
                     || gamepad.is_pressed(Button::RightThumb);
             }
@@ -297,6 +316,22 @@ impl ViewerApp {
         }
     }
 
+    pub(super) fn controller_readout(&self) -> Option<ControllerReadout> {
+        let gilrs = self.gilrs.as_ref()?;
+        let (_id, gamepad) = gilrs.gamepads().next()?;
+        Some(ControllerReadout {
+            name: gamepad.name().to_string(),
+            lx: gamepad.value(Axis::LeftStickX),
+            ly: gamepad.value(Axis::LeftStickY),
+            rx: gamepad.value(Axis::RightStickX),
+            ry: gamepad.value(Axis::RightStickY),
+            lb: raw_trigger(&gamepad, Button::LeftTrigger),
+            rb: raw_trigger(&gamepad, Button::RightTrigger),
+            lt: raw_trigger(&gamepad, Button::LeftTrigger2),
+            rt: raw_trigger(&gamepad, Button::RightTrigger2),
+        })
+    }
+
     fn select_focused_slot(&mut self, aux: bool) {
         if aux {
             self.ensure_aux_pad_focus();
@@ -395,14 +430,19 @@ fn merge_axis(a: i32, b: i32) -> i32 {
     }
 }
 
-fn trigger_value(gamepad: &gilrs::Gamepad<'_>, button: Button) -> f32 {
-    let v = gamepad
+fn raw_trigger(gamepad: &gilrs::Gamepad<'_>, button: Button) -> f32 {
+    gamepad
         .button_data(button)
         .map(|d| d.value())
-        .unwrap_or(0.0);
-    if v < 0.05 {
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn trigger_with_deadzone(v: f32, deadzone: f32) -> f32 {
+    let deadzone = deadzone.clamp(0.0, 0.9);
+    if v <= deadzone {
         0.0
     } else {
-        v.clamp(0.0, 1.0)
+        ((v - deadzone) / (1.0 - deadzone)).clamp(0.0, 1.0)
     }
 }

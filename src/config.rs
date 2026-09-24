@@ -145,7 +145,10 @@ pub struct AnprConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub silent: bool,
     /// Snapshot channel for `/ISAPI/Streaming/channels/{n}/picture`.
-    #[serde(default = "default_anpr_channel", skip_serializing_if = "is_default_anpr_channel")]
+    #[serde(
+        default = "default_anpr_channel",
+        skip_serializing_if = "is_default_anpr_channel"
+    )]
     pub channel: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plates: Vec<AnprPlate>,
@@ -238,7 +241,10 @@ pub struct AnprPlate {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
     /// Builtin (`alert` / `kim`) or path relative to cameras.toml / absolute.
-    #[serde(default = "default_anpr_sound", skip_serializing_if = "is_default_anpr_sound")]
+    #[serde(
+        default = "default_anpr_sound",
+        skip_serializing_if = "is_default_anpr_sound"
+    )]
     pub sound: String,
 }
 
@@ -1284,6 +1290,35 @@ mod tests {
             camera_url_identity("rtsp://admin:x@192.0.2.10:554/Streaming/Channels/201"),
             Some(("192.0.2.10".into(), 2))
         );
+    }
+
+    #[test]
+    fn anpr_watchlist_roundtrips_through_toml() {
+        let mut cfg = AppConfig::default();
+        cfg.anpr = Some(AnprConfig {
+            host: "192.0.2.17".into(),
+            username: "admin".into(),
+            password: "secret".into(),
+            plates: vec![AnprPlate {
+                plate: "AB12CDE".into(),
+                name: "Sam".into(),
+                enabled: true,
+                sound: "kim".into(),
+            }],
+            ..Default::default()
+        });
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            text.contains("AB12CDE"),
+            "watchlist missing from toml:\n{text}"
+        );
+        let back: AppConfig = toml::from_str(&text).unwrap();
+        let plates = &back.anpr.expect("anpr").plates;
+        assert_eq!(plates.len(), 1);
+        assert_eq!(plates[0].plate, "AB12CDE");
+        assert_eq!(plates[0].name, "Sam");
+        assert_eq!(plates[0].sound, "kim");
+        assert!(plates[0].enabled);
     }
 
     #[test]

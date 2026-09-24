@@ -37,10 +37,7 @@ pub fn remote_control_door(cfg: &GateConfig) -> Result<()> {
         .get("www-authenticate")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let probe_body = challenge
-        .body_mut()
-        .read_to_string()
-        .unwrap_or_default();
+    let probe_body = challenge.body_mut().read_to_string().unwrap_or_default();
     debug!(
         status,
         body = %truncate(&probe_body, 200),

@@ -505,7 +505,12 @@ fn digest_request(
 ) -> anyhow::Result<(u16, String)> {
     let url = format!("http://{}{}", target.host, path);
     let body_preview = body
-        .map(|b| String::from_utf8_lossy(b).chars().take(160).collect::<String>())
+        .map(|b| {
+            String::from_utf8_lossy(b)
+                .chars()
+                .take(160)
+                .collect::<String>()
+        })
         .unwrap_or_default();
     debug!(
         method,
@@ -854,6 +859,17 @@ fn send_vector(shared: &Shared, target: &PtzTarget, vec: PtzVector, last: Option
     let focus_changed = last.map(|v| v.focus) != Some(vec.focus);
     let holding_focus = vec.focus != 0;
     if move_changed || holding_move {
+        if move_changed {
+            info!(
+                host = %target.host,
+                channel = target.channel,
+                via_nvr = target.via_nvr,
+                pan = vec.pan,
+                tilt = vec.tilt,
+                zoom = vec.zoom,
+                "PTZ continuous"
+            );
+        }
         if let Err(err) = continuous_put(shared, target, vec) {
             warn!(
                 host = %target.host,
@@ -911,14 +927,45 @@ fn ptz_proxy_request(
                 body,
                 content_type,
             ) {
-                Ok((_, resp)) => {
+                Ok((status, resp)) => {
+                    let snippet = truncate_log(&resp, 240);
                     if let Some(err) = isapi_status_error(&resp) {
+                        warn!(
+                            host = %t.host,
+                            channel = t.channel,
+                            via_nvr = t.via_nvr,
+                            path,
+                            status,
+                            body = %snippet,
+                            "PTZ rejected: {err}"
+                        );
                         last_err = Some(anyhow::anyhow!("{path}: {err}"));
                         continue;
                     }
+                    let log_key = format!("ok|{path}|{status}|{snippet}");
+                    if shared.route_logged.lock().insert(log_key) {
+                        info!(
+                            host = %t.host,
+                            channel = t.channel,
+                            via_nvr = t.via_nvr,
+                            path,
+                            status,
+                            body = %snippet,
+                            "PTZ accepted"
+                        );
+                    }
                     return Ok(resp);
                 }
-                Err(err) => last_err = Some(err),
+                Err(err) => {
+                    warn!(
+                        host = %t.host,
+                        channel = t.channel,
+                        via_nvr = t.via_nvr,
+                        path,
+                        "PTZ request failed: {err:#}"
+                    );
+                    last_err = Some(err);
+                }
             }
         }
     }
@@ -1189,7 +1236,10 @@ fn parse_park_action(xml: &str) -> anyhow::Result<ParkAction> {
                     (Some("parkaction"), "parktime" | "returntime" | "time") => {
                         park_time_sec = text.parse().ok();
                     }
-                    (Some("parkaction") | Some("action"), "actiontype" | "action" | "actionname") => {
+                    (
+                        Some("parkaction") | Some("action"),
+                        "actiontype" | "action" | "actionname",
+                    ) => {
                         action_type = Some(text);
                     }
                     (Some("parkaction") | Some("action"), "actionnum" | "actionid") => {

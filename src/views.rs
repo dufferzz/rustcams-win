@@ -49,8 +49,7 @@ impl View {
         if self.slots.len() < n {
             let need = n - self.slots.len();
             let take = need.min(self.overflow_slots.len());
-            self.slots
-                .extend(self.overflow_slots.drain(..take));
+            self.slots.extend(self.overflow_slots.drain(..take));
             self.slots.resize(n, None);
         } else if self.slots.len() > n {
             let mut clipped: Vec<Option<String>> = self.slots.drain(n..).collect();

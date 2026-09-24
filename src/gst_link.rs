@@ -92,7 +92,9 @@ impl DecodeBackend {
         match self {
             Self::Software => "libav CPU decode (avdec). Default; usually smoothest on mixed GPUs.",
             Self::Nvdec => "NVIDIA NVDEC (nvh264dec / nvh265dec). Needs gst-plugin-nvcodec.",
-            Self::Hardware => "Try D3D11, Media Foundation, NVDEC, then V4L2; fall back to software.",
+            Self::Hardware => {
+                "Try D3D11, Media Foundation, NVDEC, then V4L2; fall back to software."
+            }
         }
     }
 }

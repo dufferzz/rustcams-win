@@ -162,7 +162,10 @@ fn check_latest_inner(current: &str, skipped: Option<&str>) -> Result<Option<Ava
         return Ok(None);
     }
     if status.as_u16() == 403 || status.as_u16() == 429 {
-        bail!("GitHub update check rate limited (HTTP {})", status.as_u16());
+        bail!(
+            "GitHub update check rate limited (HTTP {})",
+            status.as_u16()
+        );
     }
     if !status.is_success() {
         bail!("GitHub update check HTTP {}", status.as_u16());
@@ -223,20 +226,38 @@ fn offer_from_release(
 }
 
 /// Trim and lightly de-markdown a GitHub release body for the update banner.
+/// Drops the `## Assets` section (AppImage filenames) — not useful in-app.
 pub fn plain_changelog(body: &str) -> String {
     let mut out = String::new();
+    let mut skip_assets = false;
     for raw in body.lines() {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
+            if skip_assets {
+                continue;
+            }
             if !out.is_empty() && !out.ends_with("\n\n") {
                 out.push('\n');
             }
             continue;
         }
+
+        let heading = trimmed.starts_with('#');
         let mut t = trimmed;
         while let Some(rest) = t.strip_prefix('#') {
             t = rest.trim_start();
         }
+        if heading {
+            if t.eq_ignore_ascii_case("Assets") {
+                skip_assets = true;
+                continue;
+            }
+            skip_assets = false;
+        }
+        if skip_assets {
+            continue;
+        }
+
         let bullet = t.starts_with('-') || t.starts_with('*');
         if bullet {
             t = t[1..].trim_start();
@@ -250,8 +271,13 @@ pub fn plain_changelog(body: &str) -> String {
         }
         if bullet {
             out.push_str("• ");
+            out.push_str(&cleaned);
+            // Extra blank line between bullets for readability in the dialog.
+            out.push_str("\n\n");
+        } else {
+            out.push_str(&cleaned);
+            out.push('\n');
         }
-        out.push_str(&cleaned);
     }
     out.trim().to_string()
 }
@@ -497,6 +523,9 @@ mod tests {
         assert!(!text.contains("**"));
         assert!(text.contains("Bold item"));
         assert!(text.contains("code"));
+        assert!(!text.to_ascii_lowercase().contains("assets"));
+        assert!(!text.contains("file"));
+        assert!(text.contains("• Bold item\n\n• code"));
     }
 
     #[test]

@@ -109,8 +109,7 @@ impl ViewerApp {
                 let icon = if dirty {
                     egui::RichText::new(icons::FLOPPY_DISK).color(self.accent)
                 } else {
-                    egui::RichText::new(icons::FLOPPY_DISK)
-                        .color(Color32::from_rgb(110, 115, 125))
+                    egui::RichText::new(icons::FLOPPY_DISK).color(Color32::from_rgb(110, 115, 125))
                 };
                 if ui
                     .add_enabled(dirty, egui::Button::new(icon).small())
@@ -202,7 +201,9 @@ impl ViewerApp {
             if !is_aux {
                 if ui
                     .selectable_label(self.window_fullscreen, icons::CORNERS_OUT)
-                    .on_hover_text("OS / monitor fullscreen (Esc / right-click grid / Triangle to toggle)")
+                    .on_hover_text(
+                        "OS / monitor fullscreen (Esc / right-click grid / Triangle to toggle)",
+                    )
                     .clicked()
                 {
                     let on = !self.window_fullscreen;
@@ -210,7 +211,9 @@ impl ViewerApp {
                 }
                 if ui
                     .selectable_label(self.aux_open, icons::MONITOR)
-                    .on_hover_text("Open a second window for another monitor (shared PTZ selection)")
+                    .on_hover_text(
+                        "Open a second window for another monitor (shared PTZ selection)",
+                    )
                     .clicked()
                 {
                     self.aux_open = !self.aux_open;
@@ -381,8 +384,7 @@ impl ViewerApp {
                     );
                 }
                 if response.dragged() {
-                    let next =
-                        clamp_sidebar_width(self.sidebar_width + response.drag_delta().x);
+                    let next = clamp_sidebar_width(self.sidebar_width + response.drag_delta().x);
                     if (next - self.sidebar_width).abs() > 0.1 {
                         self.sidebar_width = next;
                     }
@@ -411,7 +413,8 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             // Horizontal layouts report infinite available_width — size from max_rect.
             let btn_reserve = 64.0;
-            let edit_w = (ui.max_rect().width() - btn_reserve - ui.spacing().item_spacing.x).max(40.0);
+            let edit_w =
+                (ui.max_rect().width() - btn_reserve - ui.spacing().item_spacing.x).max(40.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.sidebar_filter)
                     .hint_text("Filter…")
@@ -436,8 +439,8 @@ impl ViewerApp {
         let available = ui.available_height();
         let handle_h = 8.0;
         let max_controls = (available - 80.0 - handle_h).max(140.0);
-        let controls_h = clamp_sidebar_controls_height(self.sidebar_controls_height)
-            .min(max_controls);
+        let controls_h =
+            clamp_sidebar_controls_height(self.sidebar_controls_height).min(max_controls);
         let list_h = (available - controls_h - handle_h).max(80.0);
 
         egui::ScrollArea::vertical()
@@ -449,7 +452,7 @@ impl ViewerApp {
                 let multi = group_count > 1;
                 for gi in 0..group_count {
                     let group_name = self.library_groups[gi].name.clone();
-                    let group_open = self.library_groups[gi].open || !multi;
+                    let mut group_open = self.library_groups[gi].open;
                     let cam_ids = self.library_groups[gi].cameras.clone();
 
                     if self.library_renaming == Some(gi) {
@@ -489,20 +492,30 @@ impl ViewerApp {
                     };
 
                     // Always show a header so groups can be double-clicked to play.
-                    let header = egui::CollapsingHeader::new(format!(
-                        "{}  ({})",
-                        group_name,
-                        cam_ids.len()
-                    ))
-                    .id_salt(("lib_group", is_aux, gi))
-                    .open(Some(group_open))
-                    .show(ui, |ui| body(ui));
+                    // Let egui own open/close via click; we only seed default_open from prefs
+                    // and write back when the header toggles (not on double-click play).
+                    let header =
+                        egui::CollapsingHeader::new(format!("{}  ({})", group_name, cam_ids.len()))
+                            .id_salt(("lib_group", is_aux, gi))
+                            .default_open(group_open)
+                            .show(ui, |ui| body(ui));
 
                     if header.header_response.double_clicked() {
                         play_group = Some(gi);
-                    } else if multi && header.header_response.clicked() {
+                        // Double-click also toggles egui's open state — put it back.
+                        let id = ui.make_persistent_id(("lib_group", is_aux, gi));
+                        if let Some(mut state) =
+                            egui::collapsing_header::CollapsingState::load(ui.ctx(), id)
+                        {
+                            if state.is_open() != group_open {
+                                state.toggle(ui);
+                                state.store(ui.ctx());
+                            }
+                        }
+                    } else if header.header_response.clicked() {
+                        group_open = !group_open;
                         if let Some(g) = self.library_groups.get_mut(gi) {
-                            g.open = !g.open;
+                            g.open = group_open;
                             save_groups = true;
                         }
                     }
@@ -524,18 +537,14 @@ impl ViewerApp {
                             ui.close_menu();
                         }
                     });
-                    header
-                        .header_response
-                        .clone()
-                        .on_hover_text("Double-click to play this group on the grid");
+                    header.header_response.clone().on_hover_text(
+                        "Click to expand/collapse · double-click to play on the grid",
+                    );
 
                     let href = &header.header_response;
                     let hovering = href.dnd_hover_payload::<DragPayload>().is_some()
                         || (href.contains_pointer()
-                            && matches!(
-                                &self.cross_drag,
-                                Some(DragPayload::FromLibrary(_))
-                            ));
+                            && matches!(&self.cross_drag, Some(DragPayload::FromLibrary(_))));
                     if hovering {
                         ui.painter().rect_stroke(
                             href.rect,
@@ -549,8 +558,7 @@ impl ViewerApp {
                             lib_drop = Some((id, gi, cam_ids.len()));
                             self.cross_drag = None;
                         }
-                    } else if href.contains_pointer()
-                        && ui.input(|i| i.pointer.primary_released())
+                    } else if href.contains_pointer() && ui.input(|i| i.pointer.primary_released())
                     {
                         if let Some(DragPayload::FromLibrary(id)) = self.cross_drag.take() {
                             lib_drop = Some((id, gi, cam_ids.len()));
@@ -621,8 +629,7 @@ impl ViewerApp {
         if handle.dragged() {
             // Drag up → taller controls; drag down → taller camera list.
             let next = self.sidebar_controls_height - handle.drag_delta().y;
-            self.sidebar_controls_height =
-                clamp_sidebar_controls_height(next).min(max_controls);
+            self.sidebar_controls_height = clamp_sidebar_controls_height(next).min(max_controls);
             self.save_ui_prefs();
         }
 
@@ -678,10 +685,8 @@ impl ViewerApp {
         }
 
         if visible.is_empty() {
-            let (rect, drop_resp) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), 28.0),
-                Sense::hover(),
-            );
+            let (rect, drop_resp) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
             ui.painter().text(
                 rect.left_center() + Vec2::new(6.0, 0.0),
                 egui::Align2::LEFT_CENTER,
@@ -722,11 +727,7 @@ impl ViewerApp {
             let is_ptz_sel = selected_ptz == Some(id.as_str());
             let accent = self.accent;
             let response = ui.dnd_drag_source(item_id, payload.clone(), |ui| {
-                let mark = if on_view {
-                    icons::PLAY
-                } else {
-                    icons::SQUARE
-                };
+                let mark = if on_view { icons::PLAY } else { icons::SQUARE };
                 let label = if has_ptz {
                     format!("{mark}  {name}  {}", icons::CROSSHAIR)
                 } else {
@@ -914,7 +915,11 @@ impl ViewerApp {
 
         let gap = 4.0;
         // Prefer the panel's max rect — available_width can be infinite in some layouts.
-        let width = ui.max_rect().width().min(ui.available_width()).clamp(120.0, 360.0);
+        let width = ui
+            .max_rect()
+            .width()
+            .min(ui.available_width())
+            .clamp(120.0, 360.0);
         let cell = ((width - gap * 2.0) / 3.0).floor().clamp(34.0, 48.0);
         let font = (cell * 0.42).clamp(14.0, 18.0);
         let pad_w = cell * 3.0 + gap * 2.0;
@@ -1095,8 +1100,7 @@ impl ViewerApp {
                     .add_sized(
                         [ui.available_width(), 0.0],
                         egui::Button::new(
-                            egui::RichText::new("Park ?")
-                                .color(Color32::from_rgb(255, 160, 120)),
+                            egui::RichText::new("Park ?").color(Color32::from_rgb(255, 160, 120)),
                         ),
                     )
                     .on_hover_text(err)
@@ -1226,9 +1230,8 @@ impl ViewerApp {
         }
 
         let title = match &self.update_banner {
-            UpdateBanner::Offer(offer) => format!("Update to {}", offer.tag),
+            UpdateBanner::Offer(offer) => format!("Update to {}", offer.version),
             UpdateBanner::Downloading { version } => format!("Downloading {version}"),
-            UpdateBanner::Ready { version } => format!("Update {version} installed"),
             UpdateBanner::Failed { .. } => "Update failed".into(),
             UpdateBanner::Hidden => return,
         };
@@ -1246,8 +1249,8 @@ impl ViewerApp {
                 UpdateBanner::Offer(offer) => {
                     ui.label(
                         egui::RichText::new(format!(
-                            "A newer AppImage ({}) is available.",
-                            offer.tag
+                            "A new version ({}) is available.",
+                            offer.version
                         ))
                         .color(Color32::from_rgb(220, 200, 120)),
                     );
@@ -1289,21 +1292,6 @@ impl ViewerApp {
                         format_download_bytes(bytes)
                     ));
                 }
-                UpdateBanner::Ready { version } => {
-                    ui.colored_label(
-                        Color32::from_rgb(140, 220, 160),
-                        format!("Update {version} is ready."),
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Restart now").clicked() {
-                            self.relaunch_after_update();
-                        }
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                }
                 UpdateBanner::Failed { message } => {
                     ui.colored_label(
                         Color32::from_rgb(255, 160, 120),
@@ -1329,9 +1317,6 @@ impl ViewerApp {
                 }
                 UpdateBanner::Offer(_) | UpdateBanner::Failed { .. } => {
                     self.update_later = true;
-                    self.update_banner = UpdateBanner::Hidden;
-                }
-                UpdateBanner::Ready { .. } => {
                     self.update_banner = UpdateBanner::Hidden;
                 }
                 UpdateBanner::Hidden => {}
@@ -2135,18 +2120,12 @@ impl ViewerApp {
                             .color(self.accent),
                     );
                     ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("Open the gate?")
-                            .size(28.0)
-                            .strong(),
-                    );
+                    ui.label(egui::RichText::new("Open the gate?").size(28.0).strong());
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new(
-                            "Enter or ✕ to open  ·  Esc / Cancel to abort",
-                        )
-                        .size(14.0)
-                        .weak(),
+                        egui::RichText::new("Enter or ✕ to open  ·  Esc / Cancel to abort")
+                            .size(14.0)
+                            .weak(),
                     );
                     ui.add_space(18.0);
                     ui.horizontal(|ui| {
@@ -2236,12 +2215,10 @@ impl ViewerApp {
                         .weak(),
                 );
                 ui.add_space(6.0);
-                if ui
-                    .checkbox(&mut silent, "Mute alert audio")
-                    .changed()
-                {
+                if ui.checkbox(&mut silent, "Mute alert audio").changed() {
                     self.anpr.set_silent(silent);
                     self.anpr_draft.silent = silent;
+                    self.schedule_anpr_persist();
                 }
                 ui.add_space(4.0);
                 if ui.button("Dismiss").clicked() {

@@ -74,6 +74,21 @@ impl AnprWorker {
         self.shared.gen.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Replace the live watchlist without dropping the alertStream connection.
+    pub fn update_watchlist(&self, cfg: AnprConfig) {
+        let n = cfg.plates.len();
+        let host = cfg.host.trim().to_string();
+        self.shared.silent.store(cfg.silent, Ordering::SeqCst);
+        *self.shared.cfg.lock() = cfg;
+        let mut status = self.shared.status.lock();
+        if status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Listening on"))
+        {
+            *status = Some(format!("Listening on {host} ({n} plate(s))"));
+        }
+    }
+
     pub fn set_silent(&self, silent: bool) {
         self.shared.silent.store(silent, Ordering::SeqCst);
         self.shared.cfg.lock().silent = silent;
@@ -165,7 +180,10 @@ fn run_stream_session(shared: &Shared, cfg: &AnprConfig, gen: u64) -> Result<()>
 
     let challenge = agent
         .get(&url)
-        .header("Accept", "multipart/x-mixed-replace, multipart/mixed, application/xml")
+        .header(
+            "Accept",
+            "multipart/x-mixed-replace, multipart/mixed, application/xml",
+        )
         .call()
         .with_context(|| format!("ANPR probe GET {url}"))?;
 
@@ -211,7 +229,10 @@ fn run_stream_session(shared: &Shared, cfg: &AnprConfig, gen: u64) -> Result<()>
     let response = stream_agent
         .get(&url)
         .header("Authorization", &answer)
-        .header("Accept", "multipart/x-mixed-replace, multipart/mixed, application/xml")
+        .header(
+            "Accept",
+            "multipart/x-mixed-replace, multipart/mixed, application/xml",
+        )
         .header("Connection", "keep-alive")
         .call()
         .with_context(|| format!("ANPR authenticated GET {url}"))?;
@@ -245,7 +266,10 @@ fn stream_body_unauth(shared: &Shared, cfg: &AnprConfig, gen: u64, url: &str) ->
         .into();
     let response = stream_agent
         .get(url)
-        .header("Accept", "multipart/x-mixed-replace, multipart/mixed, application/xml")
+        .header(
+            "Accept",
+            "multipart/x-mixed-replace, multipart/mixed, application/xml",
+        )
         .header("Connection", "keep-alive")
         .call()
         .with_context(|| format!("ANPR open GET {url}"))?;
@@ -378,8 +402,7 @@ fn parse_anpr_event(xml: &str) -> Option<(String, String, Option<i32>)> {
     // Lightweight tag scrape — Hikvision XML namespaces vary by firmware.
     let event_type = xml_tag_text(xml, "eventType")?;
     let plate = xml_tag_text(xml, "licensePlate").unwrap_or_default();
-    let confidence = xml_tag_text(xml, "confidenceLevel")
-        .and_then(|s| s.parse::<i32>().ok());
+    let confidence = xml_tag_text(xml, "confidenceLevel").and_then(|s| s.parse::<i32>().ok());
     Some((event_type, plate, confidence))
 }
 
@@ -449,9 +472,7 @@ fn download_snapshot(cfg: &AnprConfig) -> Result<Vec<u8>> {
         bail!("snapshot HTTP {status}");
     };
 
-    let mut bytes = body
-        .read_to_vec()
-        .context("read snapshot body")?;
+    let mut bytes = body.read_to_vec().context("read snapshot body")?;
     if let Some(i) = find_jpeg_soi(&bytes) {
         bytes = bytes[i..].to_vec();
     }
@@ -475,8 +496,8 @@ fn play_alert_sound(sound: &str, config_dir: &Path) -> Result<()> {
         ANPR_SOUND_KIM => KIM_BYTES,
         other => {
             let path = resolve_sound_path(other, config_dir);
-            let data = std::fs::read(&path)
-                .with_context(|| format!("read sound {}", path.display()))?;
+            let data =
+                std::fs::read(&path).with_context(|| format!("read sound {}", path.display()))?;
             return play_mp3_bytes(&data);
         }
     };
@@ -496,8 +517,7 @@ fn play_mp3_bytes(data: &[u8]) -> Result<()> {
     use rodio::{Decoder, OutputStream, Sink};
     use std::io::Cursor;
 
-    let (_stream, handle) =
-        OutputStream::try_default().context("open audio output")?;
+    let (_stream, handle) = OutputStream::try_default().context("open audio output")?;
     let sink = Sink::try_new(&handle).context("create audio sink")?;
     let source = Decoder::new(Cursor::new(data.to_vec())).context("decode mp3")?;
     sink.append(source);
